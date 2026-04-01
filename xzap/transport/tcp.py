@@ -1,5 +1,5 @@
 """
-XZAP Transport Layer.
+XZAP TCP Transport.
 
 Async TCP transport with multi-path support.
 Each path = separate TCP connection with its own SNI.
@@ -8,7 +8,7 @@ Each path = separate TCP connection with its own SNI.
 import asyncio
 import logging
 
-log = logging.getLogger("xzap.transport")
+log = logging.getLogger("xzap.transport.tcp")
 
 
 class XZAPConnection:
@@ -32,9 +32,7 @@ class XZAPConnection:
     async def send(self, data: bytes):
         if not self._connected:
             raise RuntimeError("Not connected")
-        # Length-prefix each chunk: [2B len][data]
-        header = len(data).to_bytes(2, "big")
-        self.writer.write(header + data)
+        self.writer.write(len(data).to_bytes(2, "big") + data)
         await self.writer.drain()
 
     async def recv(self) -> bytes:
@@ -87,10 +85,9 @@ class XZAPListener:
         self._server: asyncio.Server | None = None
 
     async def start(self, handler):
-        """Start listening. handler(reader, writer) called per connection."""
         self._server = await asyncio.start_server(handler, self.host, self.port)
         addr = self._server.sockets[0].getsockname()
-        log.info("XZAP server listening on %s:%d", *addr)
+        log.info("TCP listener on %s:%d", *addr)
 
     async def serve_forever(self):
         if self._server:

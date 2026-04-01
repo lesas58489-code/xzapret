@@ -21,25 +21,35 @@ log = logging.getLogger("xzap.client")
 class XZAPClient:
     def __init__(self, server_host: str, server_port: int,
                  key: bytes = None, algo: str = ALGO_AES_GCM,
-                 num_paths: int = 4):
+                 num_paths: int = 4, transport_type: str = "tcp"):
         self.server_host = server_host
         self.server_port = server_port
+        self.transport_type = transport_type
         self.crypto = XZAPCrypto(key=key, algo=algo)
         self.obfuscator = Obfuscator(num_paths=num_paths)
         self.adaptive = AdaptiveStrategy()
         self.fragmenter = Fragmenter()
         self.recv_buffer = FragmentBuffer()
-        self.transport: MultiPathTransport | None = None
+        self.transport = None
         self.router = XZAPRouter()
         self._seqno = 0
 
     async def connect(self):
         """Establish multi-path connections to server."""
-        self.transport = MultiPathTransport(
-            self.server_host, self.server_port, self.obfuscator.active_snis
-        )
+        if self.transport_type == "ws":
+            from .transport.ws import WSMultiPathTransport, build_ws_urls
+            urls = build_ws_urls(
+                self.server_host, self.server_port,
+                self.obfuscator.active_snis,
+            )
+            self.transport = WSMultiPathTransport(urls)
+        else:
+            self.transport = MultiPathTransport(
+                self.server_host, self.server_port, self.obfuscator.active_snis
+            )
         await self.transport.connect_all()
-        log.info("Connected via %d paths", self.transport.num_paths)
+        log.info("Connected [%s] via %d paths",
+                 self.transport_type, self.transport.num_paths)
 
     async def send(self, data: bytes):
         """Encrypt, fragment, and send data across paths."""
