@@ -12,6 +12,7 @@ from .fragmentation import Fragmenter, FragmentBuffer
 from .obfuscation import Obfuscator
 from .adaptive import AdaptiveStrategy
 from .transport import MultiPathTransport
+from .routing import XZAPRouter
 
 log = logging.getLogger("xzap.client")
 
@@ -28,6 +29,7 @@ class XZAPClient:
         self.fragmenter = Fragmenter()
         self.recv_buffer = FragmentBuffer()
         self.transport: MultiPathTransport | None = None
+        self.router = XZAPRouter()
         self._seqno = 0
 
     async def connect(self):
@@ -80,6 +82,24 @@ class XZAPClient:
 
         log.debug("Sent msg seqno=%d (%d fragments, level=%d)",
                   msg.seqno, len(fragments), self.adaptive.level)
+
+    async def smart_connect(self, hostname: str, port: int = 443):
+        """Умное подключение: прямое или через XZAP в зависимости от домена.
+        Возвращает (reader, writer, is_xzap).
+        """
+        use_xzap = self.router.should_use_xzap(hostname)
+        if not use_xzap:
+            reader, writer = await self.router.open_direct(hostname, port)
+            return reader, writer, False
+
+        # Через XZAP
+        log.debug("XZAP route → %s:%d", hostname, port)
+        if not self.transport:
+            await self.connect()
+        # Возвращаем заглушку — полная интеграция прокси в следующем шаге
+        raise NotImplementedError(
+            "XZAP proxy integration (SOCKS5/HTTP CONNECT) will be added next"
+        )
 
     async def close(self):
         if self.transport:

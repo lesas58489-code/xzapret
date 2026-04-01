@@ -1,0 +1,23 @@
+# Российские и другие сайты, которые работают без VPN
+# Один домен на строку. Субдомены подхватываются автоматически.
+
+vk.com
+ok.ru
+yandex.ru
+yandex.net
+mail.ru
+rambler.ru
+avito.ru
+sberbank.ru
+gosuslugi.ru
+mos.ru
+rbc.ru
+lenta.ru
+ria.ru
+rt.com
+tinkoff.ru
+ozon.ru
+wildberries.ru
+kinopoisk.ru
+2gis.ru
+dzen.ru

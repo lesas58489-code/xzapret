@@ -1,0 +1,23 @@
+# Заблокированные сайты — идут через XZAP
+# Один домен на строку. Субдомены подхватываются автоматически.
+
+youtube.com
+googlevideo.com
+google.com
+googleapis.com
+instagram.com
+facebook.com
+twitter.com
+x.com
+tiktok.com
+reddit.com
+discord.com
+discordapp.com
+spotify.com
+netflix.com
+twitch.tv
+wikipedia.org
+medium.com
+github.com
+notion.so
+figma.com
