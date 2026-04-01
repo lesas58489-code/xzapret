@@ -13,6 +13,7 @@ from .obfuscation import Obfuscator
 from .adaptive import AdaptiveStrategy
 from .transport import MultiPathTransport
 from .routing import XZAPRouter
+from .tunnel import XZAPTunnelClient
 
 log = logging.getLogger("xzap.client")
 
@@ -83,25 +84,71 @@ class XZAPClient:
         log.debug("Sent msg seqno=%d (%d fragments, level=%d)",
                   msg.seqno, len(fragments), self.adaptive.level)
 
-    async def smart_connect(self, hostname: str, port: int = 443):
-        """Умное подключение: прямое или через XZAP в зависимости от домена.
-        Возвращает (reader, writer, is_xzap).
+    async def proxy_connect(self, hostname: str, port: int):
+        """Открывает туннель к hostname:port через XZAP-сервер.
+        Возвращает XZAPTunnelStream с методами read/write.
         """
-        use_xzap = self.router.should_use_xzap(hostname)
-        if not use_xzap:
-            reader, writer = await self.router.open_direct(hostname, port)
-            return reader, writer, False
+        tunnel = XZAPTunnelClient(
+            self.server_host, self.server_port,
+            key=self.crypto.key, algo=self.crypto.algo,
+        )
+        stream = await tunnel.connect_tunnel(hostname, port)
+        log.debug("Tunnel open → %s:%d", hostname, port)
+        return stream
 
-        # Через XZAP
-        log.debug("XZAP route → %s:%d", hostname, port)
-        if not self.transport:
-            await self.connect()
-        # Возвращаем заглушку — полная интеграция прокси в следующем шаге
-        raise NotImplementedError(
-            "XZAP proxy integration (SOCKS5/HTTP CONNECT) will be added next"
+    def make_socks5(self, host: str = "127.0.0.1", port: int = 1080):
+        """Создаёт SOCKS5-прокси, привязанный к этому клиенту."""
+        from .socks5 import SOCKS5Proxy
+
+        async def xzap_connect(hostname, port):
+            stream = await self.proxy_connect(hostname, port)
+            # Оборачиваем XZAPTunnelStream в asyncio StreamReader/Writer
+            return _stream_to_asyncio(stream)
+
+        return SOCKS5Proxy(
+            host=host, port=port,
+            router=self.router,
+            xzap_connect=xzap_connect,
         )
 
     async def close(self):
         if self.transport:
             await self.transport.close_all()
             log.info("Disconnected")
+
+
+def _stream_to_asyncio(stream):
+    """Адаптер XZAPTunnelStream → (asyncio.StreamReader, asyncio.StreamWriter)."""
+    import asyncio
+
+    r_transport, w_transport = None, None
+    reader = asyncio.StreamReader()
+
+    class _Writer:
+        def write(self, data):
+            asyncio.ensure_future(stream.write(data))
+
+        async def drain(self):
+            pass
+
+        def close(self):
+            asyncio.ensure_future(stream.close())
+
+        async def wait_closed(self):
+            await stream.close()
+
+    # Запускаем фоновую задачу: читаем из туннеля → кладём в reader
+    async def _feed():
+        try:
+            while True:
+                data = await stream.read()
+                if not data:
+                    break
+                reader.feed_data(data)
+        except Exception:
+            pass
+        finally:
+            reader.feed_eof()
+
+    asyncio.ensure_future(_feed())
+    return reader, _Writer()
