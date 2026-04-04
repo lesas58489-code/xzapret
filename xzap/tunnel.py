@@ -31,20 +31,12 @@ MAX_FRAME_SIZE = 256 * 1024
 
 
 async def _send_frame(writer, crypto, data):
-    """Encrypt, add random prefix, send as [4B len][prefix][encrypted].
-    Works with both raw StreamWriter and FragmentedWriter.
-    """
+    """Encrypt, add random prefix, send as [4B len][prefix][encrypted]."""
     encrypted = crypto.encrypt(data)
     prefix = os.urandom(PREFIX_SIZE)
     payload = prefix + encrypted
     frame = struct.pack(">I", len(payload)) + payload
-    if hasattr(writer, 'write') and asyncio.iscoroutinefunction(getattr(writer, 'write', None)):
-        # FragmentedWriter.write is async
-        await writer.write(frame)
-    else:
-        # Raw StreamWriter.write is sync
-        writer.write(frame)
-        await writer.drain()
+    await writer.write(frame)
 
 
 async def _recv_frame(reader, crypto):
@@ -79,7 +71,8 @@ class XZAPTunnelClient:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         # Wrap TCP in fragmented transport
-        reader, writer = wrap_connection(raw_reader, raw_writer)
+        reader, writer = wrap_connection(raw_reader, raw_writer,
+                                          delay_ms=(0, 0), chaff_chance=0)
 
         # Handshake
         req = json.dumps({
@@ -135,7 +128,8 @@ class XZAPTunnelServer:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         # Wrap TCP in fragmented transport
-        reader, writer = wrap_connection(raw_reader, raw_writer)
+        reader, writer = wrap_connection(raw_reader, raw_writer,
+                                          delay_ms=(0, 0), chaff_chance=0)
 
         try:
             # Handshake
