@@ -22,6 +22,7 @@ import struct
 import os
 import logging
 from .crypto import XZAPCrypto, ALGO_AES_GCM
+from .transport.fragmented import wrap_connection
 
 log = logging.getLogger("xzap.tunnel")
 
@@ -30,16 +31,26 @@ MAX_FRAME_SIZE = 256 * 1024
 
 
 async def _send_frame(writer, crypto, data):
-    """Encrypt, add random prefix, send as [4B len][prefix][encrypted]."""
+    """Encrypt, add random prefix, send as [4B len][prefix][encrypted].
+    Works with both raw StreamWriter and FragmentedWriter.
+    """
     encrypted = crypto.encrypt(data)
     prefix = os.urandom(PREFIX_SIZE)
     payload = prefix + encrypted
-    writer.write(struct.pack(">I", len(payload)) + payload)
-    await writer.drain()
+    frame = struct.pack(">I", len(payload)) + payload
+    if hasattr(writer, 'write') and asyncio.iscoroutinefunction(getattr(writer, 'write', None)):
+        # FragmentedWriter.write is async
+        await writer.write(frame)
+    else:
+        # Raw StreamWriter.write is sync
+        writer.write(frame)
+        await writer.drain()
 
 
 async def _recv_frame(reader, crypto):
-    """Read [4B len][prefix][encrypted], strip prefix, decrypt."""
+    """Read [4B len][prefix][encrypted], strip prefix, decrypt.
+    Works with both raw StreamReader and FragmentedReader.
+    """
     hdr = await reader.readexactly(4)
     length = struct.unpack(">I", hdr)[0]
     if length > MAX_FRAME_SIZE:
@@ -59,13 +70,16 @@ class XZAPTunnelClient:
         self.crypto = XZAPCrypto(key=key, algo=algo)
 
     async def connect_tunnel(self, target_host: str, target_port: int):
-        reader, writer = await asyncio.open_connection(
+        raw_reader, raw_writer = await asyncio.open_connection(
             self.server_host, self.server_port
         )
-        sock = writer.get_extra_info("socket")
+        sock = raw_writer.get_extra_info("socket")
         if sock:
             import socket
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        # Wrap TCP in fragmented transport
+        reader, writer = wrap_connection(raw_reader, raw_writer)
 
         # Handshake
         req = json.dumps({
@@ -80,16 +94,17 @@ class XZAPTunnelClient:
             raise ConnectionError(f"XZAP tunnel refused: {response.get('err')}")
 
         log.info("Tunnel open → %s:%d", target_host, target_port)
-        return XZAPTunnelStream(reader, writer, self.crypto)
+        return XZAPTunnelStream(reader, writer, self.crypto, raw_writer)
 
 
 class XZAPTunnelStream:
     """Поток данных поверх XZAP-туннеля."""
 
-    def __init__(self, reader, writer, crypto):
+    def __init__(self, reader, writer, crypto, raw_writer=None):
         self._reader = reader
         self._writer = writer
         self._crypto = crypto
+        self._raw_writer = raw_writer or writer
 
     async def write(self, data: bytes):
         await _send_frame(self._writer, self._crypto, data)
@@ -99,8 +114,8 @@ class XZAPTunnelStream:
 
     async def close(self):
         try:
-            self._writer.close()
-            await self._writer.wait_closed()
+            self._raw_writer.close()
+            await self._raw_writer.wait_closed()
         except Exception:
             pass
 
@@ -111,13 +126,16 @@ class XZAPTunnelServer:
     def __init__(self, crypto: XZAPCrypto, obfuscator=None):
         self.crypto = crypto
 
-    async def handle(self, reader, writer):
-        addr = writer.get_extra_info("peername")
+    async def handle(self, raw_reader, raw_writer):
+        addr = raw_writer.get_extra_info("peername")
         log.debug("Tunnel connection from %s", addr)
-        sock = writer.get_extra_info("socket")
+        sock = raw_writer.get_extra_info("socket")
         if sock:
             import socket
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        # Wrap TCP in fragmented transport
+        reader, writer = wrap_connection(raw_reader, raw_writer)
 
         try:
             # Handshake
@@ -172,4 +190,4 @@ class XZAPTunnelServer:
         except Exception as e:
             log.debug("Tunnel error: %s", e)
         finally:
-            writer.close()
+            raw_writer.close()
