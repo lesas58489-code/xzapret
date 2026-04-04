@@ -109,55 +109,13 @@ class XZAPClient:
         """Создаёт SOCKS5-прокси, привязанный к этому клиенту."""
         from .socks5 import SOCKS5Proxy
 
-        async def xzap_connect(hostname, port):
-            stream = await self.proxy_connect(hostname, port)
-            # Оборачиваем XZAPTunnelStream в asyncio StreamReader/Writer
-            return _stream_to_asyncio(stream)
-
         return SOCKS5Proxy(
             host=host, port=port,
             router=self.router,
-            xzap_connect=xzap_connect,
+            xzap_connect=self.proxy_connect,
         )
 
     async def close(self):
         if self.transport:
             await self.transport.close_all()
             log.info("Disconnected")
-
-
-def _stream_to_asyncio(stream):
-    """Адаптер XZAPTunnelStream → (asyncio.StreamReader, asyncio.StreamWriter)."""
-    import asyncio
-
-    r_transport, w_transport = None, None
-    reader = asyncio.StreamReader()
-
-    class _Writer:
-        def write(self, data):
-            asyncio.ensure_future(stream.write(data))
-
-        async def drain(self):
-            pass
-
-        def close(self):
-            asyncio.ensure_future(stream.close())
-
-        async def wait_closed(self):
-            await stream.close()
-
-    # Запускаем фоновую задачу: читаем из туннеля → кладём в reader
-    async def _feed():
-        try:
-            while True:
-                data = await stream.read()
-                if not data:
-                    break
-                reader.feed_data(data)
-        except Exception:
-            pass
-        finally:
-            reader.feed_eof()
-
-    asyncio.ensure_future(_feed())
-    return reader, _Writer()

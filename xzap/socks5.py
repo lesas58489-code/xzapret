@@ -30,19 +30,21 @@ REP_FAILURE = 1
 REP_CMD_NOT_SUPPORTED = 7
 REP_ATYP_NOT_SUPPORTED = 8
 
-# Тип callback для XZAP-туннеля
-XZAPConnectFn = Callable[[str, int], Awaitable[tuple]]
-
 
 class SOCKS5Proxy:
     """Локальный SOCKS5 прокси с умной маршрутизацией."""
 
     def __init__(self, host: str = "127.0.0.1", port: int = 1080,
-                 router: XZAPRouter = None, xzap_connect: XZAPConnectFn = None):
+                 router: XZAPRouter = None,
+                 xzap_connect=None):
+        """
+        xzap_connect: async (hostname, port) -> XZAPTunnelStream
+            Возвращает объект с методами read() -> bytes и write(bytes).
+        """
         self.host = host
         self.port = port
         self.router = router or XZAPRouter()
-        self.xzap_connect = xzap_connect  # None = XZAP пока недоступен
+        self.xzap_connect = xzap_connect
         self._server: asyncio.Server | None = None
         self._connections = 0
 
@@ -80,19 +82,42 @@ class SOCKS5Proxy:
             log.info("[%s] %s:%d", label, hostname, port)
 
             if use_xzap and self.xzap_connect:
-                remote_r, remote_w = await self.xzap_connect(hostname, port)
+                # Через XZAP-туннель
+                try:
+                    stream = await asyncio.wait_for(
+                        self.xzap_connect(hostname, port), timeout=15
+                    )
+                except Exception as e:
+                    log.error("XZAP tunnel failed for %s:%d: %s", hostname, port, e)
+                    await self._reply(writer, REP_FAILURE, hostname, port)
+                    return
+
+                await self._reply(writer, REP_SUCCESS, hostname, port)
+
+                # Pipe: клиент ↔ XZAP tunnel stream
+                await asyncio.gather(
+                    _pipe_reader_to_stream(reader, stream),
+                    _pipe_stream_to_writer(stream, writer),
+                    return_exceptions=True,
+                )
             else:
-                remote_r, remote_w = await asyncio.open_connection(hostname, port)
+                # Прямое TCP подключение
+                try:
+                    remote_r, remote_w = await asyncio.wait_for(
+                        asyncio.open_connection(hostname, port), timeout=10
+                    )
+                except Exception as e:
+                    log.error("Direct connect failed for %s:%d: %s", hostname, port, e)
+                    await self._reply(writer, REP_FAILURE, hostname, port)
+                    return
 
-            # Сообщаем клиенту об успехе
-            await self._reply(writer, REP_SUCCESS, hostname, port)
+                await self._reply(writer, REP_SUCCESS, hostname, port)
 
-            # Двунаправленный pipe
-            await asyncio.gather(
-                _pipe(reader, remote_w),
-                _pipe(remote_r, writer),
-                return_exceptions=True,
-            )
+                await asyncio.gather(
+                    _pipe(reader, remote_w),
+                    _pipe(remote_r, writer),
+                    return_exceptions=True,
+                )
 
         except (asyncio.IncompleteReadError, ConnectionResetError):
             pass
@@ -107,16 +132,14 @@ class SOCKS5Proxy:
     # ──────────────────────────────────────────────
 
     async def _handshake(self, reader, writer):
-        """Шаг 1: согласование метода аутентификации (no auth)."""
         ver, nmethods = await reader.readexactly(2)
         if ver != VER:
             raise ValueError(f"Not SOCKS5 (ver={ver})")
-        await reader.readexactly(nmethods)  # список методов — игнорируем
-        writer.write(bytes([VER, 0x00]))    # выбираем «no auth»
+        await reader.readexactly(nmethods)
+        writer.write(bytes([VER, 0x00]))
         await writer.drain()
 
     async def _read_connect_request(self, reader, writer) -> tuple[str | None, int]:
-        """Шаг 2: читаем CONNECT-запрос, возвращаем (hostname, port)."""
         ver, cmd, _, atyp = await reader.readexactly(4)
 
         if ver != VER or cmd != CMD_CONNECT:
@@ -141,7 +164,6 @@ class SOCKS5Proxy:
         return hostname, port
 
     async def _reply(self, writer, rep: int, hostname: str, port: int):
-        """Шаг 3: отправляем ответ SOCKS5."""
         host_b = hostname.encode()
         reply = bytes([VER, rep, 0x00, ATYP_DOMAIN, len(host_b)])
         reply += host_b + struct.pack(">H", port)
@@ -150,11 +172,11 @@ class SOCKS5Proxy:
 
 
 # ──────────────────────────────────────────────
-# Вспомогательные функции
+# Pipe функции
 # ──────────────────────────────────────────────
 
 async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
-    """Копируем данные src → dst до EOF."""
+    """TCP → TCP pipe."""
     try:
         while chunk := await src.read(65536):
             dst.write(chunk)
@@ -163,6 +185,35 @@ async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
         pass
     finally:
         _close(dst)
+
+
+async def _pipe_reader_to_stream(reader: asyncio.StreamReader, stream):
+    """TCP reader → XZAP tunnel stream (write)."""
+    try:
+        while chunk := await reader.read(65536):
+            await stream.write(chunk)
+    except Exception:
+        pass
+    finally:
+        try:
+            await stream.close()
+        except Exception:
+            pass
+
+
+async def _pipe_stream_to_writer(stream, writer: asyncio.StreamWriter):
+    """XZAP tunnel stream (read) → TCP writer."""
+    try:
+        while True:
+            data = await stream.read()
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except Exception:
+        pass
+    finally:
+        _close(writer)
 
 
 def _close(writer: asyncio.StreamWriter):
