@@ -34,7 +34,7 @@ class XZAPTunnelClient:
         self.server_port = server_port
         self.crypto = XZAPCrypto(key=key, algo=algo)
         self.fragmenter = Fragmenter(
-            overlap=0, padding_chance=0, chaff_chance=0,
+            overlap=0, padding_chance=0, chaff_chance=0, disorder=False,
         )
         self.obfuscator = Obfuscator(num_paths=1)
         self._conn: XZAPConnection | None = None
@@ -121,7 +121,7 @@ class XZAPTunnelServer:
                      writer: asyncio.StreamWriter):
         """Обработчик одного туннельного соединения."""
         fragmenter = Fragmenter(
-            overlap=0, padding_chance=0, chaff_chance=0,
+            overlap=0, padding_chance=0, chaff_chance=0, disorder=False,
         )
         recv_buf = FragmentBuffer()
         seqno = 0

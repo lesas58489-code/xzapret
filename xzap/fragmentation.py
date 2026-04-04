@@ -101,7 +101,8 @@ class Fragmenter:
                  overlap: int = 4,
                  padding_chance: float = 0.45, padding_max: int = 96,
                  chaff_chance: float = 0.35, chaff_per_message: int = 3,
-                 chaff_size_min: int = 140, chaff_size_max: int = 920):
+                 chaff_size_min: int = 140, chaff_size_max: int = 920,
+                 disorder: bool = True):
         self.min_size = min_size
         self.max_size = max_size
         self.overlap = overlap
@@ -111,6 +112,7 @@ class Fragmenter:
         self.chaff_per_message = chaff_per_message
         self.chaff_size_min = chaff_size_min
         self.chaff_size_max = chaff_size_max
+        self._disorder = disorder
 
     def fragment(self, msg_id: int, data: bytes,
                  num_paths: int = 8) -> list[Fragment]:
@@ -177,8 +179,9 @@ class Fragmenter:
                 )
                 fragments.append(chaff)
 
-        # Full disorder
-        random.shuffle(fragments)
+        # Full disorder (can be disabled for tunnel mode)
+        if self._disorder:
+            random.shuffle(fragments)
         return fragments
 
     def disorder(self, fragments: list[Fragment]) -> list[Fragment]:
