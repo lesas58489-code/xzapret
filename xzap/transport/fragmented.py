@@ -56,7 +56,8 @@ class FragmentedWriter:
         self.delay_min, self.delay_max = delay_ms
 
     async def write(self, data: bytes):
-        """Разбивает data на микрофрагменты и отправляет."""
+        """Разбивает data на микрофрагменты и отправляет одним batch."""
+        buf = bytearray()
         offset = 0
         while offset < len(data):
             # Random fragment size
@@ -73,27 +74,21 @@ class FragmentedWriter:
 
             # Maybe insert chaff before real fragment
             if random.random() < self.chaff_chance:
-                await self._send_chaff()
+                chaff_data = os.urandom(random.randint(self.min_frag, self.max_frag))
+                buf.extend(self._pack_fragment(chaff_data, FLAG_CHAFF))
 
-            # Send real fragment
-            await self._send_fragment(chunk, FLAG_REAL)
+            # Pack real fragment
+            buf.extend(self._pack_fragment(chunk, FLAG_REAL))
 
-            # Small random delay between fragments
-            if self.delay_max > 0 and offset < len(data):
-                delay = random.randint(self.delay_min, self.delay_max) / 1000.0
-                if delay > 0:
-                    await asyncio.sleep(delay)
-
-    async def _send_fragment(self, data: bytes, flags: int):
-        """Send [2B len][1B flags][data]."""
-        total = len(data) + 1  # data + flags byte
-        self._writer.write(struct.pack(">HB", total, flags) + data)
+        # Send all fragments in one TCP write
+        self._writer.write(bytes(buf))
         await self._writer.drain()
 
-    async def _send_chaff(self):
-        """Send a chaff (garbage) fragment."""
-        size = random.randint(self.min_frag, self.max_frag)
-        await self._send_fragment(os.urandom(size), FLAG_CHAFF)
+    @staticmethod
+    def _pack_fragment(data: bytes, flags: int) -> bytes:
+        """Pack [2B len][1B flags][data]."""
+        total = len(data) + 1
+        return struct.pack(">HB", total, flags) + data
 
     def close(self):
         self._writer.close()
