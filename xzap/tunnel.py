@@ -25,11 +25,12 @@ MAX_FRAME_SIZE = 256 * 1024  # 256 KB
 
 
 async def _send_frame(writer: asyncio.StreamWriter, crypto: XZAPCrypto,
-                       data: bytes):
+                       data: bytes, flush: bool = True):
     """Encrypt data and send as a length-prefixed frame."""
     encrypted = crypto.encrypt(data)
     writer.write(struct.pack(">I", len(encrypted)) + encrypted)
-    await writer.drain()
+    if flush:
+        await writer.drain()
 
 
 async def _recv_frame(reader: asyncio.StreamReader,
@@ -163,7 +164,7 @@ class XZAPTunnelServer:
 
             async def target_to_xzap():
                 try:
-                    while chunk := await target_r.read(65536):
+                    while chunk := await target_r.read(16384):
                         log.debug("target→xzap: %d bytes", len(chunk))
                         await _send_frame(writer, self.crypto, chunk)
                     log.debug("target→xzap: EOF")
