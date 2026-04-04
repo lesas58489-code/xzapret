@@ -131,6 +131,11 @@ class XZAPTunnelClient:
         reader, writer = await asyncio.open_connection(
             self.server_host, self.server_port
         )
+        # Disable Nagle for low-latency fragment delivery
+        sock = writer.get_extra_info("socket")
+        if sock:
+            import socket
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         # Handshake: simple encrypted frames
         req = json.dumps({
@@ -201,6 +206,11 @@ class XZAPTunnelServer:
                      writer: asyncio.StreamWriter):
         addr = writer.get_extra_info("peername")
         log.debug("Tunnel connection from %s", addr)
+        # Disable Nagle for low-latency fragment delivery
+        sock = writer.get_extra_info("socket")
+        if sock:
+            import socket
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         try:
             # Handshake: simple encrypted frames
