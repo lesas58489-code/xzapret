@@ -1,16 +1,19 @@
 """
-XZAP Tunnel Protocol — туннелирование TCP через полный XZAP стек.
+XZAP Tunnel Protocol — туннелирование TCP через XZAP.
 
-Слои (в порядке отправки):
+Слои:
   1. Plaintext data
-  2. XZAPMessage (msg_id, seqno, msg_key)
-  3. AES-256-GCM / ChaCha20 encryption
-  4. 64-byte random prefix
-  5. Micro-fragmentation (24-68 bytes, chaff, padding, disorder)
-  6. TCP: [2B length][fragment] per fragment
+  2. AES-256-GCM / ChaCha20 encryption
+  3. Random prefix (64 bytes) prepended to each frame
+  4. TCP: [4B length][64B random prefix][encrypted data]
 
-Handshake использует простые encrypted фреймы (без фрагментации)
-для надёжности. Фрагментация включается после CONNECT OK.
+Handshake:
+  1. Client → Server: encrypted {"cmd":"connect","host":"...","port":N}
+  2. Server → Client: encrypted {"ok":true} or {"ok":false,"err":"..."}
+  3. Bidirectional encrypted data pipe
+
+Micro-fragmentation будет добавлена поверх как отдельный слой
+после стабилизации базового туннеля.
 """
 
 import asyncio
@@ -19,107 +22,35 @@ import struct
 import os
 import logging
 from .crypto import XZAPCrypto, ALGO_AES_GCM
-from .message import XZAPMessage
-from .fragmentation import Fragmenter, FragmentBuffer, Fragment
-from .obfuscation import Obfuscator
 
 log = logging.getLogger("xzap.tunnel")
 
+PREFIX_SIZE = 64
 MAX_FRAME_SIZE = 256 * 1024
 
 
-# ──────────────────────────────────────────────
-# Simple frames — used for handshake only
-# ──────────────────────────────────────────────
-
-async def _send_simple(writer, crypto, data):
-    """Handshake frame: [4B len][encrypted]."""
+async def _send_frame(writer, crypto, data):
+    """Encrypt, add random prefix, send as [4B len][prefix][encrypted]."""
     encrypted = crypto.encrypt(data)
-    writer.write(struct.pack(">I", len(encrypted)) + encrypted)
+    prefix = os.urandom(PREFIX_SIZE)
+    payload = prefix + encrypted
+    writer.write(struct.pack(">I", len(payload)) + payload)
     await writer.drain()
 
 
-async def _recv_simple(reader, crypto):
-    """Read handshake frame."""
+async def _recv_frame(reader, crypto):
+    """Read [4B len][prefix][encrypted], strip prefix, decrypt."""
     hdr = await reader.readexactly(4)
     length = struct.unpack(">I", hdr)[0]
     if length > MAX_FRAME_SIZE:
         raise ValueError(f"Frame too large: {length}")
-    return crypto.decrypt(await reader.readexactly(length))
+    payload = await reader.readexactly(length)
+    encrypted = payload[PREFIX_SIZE:]  # strip random prefix
+    return crypto.decrypt(encrypted)
 
-
-# ──────────────────────────────────────────────
-# XZAP frames — full protocol stack for data phase
-# ──────────────────────────────────────────────
-
-class XZAPFrameSender:
-    """Отправка данных через полный XZAP стек."""
-
-    def __init__(self, writer: asyncio.StreamWriter, crypto: XZAPCrypto,
-                 fragmenter: Fragmenter, obfuscator: Obfuscator):
-        self._writer = writer
-        self._crypto = crypto
-        self._fragmenter = fragmenter
-        self._obfuscator = obfuscator
-        self._seqno = 0
-
-    async def send(self, data: bytes):
-        """data → XZAPMessage → encrypt → prefix → fragment → TCP."""
-        msg = XZAPMessage(data, seqno=self._seqno)
-        self._seqno += 1
-
-        # Encrypt
-        encrypted = self._crypto.encrypt(msg.payload, aad=msg.aad())
-        msg.payload = encrypted
-        packed = msg.pack()
-
-        # Random prefix
-        packed = self._obfuscator.add_prefix(packed)
-
-        # Fragment (with chaff, padding, disorder)
-        fragments = self._fragmenter.fragment(msg.msg_id, packed)
-
-        # Send all fragments as [2B len][fragment]
-        for frag in fragments:
-            frag_raw = frag.pack()
-            self._writer.write(len(frag_raw).to_bytes(2, "big") + frag_raw)
-        await self._writer.drain()
-
-
-class XZAPFrameReceiver:
-    """Приём данных через полный XZAP стек."""
-
-    def __init__(self, reader: asyncio.StreamReader, crypto: XZAPCrypto,
-                 obfuscator: Obfuscator):
-        self._reader = reader
-        self._crypto = crypto
-        self._obfuscator = obfuscator
-        self._buf = FragmentBuffer()
-
-    async def recv(self) -> bytes:
-        """TCP → fragments → reassemble → strip prefix → XZAPMessage → decrypt."""
-        while True:
-            hdr = await self._reader.readexactly(2)
-            length = int.from_bytes(hdr, "big")
-            raw = await self._reader.readexactly(length)
-
-            frag = Fragment.unpack(raw)
-            assembled = self._buf.add(frag)
-            if assembled is not None:
-                # Strip random prefix
-                assembled = self._obfuscator.strip_prefix(assembled)
-                # Unpack message
-                msg = XZAPMessage.unpack(assembled)
-                # Decrypt
-                return self._crypto.decrypt(msg.payload, aad=msg.aad())
-
-
-# ──────────────────────────────────────────────
-# Tunnel Client
-# ──────────────────────────────────────────────
 
 class XZAPTunnelClient:
-    """Открывает туннель к target через XZAP-сервер с полным стеком."""
+    """Открывает туннель к target через XZAP-сервер."""
 
     def __init__(self, server_host: str, server_port: int,
                  key: bytes = None, algo: str = ALGO_AES_GCM):
@@ -131,58 +62,40 @@ class XZAPTunnelClient:
         reader, writer = await asyncio.open_connection(
             self.server_host, self.server_port
         )
-        # Disable Nagle for low-latency fragment delivery
         sock = writer.get_extra_info("socket")
         if sock:
             import socket
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        # Handshake: simple encrypted frames
+        # Handshake
         req = json.dumps({
             "cmd": "connect",
             "host": target_host,
             "port": target_port,
         }).encode()
-        await _send_simple(writer, self.crypto, req)
+        await _send_frame(writer, self.crypto, req)
 
-        response = json.loads(await _recv_simple(reader, self.crypto))
+        response = json.loads(await _recv_frame(reader, self.crypto))
         if not response.get("ok"):
             raise ConnectionError(f"XZAP tunnel refused: {response.get('err')}")
 
         log.info("Tunnel open → %s:%d", target_host, target_port)
-
-        # Data phase: XZAP stack (chaff/disorder disabled until stable)
-        fragmenter = Fragmenter(
-            min_size=24, max_size=68,
-            overlap=0,
-            padding_chance=0.4,     # random padding
-            chaff_chance=0,         # TODO: enable after stability confirmed
-            chaff_per_message=0,
-            disorder=False,         # TODO: enable after stability confirmed
-        )
-        obfuscator = Obfuscator(num_paths=1)
-
-        sender = XZAPFrameSender(writer, self.crypto, fragmenter, obfuscator)
-        receiver = XZAPFrameReceiver(reader, self.crypto, obfuscator)
-
-        return XZAPTunnelStream(sender, receiver, writer)
+        return XZAPTunnelStream(reader, writer, self.crypto)
 
 
 class XZAPTunnelStream:
     """Поток данных поверх XZAP-туннеля."""
 
-    def __init__(self, sender: XZAPFrameSender,
-                 receiver: XZAPFrameReceiver,
-                 writer: asyncio.StreamWriter):
-        self._sender = sender
-        self._receiver = receiver
+    def __init__(self, reader, writer, crypto):
+        self._reader = reader
         self._writer = writer
+        self._crypto = crypto
 
     async def write(self, data: bytes):
-        await self._sender.send(data)
+        await _send_frame(self._writer, self._crypto, data)
 
     async def read(self) -> bytes:
-        return await self._receiver.recv()
+        return await _recv_frame(self._reader, self._crypto)
 
     async def close(self):
         try:
@@ -192,33 +105,27 @@ class XZAPTunnelStream:
             pass
 
 
-# ──────────────────────────────────────────────
-# Tunnel Server
-# ──────────────────────────────────────────────
-
 class XZAPTunnelServer:
-    """Серверная сторона туннеля с полным XZAP стеком."""
+    """Серверная сторона туннеля."""
 
     def __init__(self, crypto: XZAPCrypto, obfuscator=None):
         self.crypto = crypto
 
-    async def handle(self, reader: asyncio.StreamReader,
-                     writer: asyncio.StreamWriter):
+    async def handle(self, reader, writer):
         addr = writer.get_extra_info("peername")
         log.debug("Tunnel connection from %s", addr)
-        # Disable Nagle for low-latency fragment delivery
         sock = writer.get_extra_info("socket")
         if sock:
             import socket
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         try:
-            # Handshake: simple encrypted frames
-            ctrl = await _recv_simple(reader, self.crypto)
+            # Handshake
+            ctrl = await _recv_frame(reader, self.crypto)
             req = json.loads(ctrl)
             if req.get("cmd") != "connect":
-                await _send_simple(writer, self.crypto,
-                                    json.dumps({"ok": False, "err": "bad cmd"}).encode())
+                await _send_frame(writer, self.crypto,
+                                   json.dumps({"ok": False, "err": "bad cmd"}).encode())
                 return
 
             target_host = req["host"]
@@ -230,32 +137,18 @@ class XZAPTunnelServer:
                     timeout=10,
                 )
             except Exception as e:
-                await _send_simple(writer, self.crypto,
-                                    json.dumps({"ok": False, "err": str(e)}).encode())
+                await _send_frame(writer, self.crypto,
+                                   json.dumps({"ok": False, "err": str(e)}).encode())
                 return
 
-            await _send_simple(writer, self.crypto,
-                                json.dumps({"ok": True}).encode())
+            await _send_frame(writer, self.crypto,
+                               json.dumps({"ok": True}).encode())
             log.info("Tunnelling → %s:%d", target_host, target_port)
-
-            # Data phase: XZAP stack (chaff/disorder disabled until stable)
-            fragmenter = Fragmenter(
-                min_size=24, max_size=68,
-                overlap=0,
-                padding_chance=0.4,
-                chaff_chance=0,
-                chaff_per_message=0,
-                disorder=False,
-            )
-            obfuscator = Obfuscator(num_paths=1)
-
-            sender = XZAPFrameSender(writer, self.crypto, fragmenter, obfuscator)
-            receiver = XZAPFrameReceiver(reader, self.crypto, obfuscator)
 
             async def xzap_to_target():
                 try:
                     while True:
-                        data = await receiver.recv()
+                        data = await _recv_frame(reader, self.crypto)
                         log.debug("xzap→target: %d bytes", len(data))
                         target_w.write(data)
                         await target_w.drain()
@@ -266,7 +159,7 @@ class XZAPTunnelServer:
                 try:
                     while chunk := await target_r.read(16384):
                         log.debug("target→xzap: %d bytes", len(chunk))
-                        await sender.send(chunk)
+                        await _send_frame(writer, self.crypto, chunk)
                     log.debug("target→xzap: EOF")
                 except Exception as e:
                     log.debug("target→xzap ended: %s", e)
