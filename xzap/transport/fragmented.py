@@ -76,7 +76,7 @@ class FragmentedWriter:
         self._writer.write(bytes(buf))
         await self._writer.drain()
 
-        # 3. Send chaff separately after real data
+        # 3. Send chaff separately after real data (non-blocking)
         if self.chaff_chance > 0 and random.random() < self.chaff_chance:
             chaff_buf = bytearray()
             n_chaff = random.randint(1, 3)
@@ -84,7 +84,7 @@ class FragmentedWriter:
                 chaff_data = os.urandom(random.randint(self.min_frag, self.max_frag))
                 chaff_buf.extend(self._pack_fragment(chaff_data, FLAG_CHAFF))
             self._writer.write(bytes(chaff_buf))
-            await self._writer.drain()
+            # No drain — chaff goes out with next real write
 
     @staticmethod
     def _pack_fragment(data: bytes, flags: int) -> bytes:
