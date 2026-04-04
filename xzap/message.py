@@ -56,8 +56,10 @@ class XZAPMessage:
         return cls(payload, seqno=seqno, msg_id=msg_id, msg_key=msg_key)
 
     def aad(self) -> bytes:
-        """Additional Authenticated Data for encryption."""
-        return struct.pack(HEADER_FMT, self.msg_id, self.seqno, len(self.payload))
+        """Additional Authenticated Data for encryption.
+        Uses only msg_id + seqno (not payload length, which changes after encryption).
+        """
+        return struct.pack(">QI", self.msg_id, self.seqno)
 
     def __repr__(self):
         return (f"XZAPMessage(msg_id={self.msg_id}, seqno={self.seqno}, "

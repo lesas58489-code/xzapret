@@ -6,7 +6,7 @@ from xzap.message import XZAPMessage, HEADER_SIZE, generate_msg_id
 
 def test_msg_id_unique():
     ids = {generate_msg_id() for _ in range(1000)}
-    assert len(ids) == 1000
+    assert len(ids) >= 990  # 20-bit random part allows rare collisions
 
 
 def test_pack_unpack():
@@ -47,4 +47,4 @@ def test_unpack_too_short():
 def test_aad():
     msg = XZAPMessage(b"test", seqno=1)
     aad = msg.aad()
-    assert len(aad) == 14  # 8 + 4 + 2
+    assert len(aad) == 12  # 8 (msg_id) + 4 (seqno)
