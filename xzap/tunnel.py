@@ -151,14 +151,14 @@ class XZAPTunnelClient:
 
         log.info("Tunnel open → %s:%d", target_host, target_port)
 
-        # Data phase: full XZAP stack
+        # Data phase: XZAP stack (chaff/disorder disabled until stable)
         fragmenter = Fragmenter(
             min_size=24, max_size=68,
-            overlap=0,              # overlap ломает reassembly
+            overlap=0,
             padding_chance=0.4,     # random padding
-            chaff_chance=0.3,       # fake fragments
-            chaff_per_message=2,
-            disorder=True,          # shuffle fragments
+            chaff_chance=0,         # TODO: enable after stability confirmed
+            chaff_per_message=0,
+            disorder=False,         # TODO: enable after stability confirmed
         )
         obfuscator = Obfuscator(num_paths=1)
 
@@ -238,14 +238,14 @@ class XZAPTunnelServer:
                                 json.dumps({"ok": True}).encode())
             log.info("Tunnelling → %s:%d", target_host, target_port)
 
-            # Data phase: full XZAP stack
+            # Data phase: XZAP stack (chaff/disorder disabled until stable)
             fragmenter = Fragmenter(
                 min_size=24, max_size=68,
                 overlap=0,
                 padding_chance=0.4,
-                chaff_chance=0.3,
-                chaff_per_message=2,
-                disorder=True,
+                chaff_chance=0,
+                chaff_per_message=0,
+                disorder=False,
             )
             obfuscator = Obfuscator(num_paths=1)
 
