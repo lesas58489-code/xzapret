@@ -46,32 +46,41 @@ class FragmentedWriter:
                  min_frag: int = 24, max_frag: int = 68,
                  overlap: int = 0,
                  chaff_chance: float = 0.2,
-                 delay_ms: tuple[int, int] = (0, 3)):
+                 delay_ms: tuple[int, int] = (0, 3),
+                 frag_threshold: int = 4096):
         self._writer = writer
         self.min_frag = min_frag
         self.max_frag = max_frag
         self.overlap = overlap
         self.chaff_chance = chaff_chance
         self.delay_min, self.delay_max = delay_ms
+        self.frag_threshold = frag_threshold  # fragment only if data <= this
 
     async def write(self, data: bytes):
-        """Разбивает data на микрофрагменты с overlap и отправляет."""
+        """Отправляет данные. Мелкие пакеты фрагментируются, крупные — как есть."""
+        if len(data) <= self.frag_threshold:
+            await self._write_fragmented(data)
+        else:
+            # Bulk data: send as single real fragment (no micro-fragmentation)
+            buf = self._pack_fragment(data, FLAG_REAL)
+            self._writer.write(buf)
+            await self._writer.drain()
+
+    async def _write_fragmented(self, data: bytes):
+        """Фрагментирует мелкие данные с overlap и chaff."""
         buf = bytearray()
         offset = 0
-        prev_end = 0  # конец предыдущего чанка (для overlap)
         is_first = True
 
         while offset < len(data):
             frag_size = random.randint(
                 self.min_frag, min(self.max_frag, len(data) - offset)
             )
-            # Avoid tiny tail
             remaining = len(data) - offset - frag_size
             if 0 < remaining < self.min_frag:
                 frag_size = len(data) - offset
 
             if not is_first and self.overlap > 0 and offset >= self.overlap:
-                # Include overlap bytes from end of previous chunk
                 overlap_start = offset - self.overlap
                 chunk = data[overlap_start:offset + frag_size]
                 buf.extend(self._pack_fragment(chunk, FLAG_OVERLAP))
