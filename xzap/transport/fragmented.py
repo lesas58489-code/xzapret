@@ -56,33 +56,35 @@ class FragmentedWriter:
         self.delay_min, self.delay_max = delay_ms
 
     async def write(self, data: bytes):
-        """Разбивает data на микрофрагменты и отправляет одним batch."""
+        """Разбивает data на микрофрагменты и отправляет."""
+        # 1. Pack real fragments into batch
         buf = bytearray()
         offset = 0
         while offset < len(data):
-            # Random fragment size
             frag_size = random.randint(
                 self.min_frag, min(self.max_frag, len(data) - offset)
             )
-            # Avoid tiny tail
             remaining = len(data) - offset - frag_size
             if 0 < remaining < self.min_frag:
                 frag_size = len(data) - offset
 
             chunk = data[offset:offset + frag_size]
             offset += frag_size
-
-            # Maybe insert chaff before real fragment
-            if random.random() < self.chaff_chance:
-                chaff_data = os.urandom(random.randint(self.min_frag, self.max_frag))
-                buf.extend(self._pack_fragment(chaff_data, FLAG_CHAFF))
-
-            # Pack real fragment
             buf.extend(self._pack_fragment(chunk, FLAG_REAL))
 
-        # Send all fragments in one TCP write
+        # 2. Send real data batch
         self._writer.write(bytes(buf))
         await self._writer.drain()
+
+        # 3. Send chaff separately after real data
+        if self.chaff_chance > 0 and random.random() < self.chaff_chance:
+            chaff_buf = bytearray()
+            n_chaff = random.randint(1, 3)
+            for _ in range(n_chaff):
+                chaff_data = os.urandom(random.randint(self.min_frag, self.max_frag))
+                chaff_buf.extend(self._pack_fragment(chaff_data, FLAG_CHAFF))
+            self._writer.write(bytes(chaff_buf))
+            await self._writer.drain()
 
     @staticmethod
     def _pack_fragment(data: bytes, flags: int) -> bytes:
