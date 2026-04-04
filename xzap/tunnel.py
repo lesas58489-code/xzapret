@@ -178,19 +178,27 @@ class XZAPTunnelServer:
 
             # Двунаправленный pipe: XZAP-клиент ↔ реальный хост
             async def xzap_to_target():
-                while True:
-                    data = await recv_msg()
-                    target_w.write(data)
-                    await target_w.drain()
+                try:
+                    while True:
+                        data = await recv_msg()
+                        log.debug("xzap→target: %d bytes", len(data))
+                        target_w.write(data)
+                        await target_w.drain()
+                except Exception as e:
+                    log.debug("xzap→target ended: %s", e)
 
             async def target_to_xzap():
-                while chunk := await target_r.read(65536):
-                    await send_msg(chunk)
+                try:
+                    while chunk := await target_r.read(65536):
+                        log.debug("target→xzap: %d bytes", len(chunk))
+                        await send_msg(chunk)
+                    log.debug("target→xzap: EOF")
+                except Exception as e:
+                    log.debug("target→xzap ended: %s", e)
 
             await asyncio.gather(
                 xzap_to_target(),
                 target_to_xzap(),
-                return_exceptions=True,
             )
 
         except Exception as e:
