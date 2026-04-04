@@ -72,17 +72,16 @@ class XZAPClient:
         # Add random prefix
         packed = self.obfuscator.add_prefix(packed)
 
-        # Fragment
-        fragments = self.fragmenter.fragment(msg.msg_id, packed)
-        if cfg.disorder:
-            fragments = self.fragmenter.disorder(fragments)
+        # Fragment (with chaff, overlap, padding, disorder built-in)
+        fragments = self.fragmenter.fragment(
+            msg.msg_id, packed,
+            num_paths=self.transport.num_paths,
+        )
 
         # Send with repeats (adaptive)
         for _repeat in range(cfg.repeats):
             for frag in fragments:
-                path_idx = Fragmenter.assign_path(
-                    msg.msg_id, frag.index, self.transport.num_paths
-                )
+                path_idx = frag.path_id
                 try:
                     await self.transport.send_on_path(path_idx, frag.pack())
                 except Exception as e:
