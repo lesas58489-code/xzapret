@@ -190,10 +190,11 @@ async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
 async def _pipe_reader_to_stream(reader: asyncio.StreamReader, stream):
     """TCP reader → XZAP tunnel stream (write)."""
     try:
-        while chunk := await reader.read(65536):
+        while chunk := await reader.read(16384):
+            log.debug("client→tunnel: %d bytes", len(chunk))
             await stream.write(chunk)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("client→tunnel ended: %s", e)
     finally:
         try:
             await stream.close()
@@ -208,10 +209,11 @@ async def _pipe_stream_to_writer(stream, writer: asyncio.StreamWriter):
             data = await stream.read()
             if not data:
                 break
+            log.debug("tunnel→client: %d bytes", len(data))
             writer.write(data)
             await writer.drain()
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("tunnel→client ended: %s", e)
     finally:
         _close(writer)
 
