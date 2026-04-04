@@ -72,7 +72,8 @@ class XZAPTunnelClient:
 
         # Wrap TCP in fragmented transport
         reader, writer = wrap_connection(raw_reader, raw_writer,
-                                          delay_ms=(0, 0), chaff_chance=0.2)
+                                          overlap=4, chaff_chance=0.2,
+                                          delay_ms=(0, 0))
 
         # Handshake
         req = json.dumps({
@@ -129,7 +130,8 @@ class XZAPTunnelServer:
 
         # Wrap TCP in fragmented transport
         reader, writer = wrap_connection(raw_reader, raw_writer,
-                                          delay_ms=(0, 0), chaff_chance=0.2)
+                                          overlap=4, chaff_chance=0.2,
+                                          delay_ms=(0, 0))
 
         try:
             # Handshake

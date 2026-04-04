@@ -11,20 +11,17 @@ XZAP Fragmented Transport — микрофрагментация поверх TC
        ↓
   Raw TCP socket
 
-Каждый вызов write() разбивает данные на мелкие куски (24-68 байт),
-каждый кусок отправляется как отдельный TCP write + flush.
-
-Для DPI это выглядит как множество мелких пакетов с рандомными данными,
-что затрудняет анализ и pattern matching.
-
-Дополнительно:
-  - Random delay между фрагментами (0-5 мс)
-  - Chaff (мусорные) пакеты вставляются между реальными
-  - Random padding на каждый фрагмент
+Anti-DPI техники:
+  - Micro-fragmentation: каждый write() разбивается на 24-68 байт
+  - Overlap: каждый фрагмент (кроме первого) повторяет N байт предыдущего
+  - Chaff: мусорные пакеты вставляются после реальных данных
+  - Random fragment sizes
 
 Wire format per fragment:
   [2B total_len][1B flags][data]
-  flags: 0x00 = real data, 0x01 = chaff (receiver drops)
+  flags:
+    bit 0 (0x01): chaff — receiver drops
+    bit 1 (0x02): overlap — receiver strips first overlap_size bytes
 """
 
 import asyncio
@@ -37,8 +34,8 @@ log = logging.getLogger("xzap.transport.fragmented")
 
 FLAG_REAL = 0x00
 FLAG_CHAFF = 0x01
+FLAG_OVERLAP = 0x02
 
-# Fragment header: [2B total_len][1B flags] = 3 bytes
 FRAG_HDR = 3
 
 
@@ -47,36 +44,49 @@ class FragmentedWriter:
 
     def __init__(self, writer: asyncio.StreamWriter,
                  min_frag: int = 24, max_frag: int = 68,
+                 overlap: int = 0,
                  chaff_chance: float = 0.2,
                  delay_ms: tuple[int, int] = (0, 3)):
         self._writer = writer
         self.min_frag = min_frag
         self.max_frag = max_frag
+        self.overlap = overlap
         self.chaff_chance = chaff_chance
         self.delay_min, self.delay_max = delay_ms
 
     async def write(self, data: bytes):
-        """Разбивает data на микрофрагменты и отправляет."""
-        # 1. Pack real fragments into batch
+        """Разбивает data на микрофрагменты с overlap и отправляет."""
         buf = bytearray()
         offset = 0
+        prev_end = 0  # конец предыдущего чанка (для overlap)
+        is_first = True
+
         while offset < len(data):
             frag_size = random.randint(
                 self.min_frag, min(self.max_frag, len(data) - offset)
             )
+            # Avoid tiny tail
             remaining = len(data) - offset - frag_size
             if 0 < remaining < self.min_frag:
                 frag_size = len(data) - offset
 
-            chunk = data[offset:offset + frag_size]
-            offset += frag_size
-            buf.extend(self._pack_fragment(chunk, FLAG_REAL))
+            if not is_first and self.overlap > 0 and offset >= self.overlap:
+                # Include overlap bytes from end of previous chunk
+                overlap_start = offset - self.overlap
+                chunk = data[overlap_start:offset + frag_size]
+                buf.extend(self._pack_fragment(chunk, FLAG_OVERLAP))
+            else:
+                chunk = data[offset:offset + frag_size]
+                buf.extend(self._pack_fragment(chunk, FLAG_REAL))
 
-        # 2. Send real data batch
+            offset += frag_size
+            is_first = False
+
+        # Send real data batch
         self._writer.write(bytes(buf))
         await self._writer.drain()
 
-        # 3. Send chaff separately after real data (non-blocking)
+        # Send chaff separately (non-blocking)
         if self.chaff_chance > 0 and random.random() < self.chaff_chance:
             chaff_buf = bytearray()
             n_chaff = random.randint(1, 3)
@@ -84,7 +94,6 @@ class FragmentedWriter:
                 chaff_data = os.urandom(random.randint(self.min_frag, self.max_frag))
                 chaff_buf.extend(self._pack_fragment(chaff_data, FLAG_CHAFF))
             self._writer.write(bytes(chaff_buf))
-            # No drain — chaff goes out with next real write
 
     @staticmethod
     def _pack_fragment(data: bytes, flags: int) -> bytes:
@@ -105,9 +114,10 @@ class FragmentedWriter:
 class FragmentedReader:
     """Обёртка над asyncio.StreamReader: собирает фрагменты при чтении."""
 
-    def __init__(self, reader: asyncio.StreamReader):
+    def __init__(self, reader: asyncio.StreamReader, overlap: int = 0):
         self._reader = reader
         self._buffer = bytearray()
+        self.overlap = overlap
 
     async def readexactly(self, n: int) -> bytes:
         """Читает ровно n байт, собирая из фрагментов."""
@@ -126,7 +136,7 @@ class FragmentedReader:
         return result
 
     async def _read_fragment(self):
-        """Read one fragment: [2B len][1B flags][data]. Drop chaff."""
+        """Read one fragment: [2B len][1B flags][data]."""
         while True:
             hdr = await self._reader.readexactly(2)
             total = struct.unpack(">H", hdr)[0]
@@ -136,16 +146,22 @@ class FragmentedReader:
             data = payload[1:]
 
             if flags == FLAG_CHAFF:
-                # Drop chaff silently
                 continue
 
-            # Real data — add to buffer
+            if flags == FLAG_OVERLAP and self.overlap > 0:
+                # Strip overlap prefix — first overlap bytes are duplicate
+                data = data[self.overlap:]
+
             self._buffer.extend(data)
             return
 
 
 def wrap_connection(reader: asyncio.StreamReader,
                     writer: asyncio.StreamWriter,
+                    overlap: int = 0,
                     **kwargs) -> tuple[FragmentedReader, FragmentedWriter]:
     """Оборачивает TCP-соединение в фрагментированный транспорт."""
-    return FragmentedReader(reader), FragmentedWriter(writer, **kwargs)
+    return (
+        FragmentedReader(reader, overlap=overlap),
+        FragmentedWriter(writer, overlap=overlap, **kwargs),
+    )
