@@ -57,6 +57,7 @@ async def main(args):
         server_port=args.port,
         key=key,
         transport_type=args.transport,
+        use_tls=args.tls,
     )
 
     # Загружаем списки доменов
@@ -70,7 +71,8 @@ async def main(args):
         "youtube.com", "vk.com", "instagram.com",
         "discord.com", "gosuslugi.ru", "google.com",
     ]
-    print(f"\nСервер: {args.server}:{args.port} [{args.transport}]")
+    tls_label = " + TLS/SNI" if args.tls else ""
+    print(f"\nСервер: {args.server}:{args.port} [{args.transport}{tls_label}]")
     print(f"\nМаршрутизация:")
     print("-" * 42)
     for domain in test_domains:
@@ -94,6 +96,8 @@ def cli():
     parser.add_argument("--port", type=int, default=8443)
     parser.add_argument("--transport", choices=["tcp", "ws"], default="tcp")
     parser.add_argument("--socks-port", type=int, default=1080)
+    parser.add_argument("--tls", action="store_true",
+                        help="Use TLS with random SNI (white domains)")
     parser.add_argument("--key-file", default="xzap.key")
     return parser.parse_args()
 

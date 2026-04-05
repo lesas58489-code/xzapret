@@ -56,15 +56,24 @@ class XZAPTunnelClient:
     """Открывает туннель к target через XZAP-сервер."""
 
     def __init__(self, server_host: str, server_port: int,
-                 key: bytes = None, algo: str = ALGO_AES_GCM):
+                 key: bytes = None, algo: str = ALGO_AES_GCM,
+                 use_tls: bool = False):
         self.server_host = server_host
         self.server_port = server_port
         self.crypto = XZAPCrypto(key=key, algo=algo)
+        self.use_tls = use_tls
 
     async def connect_tunnel(self, target_host: str, target_port: int):
-        raw_reader, raw_writer = await asyncio.open_connection(
-            self.server_host, self.server_port
-        )
+        if self.use_tls:
+            from .tls import open_tls_connection, random_sni
+            sni = random_sni()
+            raw_reader, raw_writer = await open_tls_connection(
+                self.server_host, self.server_port, sni=sni,
+            )
+        else:
+            raw_reader, raw_writer = await asyncio.open_connection(
+                self.server_host, self.server_port
+            )
         sock = raw_writer.get_extra_info("socket")
         if sock:
             import socket

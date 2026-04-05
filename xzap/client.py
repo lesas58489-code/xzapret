@@ -21,10 +21,12 @@ log = logging.getLogger("xzap.client")
 class XZAPClient:
     def __init__(self, server_host: str, server_port: int,
                  key: bytes = None, algo: str = ALGO_AES_GCM,
-                 num_paths: int = 4, transport_type: str = "tcp"):
+                 num_paths: int = 4, transport_type: str = "tcp",
+                 use_tls: bool = False):
         self.server_host = server_host
         self.server_port = server_port
         self.transport_type = transport_type
+        self.use_tls = use_tls
         self.crypto = XZAPCrypto(key=key, algo=algo)
         self.obfuscator = Obfuscator(num_paths=num_paths)
         self.adaptive = AdaptiveStrategy()
@@ -100,6 +102,7 @@ class XZAPClient:
         tunnel = XZAPTunnelClient(
             self.server_host, self.server_port,
             key=self.crypto.key, algo=self.crypto.algo,
+            use_tls=self.use_tls,
         )
         stream = await tunnel.connect_tunnel(hostname, port)
         log.debug("Tunnel open → %s:%d", hostname, port)
