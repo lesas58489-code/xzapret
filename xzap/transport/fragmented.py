@@ -47,7 +47,7 @@ class FragmentedWriter:
                  overlap: int = 0,
                  chaff_chance: float = 0.2,
                  delay_ms: tuple[int, int] = (0, 3),
-                 frag_threshold: int = 4096):
+                 frag_threshold: int = 512):
         self._writer = writer
         self.min_frag = min_frag
         self.max_frag = max_frag

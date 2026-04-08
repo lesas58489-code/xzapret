@@ -26,7 +26,7 @@ from .transport.fragmented import wrap_connection
 
 log = logging.getLogger("xzap.tunnel")
 
-PREFIX_SIZE = 64
+PREFIX_SIZE = 16
 MAX_FRAME_SIZE = 256 * 1024
 
 
@@ -180,7 +180,7 @@ class XZAPTunnelServer:
 
             async def target_to_xzap():
                 try:
-                    while chunk := await target_r.read(16384):
+                    while chunk := await target_r.read(65536):
                         log.debug("target→xzap: %d bytes", len(chunk))
                         await _send_frame(writer, self.crypto, chunk)
                     log.debug("target→xzap: EOF")
