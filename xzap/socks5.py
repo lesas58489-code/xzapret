@@ -95,11 +95,17 @@ class SOCKS5Proxy:
                 await self._reply(writer, REP_SUCCESS, hostname, port)
 
                 # Pipe: клиент ↔ XZAP tunnel stream
-                await asyncio.gather(
-                    _pipe_reader_to_stream(reader, stream),
-                    _pipe_stream_to_writer(stream, writer),
-                    return_exceptions=True,
+                t1 = asyncio.create_task(_pipe_reader_to_stream(reader, stream))
+                t2 = asyncio.create_task(_pipe_stream_to_writer(stream, writer))
+                done, pending = await asyncio.wait(
+                    [t1, t2], return_when=asyncio.FIRST_COMPLETED,
                 )
+                for t in pending:
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
             else:
                 # Прямое TCP подключение
                 try:
@@ -190,7 +196,7 @@ async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
 async def _pipe_reader_to_stream(reader: asyncio.StreamReader, stream):
     """TCP reader → XZAP tunnel stream (write)."""
     try:
-        while chunk := await reader.read(16384):
+        while chunk := await reader.read(65536):
             log.debug("client→tunnel: %d bytes", len(chunk))
             await stream.write(chunk)
     except Exception as e:
