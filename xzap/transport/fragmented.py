@@ -149,6 +149,8 @@ class FragmentedReader:
         while True:
             hdr = await self._reader.readexactly(2)
             total = struct.unpack(">H", hdr)[0]
+            if total == 0:
+                raise asyncio.IncompleteReadError(b"", 2)
             payload = await self._reader.readexactly(total)
 
             flags = payload[0]
@@ -158,7 +160,6 @@ class FragmentedReader:
                 continue
 
             if flags == FLAG_OVERLAP and self.overlap > 0:
-                # Strip overlap prefix — first overlap bytes are duplicate
                 data = data[self.overlap:]
 
             self._buffer.extend(data)
