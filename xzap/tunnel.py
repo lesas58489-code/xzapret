@@ -22,7 +22,7 @@ import struct
 import os
 import logging
 from .crypto import XZAPCrypto, ALGO_AES_GCM
-# from .transport.fragmented import wrap_connection  # temporarily disabled
+from .transport.fragmented import wrap_connection
 
 log = logging.getLogger("xzap.tunnel")
 
@@ -36,8 +36,11 @@ async def _send_frame(writer, crypto, data):
     prefix = os.urandom(PREFIX_SIZE)
     payload = prefix + encrypted
     frame = struct.pack(">I", len(payload)) + payload
-    writer.write(frame)
-    await writer.drain()
+    coro = writer.write(frame)
+    if asyncio.iscoroutine(coro):
+        await coro  # FragmentedWriter.write() is async
+    else:
+        await writer.drain()  # asyncio.StreamWriter.write() is sync
 
 
 async def _recv_frame(reader, crypto):
@@ -80,8 +83,8 @@ class XZAPTunnelClient:
             import socket
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        # Fragmentation disabled (test mode) — use raw TCP
-        reader, writer = raw_reader, raw_writer
+        # Micro-fragmentation layer (anti-DPI)
+        reader, writer = wrap_connection(raw_reader, raw_writer)
 
         # Handshake
         req = json.dumps({
@@ -96,7 +99,7 @@ class XZAPTunnelClient:
             raise ConnectionError(f"XZAP tunnel refused: {response.get('err')}")
 
         log.info("Tunnel open → %s:%d", target_host, target_port)
-        return XZAPTunnelStream(reader, writer, self.crypto)
+        return XZAPTunnelStream(reader, writer, self.crypto, raw_writer=raw_writer)
 
 
 class XZAPTunnelStream:
@@ -136,8 +139,8 @@ class XZAPTunnelServer:
             import socket
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        # Fragmentation disabled (test mode) — use raw TCP
-        reader, writer = raw_reader, raw_writer
+        # Micro-fragmentation layer (anti-DPI)
+        reader, writer = wrap_connection(raw_reader, raw_writer)
 
         try:
             # Handshake

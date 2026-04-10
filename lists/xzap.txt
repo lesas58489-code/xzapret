@@ -22,3 +22,5 @@ medium.com
 github.com
 notion.so
 figma.com
+telegram.org
+t.me
