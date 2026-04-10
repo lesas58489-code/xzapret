@@ -17,6 +17,7 @@ spotify.com
 netflix.com
 twitch.tv
 wikipedia.org
+wikimedia.org
 medium.com
 github.com
 notion.so
