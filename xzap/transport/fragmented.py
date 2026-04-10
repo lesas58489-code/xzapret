@@ -45,9 +45,9 @@ class FragmentedWriter:
     def __init__(self, writer: asyncio.StreamWriter,
                  min_frag: int = 24, max_frag: int = 68,
                  overlap: int = 0,
-                 chaff_chance: float = 0.2,
+                 chaff_chance: float = 0.0,
                  delay_ms: tuple[int, int] = (0, 3),
-                 frag_threshold: int = 512):
+                 frag_threshold: int = 150):
         self._writer = writer
         self.min_frag = min_frag
         self.max_frag = max_frag
