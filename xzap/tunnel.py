@@ -22,7 +22,7 @@ import struct
 import os
 import logging
 from .crypto import XZAPCrypto, ALGO_AES_GCM
-from .transport.fragmented import wrap_connection
+# from .transport.fragmented import wrap_connection  # temporarily disabled
 
 log = logging.getLogger("xzap.tunnel")
 
@@ -36,7 +36,8 @@ async def _send_frame(writer, crypto, data):
     prefix = os.urandom(PREFIX_SIZE)
     payload = prefix + encrypted
     frame = struct.pack(">I", len(payload)) + payload
-    await writer.write(frame)
+    writer.write(frame)
+    await writer.drain()
 
 
 async def _recv_frame(reader, crypto):
@@ -79,10 +80,8 @@ class XZAPTunnelClient:
             import socket
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        # Wrap TCP in fragmented transport
-        reader, writer = wrap_connection(raw_reader, raw_writer,
-                                          overlap=4, chaff_chance=0.2,
-                                          delay_ms=(0, 0))
+        # Fragmentation disabled (test mode) — use raw TCP
+        reader, writer = raw_reader, raw_writer
 
         # Handshake
         req = json.dumps({
@@ -97,7 +96,7 @@ class XZAPTunnelClient:
             raise ConnectionError(f"XZAP tunnel refused: {response.get('err')}")
 
         log.info("Tunnel open → %s:%d", target_host, target_port)
-        return XZAPTunnelStream(reader, writer, self.crypto, raw_writer)
+        return XZAPTunnelStream(reader, writer, self.crypto)
 
 
 class XZAPTunnelStream:
@@ -137,10 +136,8 @@ class XZAPTunnelServer:
             import socket
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        # Wrap TCP in fragmented transport
-        reader, writer = wrap_connection(raw_reader, raw_writer,
-                                          overlap=4, chaff_chance=0.2,
-                                          delay_ms=(0, 0))
+        # Fragmentation disabled (test mode) — use raw TCP
+        reader, writer = raw_reader, raw_writer
 
         try:
             # Handshake
@@ -176,9 +173,13 @@ class XZAPTunnelServer:
                         target_w.write(data)
                         await target_w.drain()
                         sent += len(data)
-                        log.debug("→target %s:%d sent=%d", target_host, target_port, sent)
+                except asyncio.CancelledError:
+                    log.info("xzap→target CANCEL %s:%d sent=%d", target_host, target_port, sent)
+                    raise
                 except Exception as e:
                     log.info("xzap→target ended %s:%d sent=%d err=%s", target_host, target_port, sent, e)
+                finally:
+                    log.info("xzap→target DONE %s:%d sent=%d", target_host, target_port, sent)
 
             async def target_to_xzap():
                 recv = 0
@@ -186,9 +187,13 @@ class XZAPTunnelServer:
                     while chunk := await target_r.read(65536):
                         await _send_frame(writer, self.crypto, chunk)
                         recv += len(chunk)
-                        log.debug("←target %s:%d recv=%d", target_host, target_port, recv)
+                except asyncio.CancelledError:
+                    log.info("target→xzap CANCEL %s:%d recv=%d", target_host, target_port, recv)
+                    raise
                 except Exception as e:
                     log.info("target→xzap ended %s:%d recv=%d err=%s", target_host, target_port, recv, e)
+                finally:
+                    log.info("target→xzap DONE %s:%d recv=%d", target_host, target_port, recv)
 
             t1 = asyncio.create_task(xzap_to_target())
             t2 = asyncio.create_task(target_to_xzap())
