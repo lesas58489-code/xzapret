@@ -36,7 +36,7 @@ FLAG_REAL = 0x00
 FLAG_CHAFF = 0x01
 FLAG_OVERLAP = 0x02
 
-FRAG_HDR = 3
+FRAG_HDR = 5
 
 
 class FragmentedWriter:
@@ -106,9 +106,9 @@ class FragmentedWriter:
 
     @staticmethod
     def _pack_fragment(data: bytes, flags: int) -> bytes:
-        """Pack [2B len][1B flags][data]."""
+        """Pack [4B len][1B flags][data]."""
         total = len(data) + 1
-        return struct.pack(">HB", total, flags) + data
+        return struct.pack(">IB", total, flags) + data
 
     def close(self):
         self._writer.close()
@@ -145,10 +145,10 @@ class FragmentedReader:
         return result
 
     async def _read_fragment(self):
-        """Read one fragment: [2B len][1B flags][data]."""
+        """Read one fragment: [4B len][1B flags][data]."""
         while True:
-            hdr = await self._reader.readexactly(2)
-            total = struct.unpack(">H", hdr)[0]
+            hdr = await self._reader.readexactly(4)
+            total = struct.unpack(">I", hdr)[0]
             if total == 0:
                 raise asyncio.IncompleteReadError(b"", 2)
             payload = await self._reader.readexactly(total)

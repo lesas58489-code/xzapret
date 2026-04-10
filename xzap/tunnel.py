@@ -169,20 +169,26 @@ class XZAPTunnelServer:
             log.info("Tunnelling → %s:%d", target_host, target_port)
 
             async def xzap_to_target():
+                sent = 0
                 try:
                     while True:
                         data = await _recv_frame(reader, self.crypto)
                         target_w.write(data)
                         await target_w.drain()
+                        sent += len(data)
+                        log.debug("→target %s:%d sent=%d", target_host, target_port, sent)
                 except Exception as e:
-                    log.debug("xzap→target ended: %s", e)
+                    log.info("xzap→target ended %s:%d sent=%d err=%s", target_host, target_port, sent, e)
 
             async def target_to_xzap():
+                recv = 0
                 try:
                     while chunk := await target_r.read(65536):
                         await _send_frame(writer, self.crypto, chunk)
+                        recv += len(chunk)
+                        log.debug("←target %s:%d recv=%d", target_host, target_port, recv)
                 except Exception as e:
-                    log.debug("target→xzap ended: %s", e)
+                    log.info("target→xzap ended %s:%d recv=%d err=%s", target_host, target_port, recv, e)
 
             t1 = asyncio.create_task(xzap_to_target())
             t2 = asyncio.create_task(target_to_xzap())
