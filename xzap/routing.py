@@ -32,7 +32,8 @@ class XZAPRouter:
             if p.exists():
                 lines = p.read_text(encoding="utf-8").splitlines()
                 self.bypass_domains.update(
-                    line.strip().lower() for line in lines if line.strip()
+                    line.strip().lower() for line in lines
+                    if line.strip() and not line.strip().startswith("#")
                 )
                 log.info("Loaded %d bypass domains", len(self.bypass_domains))
 
@@ -41,7 +42,8 @@ class XZAPRouter:
             if p.exists():
                 lines = p.read_text(encoding="utf-8").splitlines()
                 self.xzap_domains.update(
-                    line.strip().lower() for line in lines if line.strip()
+                    line.strip().lower() for line in lines
+                    if line.strip() and not line.strip().startswith("#")
                 )
                 log.info("Loaded %d xzap domains", len(self.xzap_domains))
 

@@ -196,6 +196,16 @@ def generate_self_signed_cert(cert_path: str = "xzap_cert.pem",
     return cert_path, key_path
 
 
+_client_ctx_cache = None
+
+
+def _get_client_context() -> ssl.SSLContext:
+    global _client_ctx_cache
+    if _client_ctx_cache is None:
+        _client_ctx_cache = create_client_context()
+    return _client_ctx_cache
+
+
 async def open_tls_connection(host: str, port: int,
                                sni: str = None) -> tuple:
     """Открывает TLS-соединение с кастомным SNI.
@@ -204,7 +214,7 @@ async def open_tls_connection(host: str, port: int,
     Каждое новое соединение автоматически использует другой SNI (round-robin).
     """
     sni = sni or rotating_sni()
-    ctx = create_client_context()
+    ctx = _get_client_context()
     reader, writer = await asyncio.open_connection(
         host, port, ssl=ctx, server_hostname=sni,
     )

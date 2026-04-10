@@ -143,8 +143,10 @@ class XZAPTunnelServer:
         reader, writer = wrap_connection(raw_reader, raw_writer)
 
         try:
-            # Handshake
-            ctrl = await _recv_frame(reader, self.crypto)
+            # Handshake (30s timeout against resource exhaustion)
+            ctrl = await asyncio.wait_for(
+                _recv_frame(reader, self.crypto), timeout=30
+            )
             req = json.loads(ctrl)
             if req.get("cmd") != "connect":
                 await _send_frame(writer, self.crypto,
@@ -161,7 +163,7 @@ class XZAPTunnelServer:
                 )
             except Exception as e:
                 await _send_frame(writer, self.crypto,
-                                   json.dumps({"ok": False, "err": str(e)}).encode())
+                                   json.dumps({"ok": False, "err": "connect failed"}).encode())
                 return
 
             await _send_frame(writer, self.crypto,
@@ -218,4 +220,8 @@ class XZAPTunnelServer:
         except Exception as e:
             log.debug("Tunnel error: %s", e)
         finally:
-            raw_writer.close()
+            try:
+                raw_writer.close()
+                await raw_writer.wait_closed()
+            except Exception:
+                pass

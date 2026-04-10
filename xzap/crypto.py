@@ -53,11 +53,15 @@ class XZAPCrypto:
     def __init__(self, key: bytes = None, algo: str = ALGO_AES_GCM):
         self.algo = algo
         self.key = key or os.urandom(KEY_SIZE)
+        self._cached_cipher = None
 
     def _cipher(self):
-        if self.algo == ALGO_AES_GCM:
-            return AESGCM(self.key)
-        return ChaCha20Poly1305(self.key)
+        if self._cached_cipher is None:
+            if self.algo == ALGO_AES_GCM:
+                self._cached_cipher = AESGCM(self.key)
+            else:
+                self._cached_cipher = ChaCha20Poly1305(self.key)
+        return self._cached_cipher
 
     def encrypt(self, plaintext: bytes, aad: bytes = None) -> bytes:
         """Returns nonce || ciphertext || tag."""

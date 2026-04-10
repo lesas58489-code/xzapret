@@ -119,11 +119,17 @@ class SOCKS5Proxy:
 
                 await self._reply(writer, REP_SUCCESS, hostname, port)
 
-                await asyncio.gather(
-                    _pipe(reader, remote_w),
-                    _pipe(remote_r, writer),
-                    return_exceptions=True,
+                t1 = asyncio.create_task(_pipe(reader, remote_w))
+                t2 = asyncio.create_task(_pipe(remote_r, writer))
+                done, pending = await asyncio.wait(
+                    [t1, t2], return_when=asyncio.FIRST_COMPLETED,
                 )
+                for t in pending:
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
         except (asyncio.IncompleteReadError, ConnectionResetError):
             pass

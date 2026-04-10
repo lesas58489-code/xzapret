@@ -18,7 +18,7 @@ Anti-DPI техники:
   - Random fragment sizes
 
 Wire format per fragment:
-  [2B total_len][1B flags][data]
+  [4B total_len][1B flags][data]
   flags:
     bit 0 (0x01): chaff — receiver drops
     bit 1 (0x02): overlap — receiver strips first overlap_size bytes
