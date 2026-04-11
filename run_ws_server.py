@@ -172,6 +172,7 @@ async def run(host: str, port: int, key: bytes, ws_path: str,
         max_size=2 ** 20,
         ping_interval=30,
         ping_timeout=15,
+        compression=None,  # no deflate — encrypted data doesn't compress
         ssl=ssl_ctx,
     ):
         mode = "WSS (TLS)" if ssl_ctx else "WS"

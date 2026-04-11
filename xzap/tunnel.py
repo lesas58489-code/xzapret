@@ -81,6 +81,7 @@ class XZAPTunnelClient:
         ws = await websockets.client.connect(
             self.ws_url, max_size=2 ** 20,
             ping_interval=30, ping_timeout=15,
+            compression=None,  # disable deflate — encrypted data doesn't compress
         )
         reader = WSReader(ws)
         writer = WSWriter(ws)

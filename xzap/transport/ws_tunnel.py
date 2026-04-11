@@ -13,6 +13,14 @@ import logging
 
 log = logging.getLogger("xzap.transport.ws_tunnel")
 
+# Exceptions that mean "connection closed normally"
+_CLOSE_ERRORS = (
+    asyncio.IncompleteReadError,
+    ConnectionResetError,
+    BrokenPipeError,
+    OSError,
+)
+
 
 class WSReader:
     """Adapts WebSocket recv() to StreamReader-like readexactly()."""
@@ -28,10 +36,12 @@ class WSReader:
                 if isinstance(msg, str):
                     msg = msg.encode()
                 self._buffer.extend(msg)
-            except Exception:
-                raise asyncio.IncompleteReadError(
-                    bytes(self._buffer), n
-                )
+            except _CLOSE_ERRORS:
+                raise asyncio.IncompleteReadError(bytes(self._buffer), n)
+            except Exception as e:
+                # WinError 121 (semaphore timeout), websockets.ConnectionClosed, etc.
+                log.debug("WS recv error: %s", e)
+                raise asyncio.IncompleteReadError(bytes(self._buffer), n)
         result = bytes(self._buffer[:n])
         self._buffer = self._buffer[n:]
         return result
