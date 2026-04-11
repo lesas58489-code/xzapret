@@ -6,7 +6,7 @@ echo Building XZAP Client...
 
 cd /d "%~dp0\..\..\"
 
-pyinstaller --onefile --windowed ^
+python -m PyInstaller --onefile --windowed ^
     --name "XZAP Client" ^
     --add-data "lists;lists" ^
     --add-data "xzap;xzap" ^
