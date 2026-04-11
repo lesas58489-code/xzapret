@@ -1,137 +1,114 @@
 #!/usr/bin/env python3
 """
-XZAP WebSocket Bridge — серверная сторона.
+XZAP WebSocket Bridge — transparent WS↔TCP proxy.
 
-cloudflared (WSS) → этот мост (WS на 127.0.0.1:8080) → XZAP (TCP на 127.0.0.1:8443)
+cloudflared (WSS) → this bridge (WS on :8080) → XZAP server (TCP on :8443)
 
-Запуск:
-    python3 xzap_ws_bridge.py
-
-cloudflared config.yml:
-    ingress:
-      - hostname: xzap.example.com
-        service: ws://localhost:8080
-      - service: http_status:404
-
-Каждое WS-соединение создаёт TCP-соединение к XZAP-серверу
-и прозрачно проксирует бинарные данные в обе стороны.
+Each WebSocket connection creates a TCP connection to the XZAP server
+and transparently proxies binary data in both directions.
 """
 
 import asyncio
 import logging
-import signal
-import sys
 
-try:
-    import websockets
-    from websockets.server import serve
-except ImportError:
-    print("pip install websockets")
-    sys.exit(1)
+from aiohttp import web, WSMsgType
 
-# --- Настройки ---
 WS_HOST = "127.0.0.1"
 WS_PORT = 8080
 XZAP_HOST = "127.0.0.1"
-XZAP_PORT = 8443  # твой XZAP TLS listener
+XZAP_PORT = 8443
 BUFFER_SIZE = 65536
-LOG_LEVEL = logging.INFO
 
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("xzap-ws-bridge")
+log = logging.getLogger("xzap-bridge")
 
 
-async def pipe_ws_to_tcp(ws, writer, peer: str):
-    """WS binary frames → TCP."""
-    try:
-        async for msg in ws:
-            if isinstance(msg, bytes):
-                writer.write(msg)
-                await writer.drain()
-            # текстовые фреймы игнорируем
-    except websockets.ConnectionClosed:
-        pass
-    except Exception as e:
-        log.debug(f"[{peer}] ws→tcp error: {e}")
-    finally:
-        writer.close()
+async def ws_handler(request: web.Request) -> web.WebSocketResponse:
+    ws = web.WebSocketResponse(
+        max_msg_size=2 ** 20,
+        autoping=True,
+        compress=False,
+    )
+    await ws.prepare(request)
 
+    peer = request.remote
+    log.info("[%s] WS connected", peer)
 
-async def pipe_tcp_to_ws(reader, ws, peer: str):
-    """TCP → WS binary frames."""
-    try:
-        while True:
-            data = await reader.read(BUFFER_SIZE)
-            if not data:
-                break
-            await ws.send(data)
-    except (websockets.ConnectionClosed, ConnectionResetError):
-        pass
-    except Exception as e:
-        log.debug(f"[{peer}] tcp→ws error: {e}")
-
-
-async def handle_client(ws):
-    peer = ws.remote_address
-    log.info(f"[{peer}] WS connected")
-
+    # Connect to XZAP server
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(XZAP_HOST, XZAP_PORT),
             timeout=5.0,
         )
     except Exception as e:
-        log.error(f"[{peer}] cannot connect to XZAP: {e}")
-        await ws.close(1011, "backend unavailable")
-        return
+        log.error("[%s] cannot connect to XZAP: %s", peer, e)
+        await ws.close(message=b"backend unavailable")
+        return ws
 
-    log.info(f"[{peer}] → XZAP connected")
+    log.info("[%s] → XZAP connected", peer)
 
-    tasks = [
-        asyncio.create_task(pipe_ws_to_tcp(ws, writer, str(peer))),
-        asyncio.create_task(pipe_tcp_to_ws(reader, ws, str(peer))),
-    ]
+    async def ws_to_tcp():
+        """WS binary frames → TCP."""
+        try:
+            async for msg in ws:
+                if msg.type == WSMsgType.BINARY:
+                    writer.write(msg.data)
+                    await writer.drain()
+                elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
+                    break
+        except Exception as e:
+            log.debug("[%s] ws→tcp: %s", peer, e)
 
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    async def tcp_to_ws():
+        """TCP → WS binary frames."""
+        try:
+            while True:
+                data = await reader.read(BUFFER_SIZE)
+                if not data:
+                    break
+                await ws.send_bytes(data)
+        except Exception as e:
+            log.debug("[%s] tcp→ws: %s", peer, e)
+
+    t1 = asyncio.create_task(ws_to_tcp())
+    t2 = asyncio.create_task(tcp_to_ws())
+    done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
 
     for t in pending:
         t.cancel()
+        try:
+            await t
+        except (asyncio.CancelledError, Exception):
+            pass
 
     writer.close()
     try:
-        await ws.close()
+        await writer.wait_closed()
     except Exception:
         pass
 
-    log.info(f"[{peer}] session closed")
+    if not ws.closed:
+        await ws.close()
+
+    log.info("[%s] session closed", peer)
+    return ws
 
 
-async def main():
-    stop = asyncio.get_event_loop().create_future()
+def main():
+    app = web.Application()
+    # Accept WebSocket on any path (cloudflared sends to /)
+    app.router.add_get("/{path:.*}", ws_handler)
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        asyncio.get_event_loop().add_signal_handler(sig, stop.set_result, None)
-
-    async with serve(
-        handle_client,
-        WS_HOST,
-        WS_PORT,
-        # cloudflared сам терминирует TLS, тут plain WS
-        ping_interval=None,     # cloudflared не пробрасывает WS PING/PONG
-        ping_timeout=None,
-        max_size=2**20,         # 1MB макс фрейм
-        compression=None,       # XZAP уже шифрован, сжатие бесполезно
-    ):
-        log.info(f"WS bridge listening on {WS_HOST}:{WS_PORT}")
-        log.info(f"Forwarding to XZAP at {XZAP_HOST}:{XZAP_PORT}")
-        await stop
-
-    log.info("Shutting down")
+    log.info("WS bridge: %s:%d → XZAP %s:%d", WS_HOST, WS_PORT, XZAP_HOST, XZAP_PORT)
+    web.run_app(app, host=WS_HOST, port=WS_PORT, print=lambda s: log.info(s))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        main()
+    except KeyboardInterrupt:
+        log.info("Shutting down")
