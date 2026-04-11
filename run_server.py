@@ -40,9 +40,9 @@ def load_key(path: str) -> bytes:
 
 
 async def run_tcp_server(host: str, port: int, key: bytes):
-    """TCP-сервер (без TLS)."""
+    """TCP-сервер (без TLS, без фрагментации — для cloudflared)."""
     crypto = XZAPCrypto(key=key)
-    tunnel_handler = XZAPTunnelServer(crypto)
+    tunnel_handler = XZAPTunnelServer(crypto, use_fragmentation=False)
     listener = XZAPListener(host, port)
     await listener.start(tunnel_handler.handle)
     log.info("XZAP TCP server ready on %s:%d", host, port)

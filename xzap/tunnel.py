@@ -130,8 +130,12 @@ class XZAPTunnelClient:
             import socket
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        # Micro-fragmentation layer (anti-DPI)
-        reader, writer = wrap_connection(raw_reader, raw_writer)
+        if self.use_tls:
+            # Micro-fragmentation only for direct TLS (anti-DPI)
+            reader, writer = wrap_connection(raw_reader, raw_writer)
+        else:
+            # Plain TCP (e.g. through cloudflared) — no fragmentation needed
+            reader, writer = raw_reader, raw_writer
 
         # Handshake
         req = json.dumps({
@@ -175,8 +179,9 @@ class XZAPTunnelStream:
 class XZAPTunnelServer:
     """Серверная сторона туннеля."""
 
-    def __init__(self, crypto: XZAPCrypto, obfuscator=None):
+    def __init__(self, crypto: XZAPCrypto, obfuscator=None, use_fragmentation: bool = True):
         self.crypto = crypto
+        self.use_fragmentation = use_fragmentation
 
     async def handle(self, raw_reader, raw_writer):
         addr = raw_writer.get_extra_info("peername")
@@ -186,8 +191,10 @@ class XZAPTunnelServer:
             import socket
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        # Micro-fragmentation layer (anti-DPI)
-        reader, writer = wrap_connection(raw_reader, raw_writer)
+        if self.use_fragmentation:
+            reader, writer = wrap_connection(raw_reader, raw_writer)
+        else:
+            reader, writer = raw_reader, raw_writer
 
         try:
             # Handshake (30s timeout against resource exhaustion)
