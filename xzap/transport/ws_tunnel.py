@@ -23,23 +23,38 @@ _CLOSE_ERRORS = (
 
 
 class WSReader:
-    """Adapts WebSocket recv() to StreamReader-like readexactly()."""
+    """Adapts WebSocket recv() to StreamReader-like readexactly().
+    Works with both aiohttp (msg.data) and websockets (raw bytes) APIs.
+    """
 
     def __init__(self, ws):
         self._ws = ws
         self._buffer = bytearray()
+        # aiohttp WS uses receive() → WSMessage; websockets uses recv() → bytes
+        self._is_aiohttp = hasattr(ws, 'receive')
+
+    async def _recv_bytes(self) -> bytes:
+        """Read one message as bytes from either aiohttp or websockets WS."""
+        if self._is_aiohttp:
+            import aiohttp
+            msg = await self._ws.receive()
+            if msg.type == aiohttp.WSMsgType.BINARY:
+                return msg.data
+            if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
+                            aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                raise ConnectionError("WS closed")
+            return b""
+        else:
+            msg = await self._ws.recv()
+            return msg if isinstance(msg, bytes) else msg.encode()
 
     async def readexactly(self, n: int) -> bytes:
         while len(self._buffer) < n:
             try:
-                msg = await self._ws.recv()
-                if isinstance(msg, str):
-                    msg = msg.encode()
-                self._buffer.extend(msg)
-            except _CLOSE_ERRORS:
-                raise asyncio.IncompleteReadError(bytes(self._buffer), n)
+                data = await self._recv_bytes()
+                if data:
+                    self._buffer.extend(data)
             except Exception as e:
-                # WinError 121 (semaphore timeout), websockets.ConnectionClosed, etc.
                 log.debug("WS recv error: %s", e)
                 raise asyncio.IncompleteReadError(bytes(self._buffer), n)
         result = bytes(self._buffer[:n])
@@ -49,10 +64,9 @@ class WSReader:
     async def read(self, n: int) -> bytes:
         if not self._buffer:
             try:
-                msg = await self._ws.recv()
-                if isinstance(msg, str):
-                    msg = msg.encode()
-                self._buffer.extend(msg)
+                data = await self._recv_bytes()
+                if data:
+                    self._buffer.extend(data)
             except Exception:
                 return b""
         result = bytes(self._buffer[:n])
@@ -68,6 +82,9 @@ class WSWriter:
 
     def write(self, data: bytes):
         """Returns a coroutine — _send_frame will await it."""
+        # aiohttp uses send_bytes, websockets uses send
+        if hasattr(self._ws, 'send_bytes'):
+            return self._ws.send_bytes(data)
         return self._ws.send(data)
 
     async def drain(self):

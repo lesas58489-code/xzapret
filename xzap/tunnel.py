@@ -74,44 +74,41 @@ class XZAPTunnelClient:
         return await self._connect_tcp(target_host, target_port)
 
     async def _connect_ws(self, target_host: str, target_port: int):
-        """Connect via multiplexed WebSocket (through Cloudflare CDN).
-        All tunnels share ONE persistent aiohttp WebSocket connection.
+        """Connect via WebSocket bridge (through Cloudflare Tunnel).
+        Each tunnel = one WSS connection. Bridge forwards WS↔TCP to XZAP server.
         """
-        # Lazy-init if not provided by XZAPClient
-        if not hasattr(self, '_mux') or self._mux is None:
-            from .transport.ws_mux import MuxClient
-            self._mux = MuxClient(self.ws_url)
-        # Try handshake with 5s timeout; on failure, force reconnect and retry once
-        for attempt in range(2):
-            await self._mux.ensure_connected()
-            stream = self._mux.create_stream()
+        import aiohttp
+        from .transport.ws_tunnel import WSReader, WSWriter
 
-            req = json.dumps({
-                "cmd": "connect",
-                "host": target_host,
-                "port": target_port,
-            }).encode()
+        if not hasattr(self, '_ws_session') or self._ws_session is None or self._ws_session.closed:
+            self._ws_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None, connect=15)
+            )
 
-            try:
-                await _send_frame(stream, self.crypto, req)
-                response = json.loads(
-                    await asyncio.wait_for(_recv_frame(stream, self.crypto), timeout=5)
-                )
-                if not response.get("ok"):
-                    stream.close()
-                    raise ConnectionError(f"XZAP tunnel refused: {response.get('err')}")
+        ws = await self._ws_session.ws_connect(
+            self.ws_url,
+            max_msg_size=2 ** 20,
+            compress=0,
+            autoping=True,
+        )
+        reader = WSReader(ws)
+        writer = WSWriter(ws)
 
-                log.info("Tunnel open (WS/mux:%d) → %s:%d",
-                         stream.stream_id, target_host, target_port)
-                return XZAPTunnelStream(stream, stream, self.crypto, raw_writer=stream)
+        # XZAP handshake (goes through: WS → bridge → XZAP TLS server)
+        req = json.dumps({
+            "cmd": "connect",
+            "host": target_host,
+            "port": target_port,
+        }).encode()
+        await _send_frame(writer, self.crypto, req)
 
-            except (asyncio.TimeoutError, asyncio.IncompleteReadError):
-                stream.close()
-                if attempt == 0:
-                    log.info("MUX handshake timeout, forcing reconnect")
-                    await self._mux.force_reconnect()
-                else:
-                    raise ConnectionError("Tunnel handshake timeout after reconnect")
+        response = json.loads(await _recv_frame(reader, self.crypto))
+        if not response.get("ok"):
+            await ws.close()
+            raise ConnectionError(f"XZAP tunnel refused: {response.get('err')}")
+
+        log.info("Tunnel open (WS) → %s:%d", target_host, target_port)
+        return XZAPTunnelStream(reader, writer, self.crypto, raw_writer=writer)
 
     async def _connect_tcp(self, target_host: str, target_port: int):
         """Connect via direct TCP (with TLS + fragmentation)."""
