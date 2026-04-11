@@ -43,6 +43,9 @@ class MuxSession:
         self.ws = ws
         self.streams: dict[int, tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
         self.tasks: dict[int, asyncio.Task] = {}
+        # Buffer DATA that arrives before OPEN completes (TCP connect takes time)
+        self.pending_data: dict[int, list[bytes]] = {}
+        self.connecting: set[int] = set()
 
     async def send_frame(self, stream_id: int, action: int, data: bytes = b""):
         frame = struct.pack(">IB", stream_id, action) + data
@@ -61,16 +64,31 @@ class MuxSession:
         host, port = target[:sep], int(target[sep + 1:])
         log.info("[%d] OPEN → %s:%d", stream_id, host, port)
 
+        # Mark as connecting — DATA will be buffered
+        self.connecting.add(stream_id)
+        self.pending_data[stream_id] = []
+
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port), timeout=10.0
             )
         except Exception as e:
             log.warning("[%d] connect failed: %s", stream_id, e)
+            self.connecting.discard(stream_id)
+            self.pending_data.pop(stream_id, None)
             await self.send_frame(stream_id, ACT_CLOSE)
             return
 
         self.streams[stream_id] = (reader, writer)
+        self.connecting.discard(stream_id)
+
+        # Flush buffered DATA that arrived during TCP connect
+        buffered = self.pending_data.pop(stream_id, [])
+        for chunk in buffered:
+            writer.write(chunk)
+        if buffered:
+            await writer.drain()
+
         self.tasks[stream_id] = asyncio.create_task(
             self._tcp_reader(stream_id, reader)
         )
@@ -89,6 +107,13 @@ class MuxSession:
             self._close_stream(stream_id)
 
     async def handle_data(self, stream_id: int, payload: bytes):
+        # If still connecting — buffer data
+        if stream_id in self.connecting:
+            buf = self.pending_data.get(stream_id)
+            if buf is not None:
+                buf.append(payload)
+            return
+
         pair = self.streams.get(stream_id)
         if pair:
             try:
