@@ -195,9 +195,12 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                 payload = data[4:]
 
                 if stream_id not in streams:
+                    log.info("MUX new stream %d (total=%d)", stream_id, len(streams) + 1)
                     stream = MuxServerStream(ws, stream_id)
                     streams[stream_id] = stream
                     asyncio.create_task(handle_stream(stream, crypto))
+                else:
+                    log.debug("MUX data stream %d (%d bytes)", stream_id, len(payload))
 
                 stream = streams.get(stream_id)
                 if stream and not stream._closed:
