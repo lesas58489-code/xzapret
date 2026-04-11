@@ -75,12 +75,11 @@ class XZAPTunnelClient:
 
     async def _connect_ws(self, target_host: str, target_port: int):
         """Connect via multiplexed WebSocket (through Cloudflare CDN).
-        All tunnels share ONE persistent WebSocket connection.
+        All tunnels share ONE persistent aiohttp WebSocket connection.
         """
-        from .transport.ws_mux import MuxClient
-
-        # Lazy-init shared multiplexer (one per client instance)
+        # Lazy-init if not provided by XZAPClient
         if not hasattr(self, '_mux') or self._mux is None:
+            from .transport.ws_mux import MuxClient
             self._mux = MuxClient(self.ws_url)
         await self._mux.ensure_connected()
 

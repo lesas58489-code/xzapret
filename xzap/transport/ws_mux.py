@@ -14,56 +14,50 @@ Each stream maps to one XZAP tunnel (one SOCKS5 connection).
 import asyncio
 import struct
 import logging
-import time
 from typing import Dict, Optional
+
+import aiohttp
 
 log = logging.getLogger("xzap.ws_mux")
 
 
 class MuxClient:
-    """Client-side multiplexer — one WebSocket, many tunnels."""
+    """Client-side multiplexer — one aiohttp WebSocket, many tunnels.
+    Uses aiohttp instead of websockets library for Windows IocpProactor compat.
+    """
 
-    def __init__(self, ws_url: str, ping_interval: int = 20):
+    def __init__(self, ws_url: str):
         self.ws_url = ws_url
-        self.ping_interval = ping_interval
-        self._ws = None
+        self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self._session: Optional[aiohttp.ClientSession] = None
         self._streams: Dict[int, MuxStream] = {}
         self._next_id = 1
         self._lock = asyncio.Lock()
         self._reader_task: Optional[asyncio.Task] = None
-        self._connected = asyncio.Event()
 
     async def ensure_connected(self):
         """Connect if not already connected."""
-        if self._ws is not None:
-            closed = getattr(self._ws, 'closed', False)
-            if hasattr(self._ws, 'close_code'):
-                closed = self._ws.close_code is not None
-            if not closed:
-                return
+        if self._ws is not None and not self._ws.closed:
+            return
         async with self._lock:
-            # Double-check after acquiring lock
-            if self._ws is not None:
-                closed = getattr(self._ws, 'closed', False)
-                if hasattr(self._ws, 'close_code'):
-                    closed = self._ws.close_code is not None
-                if not closed:
-                    return
+            if self._ws is not None and not self._ws.closed:
+                return
             await self._connect()
 
     async def _connect(self):
-        import websockets
         log.info("MUX connecting to %s", self.ws_url)
-        self._ws = await websockets.connect(
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=None, connect=15)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+
+        self._ws = await self._session.ws_connect(
             self.ws_url,
-            max_size=2 ** 20,
-            ping_interval=None,  # disable client pings — Cloudflare doesn't relay them
-            ping_timeout=None,
-            compression=None,
-            open_timeout=15,
-            close_timeout=5,
+            max_msg_size=2 ** 20,
+            heartbeat=20,       # aiohttp handles ping/pong internally
+            compress=0,         # no compression
+            autoclose=False,    # we manage close ourselves
+            autoping=True,      # auto-respond to server pings
         )
-        self._connected.set()
         # Start background reader
         if self._reader_task is None or self._reader_task.done():
             self._reader_task = asyncio.create_task(self._read_loop())
@@ -73,30 +67,36 @@ class MuxClient:
         """Read messages from WebSocket and dispatch to streams."""
         try:
             while True:
-                try:
-                    msg = await self._ws.recv()
-                except Exception as e:
-                    log.info("MUX read error: %s", e)
+                msg = await self._ws.receive()
+
+                if msg.type == aiohttp.WSMsgType.BINARY:
+                    data = msg.data
+                    if len(data) < 4:
+                        continue
+                    stream_id = struct.unpack(">I", data[:4])[0]
+                    payload = data[4:]
+                    stream = self._streams.get(stream_id)
+                    if stream:
+                        stream._recv_buffer.append(payload)
+                        stream._data_ready.set()
+
+                elif msg.type in (aiohttp.WSMsgType.CLOSE,
+                                   aiohttp.WSMsgType.CLOSING,
+                                   aiohttp.WSMsgType.CLOSED):
+                    log.info("MUX WebSocket closed by server")
                     break
 
-                if isinstance(msg, str):
-                    msg = msg.encode()
-                if len(msg) < 4:
-                    continue
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    log.info("MUX WebSocket error: %s", self._ws.exception())
+                    break
 
-                stream_id = struct.unpack(">I", msg[:4])[0]
-                payload = msg[4:]
-
-                stream = self._streams.get(stream_id)
-                if stream:
-                    stream._recv_buffer.append(payload)
-                    stream._data_ready.set()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            log.debug("MUX reader ended: %s", e)
+            log.info("MUX reader ended: %s", e)
         finally:
             # Signal all streams that connection is dead
-            self._connected.clear()
-            for stream in self._streams.values():
+            for stream in list(self._streams.values()):
                 stream._closed = True
                 stream._data_ready.set()
 
@@ -112,7 +112,7 @@ class MuxClient:
         """Send data on a specific stream."""
         msg = struct.pack(">I", stream_id) + data
         try:
-            await self._ws.send(msg)
+            await self._ws.send_bytes(msg)
         except Exception as e:
             log.debug("MUX send error stream=%d: %s", stream_id, e)
             raise
@@ -123,11 +123,10 @@ class MuxClient:
     async def close(self):
         if self._reader_task:
             self._reader_task.cancel()
-        if self._ws:
-            try:
-                await self._ws.close()
-            except Exception:
-                pass
+        if self._ws and not self._ws.closed:
+            await self._ws.close()
+        if self._session and not self._session.closed:
+            await self._session.close()
 
 
 class MuxStream:
