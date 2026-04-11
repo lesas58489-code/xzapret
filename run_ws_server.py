@@ -25,8 +25,8 @@ import websockets
 import websockets.server
 
 from xzap.crypto import XZAPCrypto
-from xzap.tunnel import XZAPTunnelServer, _send_frame, _recv_frame
-from xzap.transport.ws_tunnel import WSReader, WSWriter
+from xzap.tunnel import _send_frame, _recv_frame
+from xzap.transport.ws_mux import MuxServer, MuxServerStream
 
 import json
 import struct
@@ -46,23 +46,16 @@ def load_key(path: str) -> bytes:
     return key
 
 
-async def handle_ws_tunnel(websocket, crypto: XZAPCrypto):
-    """Handle one WebSocket connection — run XZAP tunnel protocol."""
-    addr = websocket.remote_address
-    log.debug("WS tunnel from %s", addr)
-
-    reader = WSReader(websocket)
-    writer = WSWriter(websocket)
-
+async def handle_mux_stream(stream: MuxServerStream, crypto: XZAPCrypto):
+    """Handle one multiplexed stream — same as TCP tunnel handler."""
     try:
-        # Handshake (same protocol as TCP tunnel, no fragmentation)
         ctrl = await asyncio.wait_for(
-            _recv_frame(reader, crypto), timeout=30
+            _recv_frame(stream, crypto), timeout=30
         )
         req = json.loads(ctrl)
 
         if req.get("cmd") != "connect":
-            await _send_frame(writer, crypto,
+            await _send_frame(stream, crypto,
                               json.dumps({"ok": False, "err": "bad cmd"}).encode())
             return
 
@@ -75,49 +68,46 @@ async def handle_ws_tunnel(websocket, crypto: XZAPCrypto):
                 timeout=10,
             )
         except Exception:
-            await _send_frame(writer, crypto,
+            await _send_frame(stream, crypto,
                               json.dumps({"ok": False, "err": "connect failed"}).encode())
             return
 
-        await _send_frame(writer, crypto,
+        await _send_frame(stream, crypto,
                           json.dumps({"ok": True}).encode())
-        log.info("WS Tunnelling → %s:%d", target_host, target_port)
+        log.info("MUX Tunnelling [%d] → %s:%d", stream.stream_id, target_host, target_port)
 
-        # Bidirectional pipe
-        async def ws_to_target():
+        async def mux_to_target():
             sent = 0
             try:
                 while True:
-                    data = await _recv_frame(reader, crypto)
+                    data = await _recv_frame(stream, crypto)
                     target_w.write(data)
                     await target_w.drain()
                     sent += len(data)
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                log.debug("ws→target ended %s:%d sent=%d err=%s",
-                          target_host, target_port, sent, e)
+            except Exception:
+                pass
             finally:
-                log.info("ws→target DONE %s:%d sent=%d",
-                         target_host, target_port, sent)
+                log.info("mux→target DONE [%d] %s:%d sent=%d",
+                         stream.stream_id, target_host, target_port, sent)
 
-        async def target_to_ws():
+        async def target_to_mux():
             recv = 0
             try:
                 while chunk := await target_r.read(65536):
-                    await _send_frame(writer, crypto, chunk)
+                    await _send_frame(stream, crypto, chunk)
                     recv += len(chunk)
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                log.debug("target→ws ended %s:%d recv=%d err=%s",
-                          target_host, target_port, recv, e)
+            except Exception:
+                pass
             finally:
-                log.info("target→ws DONE %s:%d recv=%d",
-                         target_host, target_port, recv)
+                log.info("target→mux DONE [%d] %s:%d recv=%d",
+                         stream.stream_id, target_host, target_port, recv)
 
-        t1 = asyncio.create_task(ws_to_target())
-        t2 = asyncio.create_task(target_to_ws())
+        t1 = asyncio.create_task(mux_to_target())
+        t2 = asyncio.create_task(target_to_mux())
         done, pending = await asyncio.wait(
             [t1, t2], return_when=asyncio.FIRST_COMPLETED,
         )
@@ -134,7 +124,19 @@ async def handle_ws_tunnel(websocket, crypto: XZAPCrypto):
             pass
 
     except Exception as e:
-        log.debug("WS tunnel error: %s", e)
+        log.debug("MUX stream %d error: %s", stream.stream_id, e)
+    finally:
+        stream.close()
+
+
+async def handle_mux_ws(websocket, crypto: XZAPCrypto):
+    """Handle one multiplexed WebSocket — dispatch streams to tunnel handlers."""
+    mux = MuxServer()
+
+    async def stream_handler(reader, writer):
+        await handle_mux_stream(reader, crypto)
+
+    await mux.handle(websocket, stream_handler)
 
 
 async def run(host: str, port: int, key: bytes, ws_path: str,
@@ -156,7 +158,7 @@ async def run(host: str, port: int, key: bytes, ws_path: str,
             await websocket.close(1008, "Not found")
             return
 
-        await handle_ws_tunnel(websocket, crypto)
+        await handle_mux_ws(websocket, crypto)
 
     # TLS for Cloudflare "Full" SSL mode (self-signed cert is OK)
     ssl_ctx = None

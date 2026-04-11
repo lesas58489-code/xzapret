@@ -74,19 +74,17 @@ class XZAPTunnelClient:
         return await self._connect_tcp(target_host, target_port)
 
     async def _connect_ws(self, target_host: str, target_port: int):
-        """Connect via WebSocket (through Cloudflare CDN)."""
-        from .transport.ws_tunnel import WSReader, WSWriter
-        import websockets
+        """Connect via multiplexed WebSocket (through Cloudflare CDN).
+        All tunnels share ONE persistent WebSocket connection.
+        """
+        from .transport.ws_mux import MuxClient
 
-        ws = await websockets.connect(
-            self.ws_url, max_size=2 ** 20,
-            ping_interval=20, ping_timeout=10,
-            compression=None,
-            open_timeout=15,
-            close_timeout=5,
-        )
-        reader = WSReader(ws)
-        writer = WSWriter(ws)
+        # Lazy-init shared multiplexer (one per client instance)
+        if not hasattr(self, '_mux') or self._mux is None:
+            self._mux = MuxClient(self.ws_url)
+        await self._mux.ensure_connected()
+
+        stream = self._mux.create_stream()
 
         # Handshake (no fragmentation — CDN handles transport)
         req = json.dumps({
@@ -94,14 +92,15 @@ class XZAPTunnelClient:
             "host": target_host,
             "port": target_port,
         }).encode()
-        await _send_frame(writer, self.crypto, req)
+        await _send_frame(stream, self.crypto, req)
 
-        response = json.loads(await _recv_frame(reader, self.crypto))
+        response = json.loads(await _recv_frame(stream, self.crypto))
         if not response.get("ok"):
+            stream.close()
             raise ConnectionError(f"XZAP tunnel refused: {response.get('err')}")
 
-        log.info("Tunnel open (WS) → %s:%d", target_host, target_port)
-        return XZAPTunnelStream(reader, writer, self.crypto, raw_writer=writer)
+        log.info("Tunnel open (WS/mux:%d) → %s:%d", stream.stream_id, target_host, target_port)
+        return XZAPTunnelStream(stream, stream, self.crypto, raw_writer=stream)
 
     async def _connect_tcp(self, target_host: str, target_port: int):
         """Connect via direct TCP (with TLS + fragmentation)."""
