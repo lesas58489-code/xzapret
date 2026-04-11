@@ -31,7 +31,7 @@ ACT_CLOSE = 0x03
 HDR_SIZE = 5
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
@@ -87,8 +87,10 @@ class MuxClient:
         async with self._ws_lock:
             try:
                 await self._ws.send_bytes(frame)
-            except Exception:
-                pass
+                if action == ACT_DATA:
+                    log.debug("[%d] sent %d bytes", stream_id, len(data))
+            except Exception as e:
+                log.warning("[%d] send error: %s", stream_id, e)
 
     async def connect_ws(self):
         while True:
@@ -125,7 +127,11 @@ class MuxClient:
                             q = self._streams.get(stream_id)
                             if q:
                                 await q.put(payload)
+                                log.debug("[%d] recv %d bytes", stream_id, len(payload))
+                            else:
+                                log.warning("[%d] DATA dropped (unknown stream, %d bytes)", stream_id, len(payload))
                         elif action == ACT_CLOSE:
+                            log.debug("[%d] CLOSE from server", stream_id)
                             q = self._streams.pop(stream_id, None)
                             if q:
                                 await q.put(None)
