@@ -31,7 +31,7 @@ ACT_CLOSE = 0x03
 HDR_SIZE = 5
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
@@ -104,7 +104,7 @@ class MuxClient:
                     max_msg_size=2 ** 20,
                     compress=0,
                     autoping=True,
-                    heartbeat=10,  # frequent pings to keep CF proxy alive
+                    heartbeat=None,  # CF doesn't forward WS PING/PONG
                 )
                 log.info("WSS connected to %s", self.ws_url)
                 self._connected.set()
