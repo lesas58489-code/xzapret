@@ -76,12 +76,15 @@ class MuxSession:
         )
 
     async def _tcp_reader(self, stream_id: int, reader: asyncio.StreamReader):
+        total = 0
         try:
             while chunk := await reader.read(BUFFER_SIZE):
                 await self.send_frame(stream_id, ACT_DATA, chunk)
+                total += len(chunk)
         except Exception:
             pass
         finally:
+            log.info("[%d] tcp→ws %d bytes", stream_id, total)
             await self.send_frame(stream_id, ACT_CLOSE)
             self._close_stream(stream_id)
 
