@@ -15,8 +15,14 @@ import argparse
 import logging
 import os
 import struct
+import sys
 from pathlib import Path
 from typing import Optional
+
+# Windows: SelectorEventLoop for stable WebSocket TLS connections
+# IocpProactor silently kills WSS after ~20 seconds
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import aiohttp
 
