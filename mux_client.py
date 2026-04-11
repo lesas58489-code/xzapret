@@ -102,7 +102,7 @@ class MuxClient:
                     max_msg_size=2 ** 20,
                     compress=0,
                     autoping=True,
-                    heartbeat=30,  # keep connection alive through CF proxy
+                    heartbeat=10,  # frequent pings to keep CF proxy alive
                 )
                 log.info("WSS connected to %s", self.ws_url)
                 self._connected.set()

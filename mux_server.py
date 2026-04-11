@@ -160,7 +160,7 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(
         max_msg_size=2 ** 20,
         autoping=True,
-        heartbeat=30,  # detect dead connections
+        heartbeat=10,  # match client frequency
         compress=False,
     )
     await ws.prepare(request)
