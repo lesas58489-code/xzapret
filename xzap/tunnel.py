@@ -75,13 +75,25 @@ class XZAPTunnelClient:
 
     async def _connect_ws(self, target_host: str, target_port: int):
         """Connect via WebSocket (through Cloudflare CDN)."""
-        import websockets.client
         from .transport.ws_tunnel import WSReader, WSWriter
+        import ssl as _ssl
 
-        ws = await websockets.client.connect(
+        # Use modern websockets API (not legacy) for better asyncio compat
+        try:
+            from websockets.asyncio.client import connect as ws_connect
+        except ImportError:
+            from websockets.client import connect as ws_connect
+
+        # Trust all certs for the CDN connection (XZAP has its own auth)
+        ssl_ctx = _ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = _ssl.CERT_NONE
+
+        ws = await ws_connect(
             self.ws_url, max_size=2 ** 20,
             ping_interval=30, ping_timeout=15,
-            compression=None,  # disable deflate — encrypted data doesn't compress
+            compression=None,
+            ssl=ssl_ctx if self.ws_url.startswith("wss://") else None,
         )
         reader = WSReader(ws)
         writer = WSWriter(ws)

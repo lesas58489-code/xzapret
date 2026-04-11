@@ -20,14 +20,21 @@ import argparse
 import base64
 import logging
 import os
+import sys
 from pathlib import Path
+
+# Windows: use SelectorEventLoop to avoid IocpProactor TLS/WS bugs (WinError 121)
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from xzap.client import XZAPClient
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
+# Suppress noisy websockets debug/error logs
+logging.getLogger("websockets").setLevel(logging.WARNING)
 
 
 def load_key(key_file: str) -> bytes | None:
