@@ -172,9 +172,9 @@ async def run(host: str, port: int, key: bytes, ws_path: str,
     async with websockets.server.serve(
         handler, host, port,
         max_size=2 ** 20,
-        ping_interval=30,
-        ping_timeout=15,
-        compression=None,  # no deflate — encrypted data doesn't compress
+        ping_interval=None,  # Cloudflare handles keepalive
+        ping_timeout=None,
+        compression=None,
         ssl=ssl_ctx,
     ):
         mode = "WSS (TLS)" if ssl_ctx else "WS"

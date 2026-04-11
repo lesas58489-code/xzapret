@@ -35,16 +35,20 @@ class MuxClient:
 
     async def ensure_connected(self):
         """Connect if not already connected."""
-        if self._ws is not None and not getattr(self._ws, 'closed', True) is True:
-            return
+        if self._ws is not None:
+            closed = getattr(self._ws, 'closed', False)
+            if hasattr(self._ws, 'close_code'):
+                closed = self._ws.close_code is not None
+            if not closed:
+                return
         async with self._lock:
+            # Double-check after acquiring lock
             if self._ws is not None:
-                try:
-                    # Check if still alive
-                    if not getattr(self._ws, 'closed', False):
-                        return
-                except Exception:
-                    pass
+                closed = getattr(self._ws, 'closed', False)
+                if hasattr(self._ws, 'close_code'):
+                    closed = self._ws.close_code is not None
+                if not closed:
+                    return
             await self._connect()
 
     async def _connect(self):
@@ -53,8 +57,8 @@ class MuxClient:
         self._ws = await websockets.connect(
             self.ws_url,
             max_size=2 ** 20,
-            ping_interval=self.ping_interval,
-            ping_timeout=10,
+            ping_interval=None,  # disable client pings — Cloudflare doesn't relay them
+            ping_timeout=None,
             compression=None,
             open_timeout=15,
             close_timeout=5,
