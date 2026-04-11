@@ -36,6 +36,11 @@ class XZAPClient:
         self.transport = None
         self.router = XZAPRouter()
         self._seqno = 0
+        # Shared multiplexer for WebSocket/CDN mode (one WS for all tunnels)
+        self._mux = None
+        if ws_url:
+            from .transport.ws_mux import MuxClient
+            self._mux = MuxClient(ws_url)
 
     async def connect(self):
         """Establish multi-path connections to server."""
@@ -100,26 +105,17 @@ class XZAPClient:
         """Открывает туннель к hostname:port через XZAP-сервер.
         Возвращает XZAPTunnelStream с методами read/write.
         """
-        # Share one MuxClient for all WS connections
-        if not hasattr(self, '_shared_mux'):
-            self._shared_mux = None
-
         tunnel = XZAPTunnelClient(
             self.server_host, self.server_port,
             key=self.crypto.key, algo=self.crypto.algo,
             use_tls=self.use_tls,
             ws_url=self.ws_url,
         )
-        # Pass shared mux so all tunnels reuse ONE WebSocket
-        if self.ws_url:
-            tunnel._mux = self._shared_mux
+        # All tunnels share ONE MuxClient (one WebSocket)
+        if self._mux:
+            tunnel._mux = self._mux
 
         stream = await tunnel.connect_tunnel(hostname, port)
-
-        # Save the mux back for next call
-        if self.ws_url and hasattr(tunnel, '_mux'):
-            self._shared_mux = tunnel._mux
-
         log.debug("Tunnel open → %s:%d", hostname, port)
         return stream
 
