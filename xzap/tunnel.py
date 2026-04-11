@@ -81,25 +81,37 @@ class XZAPTunnelClient:
         if not hasattr(self, '_mux') or self._mux is None:
             from .transport.ws_mux import MuxClient
             self._mux = MuxClient(self.ws_url)
-        await self._mux.ensure_connected()
+        # Try handshake with 5s timeout; on failure, force reconnect and retry once
+        for attempt in range(2):
+            await self._mux.ensure_connected()
+            stream = self._mux.create_stream()
 
-        stream = self._mux.create_stream()
+            req = json.dumps({
+                "cmd": "connect",
+                "host": target_host,
+                "port": target_port,
+            }).encode()
 
-        # Handshake (no fragmentation — CDN handles transport)
-        req = json.dumps({
-            "cmd": "connect",
-            "host": target_host,
-            "port": target_port,
-        }).encode()
-        await _send_frame(stream, self.crypto, req)
+            try:
+                await _send_frame(stream, self.crypto, req)
+                response = json.loads(
+                    await asyncio.wait_for(_recv_frame(stream, self.crypto), timeout=5)
+                )
+                if not response.get("ok"):
+                    stream.close()
+                    raise ConnectionError(f"XZAP tunnel refused: {response.get('err')}")
 
-        response = json.loads(await _recv_frame(stream, self.crypto))
-        if not response.get("ok"):
-            stream.close()
-            raise ConnectionError(f"XZAP tunnel refused: {response.get('err')}")
+                log.info("Tunnel open (WS/mux:%d) → %s:%d",
+                         stream.stream_id, target_host, target_port)
+                return XZAPTunnelStream(stream, stream, self.crypto, raw_writer=stream)
 
-        log.info("Tunnel open (WS/mux:%d) → %s:%d", stream.stream_id, target_host, target_port)
-        return XZAPTunnelStream(stream, stream, self.crypto, raw_writer=stream)
+            except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+                stream.close()
+                if attempt == 0:
+                    log.info("MUX handshake timeout, forcing reconnect")
+                    await self._mux.force_reconnect()
+                else:
+                    raise ConnectionError("Tunnel handshake timeout after reconnect")
 
     async def _connect_tcp(self, target_host: str, target_port: int):
         """Connect via direct TCP (with TLS + fragmentation)."""

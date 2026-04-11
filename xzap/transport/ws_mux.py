@@ -120,6 +120,23 @@ class MuxClient:
     def remove_stream(self, stream_id: int):
         self._streams.pop(stream_id, None)
 
+    async def force_reconnect(self):
+        """Kill current connection and reconnect."""
+        log.info("MUX force reconnecting")
+        if self._reader_task:
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._ws and not self._ws.closed:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+        self._ws = None
+        self._streams.clear()
+
     async def close(self):
         if self._reader_task:
             self._reader_task.cancel()
