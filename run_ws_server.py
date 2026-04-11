@@ -173,7 +173,7 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
 
     ws = web.WebSocketResponse(
         max_msg_size=2 ** 20,
-        heartbeat=30,
+        heartbeat=None,   # cloudflared doesn't forward WS pings — disable
         autoping=True,
         compress=False,
     )
