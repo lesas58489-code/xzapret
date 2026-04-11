@@ -191,9 +191,11 @@ class XZAPClientApp:
 
     def _run_proxy(self, host, port, key, socks_port, use_tls):
         from xzap.client import XZAPClient
+        import socket as _socket
 
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+        self._proxy = None
 
         async def main():
             client = XZAPClient(
@@ -209,17 +211,22 @@ class XZAPClientApp:
                 xzap_file=str(lists_dir / "xzap.txt"),
             )
 
-            proxy = client.make_socks5("127.0.0.1", socks_port)
-            await proxy.start()
+            self._proxy = client.make_socks5("127.0.0.1", socks_port)
+            await self._proxy.start()
+
+            # Set SO_REUSEADDR so port is freed immediately on disconnect
+            for sock in self._proxy._server.sockets:
+                sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
 
             self.root.after(0, self._on_connected, socks_port)
 
-            await proxy.serve_forever()
+            await self._proxy.serve_forever()
 
         try:
             self._loop.run_until_complete(main())
         except Exception as e:
-            self.root.after(0, self._on_error, str(e))
+            if self._connected:
+                self.root.after(0, self._on_error, str(e))
 
     def _on_connected(self, socks_port: int):
         self._connected = True
@@ -242,8 +249,7 @@ class XZAPClientApp:
         self.proxy_info.set("")
 
     def _disconnect(self):
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        self._shutdown_proxy()
         self._connected = False
         self.status_var.set("Disconnected")
         self._draw_dot("red")
@@ -253,11 +259,29 @@ class XZAPClientApp:
                   self.entry_socks):
             w.config(state="normal")
 
+    def _shutdown_proxy(self):
+        """Stop the SOCKS5 server and event loop cleanly."""
+        if self._loop and not self._loop.is_closed():
+            async def _stop():
+                if self._proxy:
+                    await self._proxy.stop()
+            try:
+                self._loop.call_soon_threadsafe(
+                    self._loop.create_task, _stop()
+                )
+            except Exception:
+                pass
+            # Give the stop task a moment, then stop the loop
+            self.root.after(200, self._force_stop_loop)
+
+    def _force_stop_loop(self):
+        if self._loop and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+
     def _on_close(self):
         self._save_settings()
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        self.root.destroy()
+        self._shutdown_proxy()
+        self.root.after(300, self.root.destroy)
 
     def run(self):
         self.root.mainloop()
