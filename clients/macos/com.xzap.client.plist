@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.xzap.client</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/python3</string>
+        <string>/usr/local/xzap/run_smart_client.py</string>
+        <string>--server</string>
+        <string>YOUR_SERVER_IP</string>
+        <string>--port</string>
+        <string>8443</string>
+        <string>--tls</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>XZAP_KEY</key>
+        <string>YOUR_BASE64_KEY</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/xzap.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/xzap.log</string>
+</dict>
+</plist>
