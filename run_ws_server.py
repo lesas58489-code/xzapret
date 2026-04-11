@@ -189,6 +189,8 @@ def main():
     parser.add_argument("--path", default="/tunnel")
     parser.add_argument("--ssl-cert", default="xzap_cert.pem")
     parser.add_argument("--ssl-key", default="xzap_tls_key.pem")
+    parser.add_argument("--no-tls", action="store_true",
+                        help="Disable TLS (for cloudflared local connection)")
     parser.add_argument("--key-file", default=KEY_FILE)
     args = parser.parse_args()
 
@@ -205,8 +207,10 @@ def main():
     print(f"Cloudflare: wss://solar-cloud.xyz{args.path}")
     print()
 
+    ssl_cert = None if args.no_tls else args.ssl_cert
+    ssl_key = None if args.no_tls else args.ssl_key
     asyncio.run(run(args.host, args.port, key, args.path,
-                    ssl_cert=args.ssl_cert, ssl_key=args.ssl_key))
+                    ssl_cert=ssl_cert, ssl_key=ssl_key))
 
 
 if __name__ == "__main__":
