@@ -102,7 +102,7 @@ class MuxClient:
                     max_msg_size=2 ** 20,
                     compress=0,
                     autoping=True,
-                    heartbeat=20,
+                    heartbeat=None,  # cloudflared doesn't forward WS PING/PONG
                 )
                 log.info("WSS connected to %s", self.ws_url)
                 self._connected.set()
