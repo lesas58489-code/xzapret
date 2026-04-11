@@ -22,7 +22,7 @@ class XZAPClient:
     def __init__(self, server_host: str, server_port: int,
                  key: bytes = None, algo: str = ALGO_AES_GCM,
                  num_paths: int = 4, transport_type: str = "tcp",
-                 use_tls: bool = False):
+                 use_tls: bool = False, ws_url: str = None):
         self.server_host = server_host
         self.server_port = server_port
         self.transport_type = transport_type
@@ -32,6 +32,7 @@ class XZAPClient:
         self.adaptive = AdaptiveStrategy()
         self.fragmenter = Fragmenter()
         self.recv_buffer = FragmentBuffer()
+        self.ws_url = ws_url
         self.transport = None
         self.router = XZAPRouter()
         self._seqno = 0
@@ -103,6 +104,7 @@ class XZAPClient:
             self.server_host, self.server_port,
             key=self.crypto.key, algo=self.crypto.algo,
             use_tls=self.use_tls,
+            ws_url=self.ws_url,
         )
         stream = await tunnel.connect_tunnel(hostname, port)
         log.debug("Tunnel open → %s:%d", hostname, port)

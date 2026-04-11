@@ -61,13 +61,47 @@ class XZAPTunnelClient:
 
     def __init__(self, server_host: str, server_port: int,
                  key: bytes = None, algo: str = ALGO_AES_GCM,
-                 use_tls: bool = False):
+                 use_tls: bool = False, ws_url: str = None):
         self.server_host = server_host
         self.server_port = server_port
         self.crypto = XZAPCrypto(key=key, algo=algo)
         self.use_tls = use_tls
+        self.ws_url = ws_url  # e.g. "wss://solar-cloud.xyz/tunnel"
 
     async def connect_tunnel(self, target_host: str, target_port: int):
+        if self.ws_url:
+            return await self._connect_ws(target_host, target_port)
+        return await self._connect_tcp(target_host, target_port)
+
+    async def _connect_ws(self, target_host: str, target_port: int):
+        """Connect via WebSocket (through Cloudflare CDN)."""
+        import websockets.client
+        from .transport.ws_tunnel import WSReader, WSWriter
+
+        ws = await websockets.client.connect(
+            self.ws_url, max_size=2 ** 20,
+            ping_interval=30, ping_timeout=15,
+        )
+        reader = WSReader(ws)
+        writer = WSWriter(ws)
+
+        # Handshake (no fragmentation — CDN handles transport)
+        req = json.dumps({
+            "cmd": "connect",
+            "host": target_host,
+            "port": target_port,
+        }).encode()
+        await _send_frame(writer, self.crypto, req)
+
+        response = json.loads(await _recv_frame(reader, self.crypto))
+        if not response.get("ok"):
+            raise ConnectionError(f"XZAP tunnel refused: {response.get('err')}")
+
+        log.info("Tunnel open (WS) → %s:%d", target_host, target_port)
+        return XZAPTunnelStream(reader, writer, self.crypto, raw_writer=writer)
+
+    async def _connect_tcp(self, target_host: str, target_port: int):
+        """Connect via direct TCP (with TLS + fragmentation)."""
         if self.use_tls:
             from .tls import open_tls_connection, random_sni
             sni = random_sni()

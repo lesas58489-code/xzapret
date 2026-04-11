@@ -58,6 +58,7 @@ async def main(args):
         key=key,
         transport_type=args.transport,
         use_tls=args.tls,
+        ws_url=getattr(args, 'ws_url', None),
     )
 
     # Загружаем списки доменов
@@ -71,8 +72,11 @@ async def main(args):
         "youtube.com", "vk.com", "instagram.com",
         "discord.com", "gosuslugi.ru", "google.com",
     ]
-    tls_label = " + TLS/SNI" if args.tls else ""
-    print(f"\nСервер: {args.server}:{args.port} [{args.transport}{tls_label}]")
+    if args.ws_url:
+        print(f"\nСервер: {args.ws_url} [WebSocket/CDN]")
+    else:
+        tls_label = " + TLS/SNI" if args.tls else ""
+        print(f"\nСервер: {args.server}:{args.port} [{args.transport}{tls_label}]")
     print(f"\nМаршрутизация:")
     print("-" * 42)
     for domain in test_domains:
@@ -98,6 +102,8 @@ def cli():
     parser.add_argument("--socks-port", type=int, default=1080)
     parser.add_argument("--tls", action="store_true",
                         help="Use TLS with random SNI (white domains)")
+    parser.add_argument("--ws-url", default=None,
+                        help="WebSocket URL (e.g. wss://solar-cloud.xyz/tunnel)")
     parser.add_argument("--key-file", default="xzap.key")
     return parser.parse_args()
 
