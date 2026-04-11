@@ -320,7 +320,9 @@ def main():
     router.load(args.bypass)
 
     client = MuxClient(args.ws_url, router)
-    asyncio.run(client.run())
+    loop = asyncio.new_event_loop()
+    log.info("Event loop: %s", type(loop).__name__)
+    loop.run_until_complete(client.run())
 
 
 if __name__ == "__main__":
