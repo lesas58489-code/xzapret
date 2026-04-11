@@ -16,7 +16,7 @@ from aiohttp import web, WSMsgType
 WS_HOST = "127.0.0.1"
 WS_PORT = 8080
 XZAP_HOST = "127.0.0.1"
-XZAP_PORT = 8443
+XZAP_PORT = 8444  # plain TCP XZAP (no TLS — cloudflared handles encryption)
 BUFFER_SIZE = 65536
 
 logging.basicConfig(
