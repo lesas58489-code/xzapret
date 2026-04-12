@@ -9,12 +9,6 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
-import java.io.FileInputStream
-import java.io.FileOutputStream
-import java.net.InetSocketAddress
-import java.net.ServerSocket
-import java.net.Socket
-import java.nio.ByteBuffer
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -43,7 +37,7 @@ class XzapVpnService : VpnService() {
     private var mux: MuxConnection? = null
     private val running = AtomicBoolean(false)
     private var executor: ExecutorService? = null
-    private var socksServer: ServerSocket? = null
+    private var tunForwarder: TunForwarder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -82,13 +76,13 @@ class XzapVpnService : VpnService() {
             // Setup VPN
             setupVpn()
 
-            // Start SOCKS5 proxy
+            // Start TUN forwarder (tun2socks)
             running.set(true)
-            executor = Executors.newCachedThreadPool()
-            executor?.submit { runSocksProxy() }
+            tunForwarder = TunForwarder(vpnInterface!!, mux!!, running)
+            tunForwarder!!.start()
 
             updateNotification("Connected via $wsUrl")
-            Log.i(TAG, "VPN + SOCKS5 ready")
+            Log.i(TAG, "VPN + TunForwarder ready")
         }.start()
     }
 
@@ -106,112 +100,15 @@ class XzapVpnService : VpnService() {
             builder.addDisallowedApplication(packageName)
         } catch (_: Exception) {}
 
-        // Route through local SOCKS5 proxy
-        // Android doesn't natively support SOCKS5 in VPN, so we use
-        // the VPN to redirect DNS and the proxy for actual connections
         vpnInterface = builder.establish()
         Log.i(TAG, "VPN interface established")
     }
 
-    private fun runSocksProxy() {
-        try {
-            socksServer = ServerSocket()
-            socksServer?.reuseAddress = true
-            socksServer?.bind(InetSocketAddress("127.0.0.1", SOCKS_PORT))
-            Log.i(TAG, "SOCKS5 proxy on 127.0.0.1:$SOCKS_PORT")
-
-            while (running.get()) {
-                val client = socksServer?.accept() ?: break
-                executor?.submit { handleSocksClient(client) }
-            }
-        } catch (e: Exception) {
-            if (running.get()) Log.e(TAG, "SOCKS proxy error", e)
-        }
-    }
-
-    private fun handleSocksClient(client: Socket) {
-        try {
-            val input = client.getInputStream()
-            val output = client.getOutputStream()
-
-            // SOCKS5 greeting
-            val greeting = ByteArray(2)
-            input.read(greeting)
-            if (greeting[0] != 0x05.toByte()) return
-            input.skip(greeting[1].toLong())
-            output.write(byteArrayOf(0x05, 0x00))
-
-            // SOCKS5 request
-            val req = ByteArray(4)
-            input.read(req)
-            if (req[1] != 0x01.toByte()) return // only CONNECT
-
-            val host: String
-            when (req[3].toInt()) {
-                0x01 -> { // IPv4
-                    val addr = ByteArray(4)
-                    input.read(addr)
-                    host = addr.joinToString(".") { (it.toInt() and 0xFF).toString() }
-                }
-                0x03 -> { // Domain
-                    val len = input.read()
-                    val domain = ByteArray(len)
-                    input.read(domain)
-                    host = String(domain)
-                }
-                else -> return
-            }
-            val portBuf = ByteArray(2)
-            input.read(portBuf)
-            val port = ((portBuf[0].toInt() and 0xFF) shl 8) or (portBuf[1].toInt() and 0xFF)
-
-            // Open MUX stream
-            val streamId = mux!!.openStream(host, port)
-            Log.d(TAG, "[$streamId] → $host:$port")
-
-            // SOCKS5 success
-            output.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
-
-            // Bidirectional pipe
-            val clientToMux = Thread {
-                try {
-                    val buf = ByteArray(32768)
-                    while (running.get()) {
-                        val n = input.read(buf)
-                        if (n <= 0) break
-                        mux?.sendData(streamId, buf.copyOf(n))
-                    }
-                } catch (_: Exception) {}
-                mux?.closeStream(streamId)
-            }
-
-            val muxToClient = Thread {
-                try {
-                    while (running.get()) {
-                        val data = mux?.recvData(streamId) ?: break
-                        output.write(data)
-                        output.flush()
-                    }
-                } catch (_: Exception) {}
-                try { client.close() } catch (_: Exception) {}
-            }
-
-            clientToMux.start()
-            muxToClient.start()
-            clientToMux.join()
-            muxToClient.join()
-
-        } catch (e: Exception) {
-            Log.d(TAG, "SOCKS client error: ${e.message}")
-        } finally {
-            try { client.close() } catch (_: Exception) {}
-        }
-    }
+    // TunForwarder handles all traffic (replaces SOCKS5 proxy)
 
     private fun disconnect() {
         running.set(false)
-        socksServer?.close()
-        executor?.shutdownNow()
+        tunForwarder = null
         vpnInterface?.close()
         mux?.shutdown()
         vpnInterface = null
