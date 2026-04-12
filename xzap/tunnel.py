@@ -187,9 +187,9 @@ class XZAPTunnelServer:
         reader, writer = wrap_connection(raw_reader, raw_writer)
 
         try:
-            # Handshake (120s timeout — pool connections wait idle)
+            # Handshake (30s timeout against resource exhaustion)
             ctrl = await asyncio.wait_for(
-                _recv_frame(reader, self.crypto), timeout=120
+                _recv_frame(reader, self.crypto), timeout=30
             )
             req = json.loads(ctrl)
             if req.get("cmd") != "connect":
