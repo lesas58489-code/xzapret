@@ -190,35 +190,76 @@ class XzapSocksProxy(
         }
     }
 
-    // ==================== XZAP frame I/O ====================
+    // ==================== XZAP frame I/O (with fragmentation layer) ====================
 
     private fun sendFrame(out: OutputStream, data: ByteArray) {
         val encrypted = encrypt(data)
         val prefix = ByteArray(PREFIX_SIZE).also { random.nextBytes(it) }
         val payload = prefix + encrypted
-        val header = ByteArray(4)
-        header[0] = ((payload.size shr 24) and 0xFF).toByte()
-        header[1] = ((payload.size shr 16) and 0xFF).toByte()
-        header[2] = ((payload.size shr 8) and 0xFF).toByte()
-        header[3] = (payload.size and 0xFF).toByte()
+
+        // XZAP frame: [4B length][payload]
+        val xzapFrame = ByteArray(4 + payload.size)
+        putInt(xzapFrame, 0, payload.size)
+        System.arraycopy(payload, 0, xzapFrame, 4, payload.size)
+
+        // Wrap in fragmentation: [4B total][1B flags=0x00][xzapFrame]
+        val fragTotal = xzapFrame.size + 1
+        val fragFrame = ByteArray(4 + fragTotal)
+        putInt(fragFrame, 0, fragTotal)
+        fragFrame[4] = 0x00 // FLAG_REAL
+        System.arraycopy(xzapFrame, 0, fragFrame, 5, xzapFrame.size)
+
         synchronized(out) {
-            out.write(header)
-            out.write(payload)
+            out.write(fragFrame)
             out.flush()
         }
     }
 
     private fun recvFrame(inp: InputStream): ByteArray? {
-        val header = readExactly(inp, 4) ?: return null
-        val length = ((header[0].toInt() and 0xFF) shl 24) or
-                     ((header[1].toInt() and 0xFF) shl 16) or
-                     ((header[2].toInt() and 0xFF) shl 8) or
-                     (header[3].toInt() and 0xFF)
-        if (length > 256 * 1024) return null
-        val payload = readExactly(inp, length) ?: return null
-        val encrypted = payload.copyOfRange(PREFIX_SIZE, payload.size)
-        return decrypt(encrypted)
+        // Read fragmentation frames until we get a complete XZAP frame
+        val buffer = mutableListOf<Byte>()
+
+        while (true) {
+            // Read frag header: [4B total]
+            val fragHdr = readExactly(inp, 4) ?: return null
+            val fragTotal = getInt(fragHdr, 0)
+            if (fragTotal <= 0 || fragTotal > 256 * 1024) return null
+
+            // Read frag payload: [1B flags][data]
+            val fragPayload = readExactly(inp, fragTotal) ?: return null
+            val flags = fragPayload[0].toInt() and 0xFF
+
+            if (flags == 0x01) continue // chaff — skip
+
+            // Real or overlap data
+            val fragData = fragPayload.copyOfRange(1, fragPayload.size)
+            buffer.addAll(fragData.toList())
+
+            // Check if we have a complete XZAP frame
+            if (buffer.size >= 4) {
+                val buf = buffer.toByteArray()
+                val xzapLen = getInt(buf, 0)
+                if (buf.size >= 4 + xzapLen) {
+                    val payload = buf.copyOfRange(4, 4 + xzapLen)
+                    val encrypted = payload.copyOfRange(PREFIX_SIZE, payload.size)
+                    return decrypt(encrypted)
+                }
+            }
+        }
     }
+
+    private fun putInt(buf: ByteArray, off: Int, v: Int) {
+        buf[off] = ((v shr 24) and 0xFF).toByte()
+        buf[off + 1] = ((v shr 16) and 0xFF).toByte()
+        buf[off + 2] = ((v shr 8) and 0xFF).toByte()
+        buf[off + 3] = (v and 0xFF).toByte()
+    }
+
+    private fun getInt(buf: ByteArray, off: Int): Int =
+        ((buf[off].toInt() and 0xFF) shl 24) or
+        ((buf[off + 1].toInt() and 0xFF) shl 16) or
+        ((buf[off + 2].toInt() and 0xFF) shl 8) or
+        (buf[off + 3].toInt() and 0xFF)
 
     private fun readExactly(inp: InputStream, n: Int): ByteArray? {
         val buf = ByteArray(n)
