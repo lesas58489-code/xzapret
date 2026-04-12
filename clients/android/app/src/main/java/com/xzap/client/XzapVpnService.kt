@@ -56,9 +56,17 @@ class XzapVpnService : VpnService() {
         val key = Base64.decode(keyB64, Base64.DEFAULT)
         running.set(true)
 
+        // Bypass domains (Russian sites go direct)
+        val bypass = setOf(
+            "vk.com", "ok.ru", "yandex.ru", "yandex.net", "mail.ru",
+            "rambler.ru", "avito.ru", "sberbank.ru", "gosuslugi.ru",
+            "mos.ru", "rbc.ru", "lenta.ru", "ria.ru", "rt.com",
+            "tinkoff.ru", "ozon.ru", "wildberries.ru", "kinopoisk.ru",
+            "2gis.ru", "dzen.ru",
+        )
+
         Thread {
-            // Start SOCKS5 proxy (XZAP TLS backed)
-            socksProxy = XzapSocksProxy(server, port, key, running)
+            socksProxy = XzapSocksProxy(server, port, key, running, bypass)
             socksProxy!!.start(SOCKS_PORT)
 
             Thread.sleep(500) // wait for SOCKS to bind
