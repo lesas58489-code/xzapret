@@ -48,7 +48,10 @@ class XzapVpnService : VpnService() {
     }
 
     private fun connect(server: String, port: Int, keyB64: String) {
-        if (running.get()) return
+        if (running.get()) {
+            disconnect()
+            Thread.sleep(500)
+        }
 
         createNotificationChannel()
         startForeground(1, buildNotification("Connecting..."))

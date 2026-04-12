@@ -86,6 +86,8 @@ class XzapSocksProxy(
         }), random)
         sslFactory = sslCtx.socketFactory
 
+        // Kill any previous instance on this port
+        try { ServerSocket().apply { reuseAddress = true; bind(InetSocketAddress("127.0.0.1", port)); close() } } catch (_: Exception) {}
         serverSocket = ServerSocket()
         serverSocket?.reuseAddress = true
         serverSocket?.bind(InetSocketAddress("127.0.0.1", port))
