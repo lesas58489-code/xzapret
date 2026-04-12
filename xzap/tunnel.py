@@ -187,10 +187,7 @@ class XZAPTunnelServer:
         reader, writer = wrap_connection(raw_reader, raw_writer)
 
         try:
-            # Handshake (30s timeout against resource exhaustion)
-            ctrl = await asyncio.wait_for(
-                _recv_frame(reader, self.crypto), timeout=30
-            )
+            ctrl = await _recv_frame(reader, self.crypto)
             req = json.loads(ctrl)
             if req.get("cmd") != "connect":
                 await _send_frame(writer, self.crypto,
