@@ -86,9 +86,6 @@ async def main(args):
         label = "→ XZAP " if use_xzap else "→ DIRECT"
         print(f"  {domain:<30} {label}")
 
-    # Connection pool (pre-establish TLS connections)
-    await client.init_pool()
-
     # Запускаем SOCKS5-прокси
     proxy = client.make_socks5("127.0.0.1", args.socks_port)
     await proxy.start()
