@@ -10,21 +10,24 @@ Optimizations:
 
 import asyncio
 import logging
+import time
 from collections import deque
 
 log = logging.getLogger("xzap.pool")
+
+CONN_TTL = 60  # seconds — close idle connections older than this
 
 
 class ConnectionPool:
     """Pool of pre-established TLS+fragmented connections to XZAP server."""
 
     def __init__(self, server_host: str, server_port: int,
-                 use_tls: bool = False, pool_size: int = 16):
+                 use_tls: bool = False, pool_size: int = 10):
         self.server_host = server_host
         self.server_port = server_port
         self.use_tls = use_tls
         self.pool_size = pool_size
-        self._pool: deque = deque()
+        self._pool: deque = deque()  # (reader, writer, raw_writer, created_at)
         self._creating = 0
         self._lock = asyncio.Lock()
         self._keepalive_task = None
@@ -41,12 +44,17 @@ class ConnectionPool:
 
     async def get(self):
         """Get a warm connection. Falls back to on-demand if pool empty."""
+        now = time.monotonic()
         async with self._lock:
             while self._pool:
-                conn = self._pool.popleft()
-                reader, writer, raw_writer = conn
-                if not raw_writer.is_closing():
-                    return reader, writer, raw_writer
+                reader, writer, raw_writer, created = self._pool.popleft()
+                if raw_writer.is_closing() or (now - created) > CONN_TTL:
+                    try:
+                        raw_writer.close()
+                    except Exception:
+                        pass
+                    continue
+                return reader, writer, raw_writer
 
         # Pool empty — create on demand
         log.debug("Pool empty, creating on demand")
@@ -57,16 +65,17 @@ class ConnectionPool:
         while True:
             await asyncio.sleep(5)
             try:
-                # Prune dead connections
+                # Prune dead + expired connections
+                now = time.monotonic()
                 async with self._lock:
                     alive = deque()
                     while self._pool:
-                        conn = self._pool.popleft()
-                        if not conn[2].is_closing():
-                            alive.append(conn)
+                        r, w, rw, created = self._pool.popleft()
+                        if not rw.is_closing() and (now - created) < CONN_TTL:
+                            alive.append((r, w, rw, created))
                         else:
                             try:
-                                conn[2].close()
+                                rw.close()
                             except Exception:
                                 pass
                     self._pool = alive
@@ -90,7 +99,7 @@ class ConnectionPool:
                 self._open_connection(), timeout=10
             )
             async with self._lock:
-                self._pool.append(conn)
+                self._pool.append((*conn, time.monotonic()))
         except Exception as e:
             log.debug("Pool: create failed: %s", e)
         finally:
