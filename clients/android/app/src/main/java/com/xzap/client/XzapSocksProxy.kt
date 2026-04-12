@@ -114,19 +114,10 @@ class XzapSocksProxy(
 
             Log.d(TAG, "→ $host:$port")
 
-            // Bidirectional pipe
+            // Bidirectional pipe: app ↔ XZAP tunnel
             val tunnelInp = tunnel.getInputStream()
             val tunnelOut = tunnel.getOutputStream()
 
-            val t1 = Thread {
-                pipe(inp, tunnelOut, "app→xzap") { data -> encrypt(data) }
-            }
-            val t2 = Thread {
-                pipe(tunnelInp, out, "xzap→app") { null } // read XZAP frames
-                try { client.close() } catch (_: Exception) {}
-            }
-
-            // Custom pipe: app→tunnel sends XZAP frames, tunnel→app reads XZAP frames
             val appToTunnel = Thread {
                 try {
                     val buf = ByteArray(BUFFER_SIZE)
