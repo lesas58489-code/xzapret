@@ -15,7 +15,7 @@ from collections import deque
 
 log = logging.getLogger("xzap.pool")
 
-CONN_TTL = 60  # seconds — close idle connections older than this
+CONN_TTL = 90  # seconds — must be < server handshake timeout (120s)
 
 
 class ConnectionPool:
