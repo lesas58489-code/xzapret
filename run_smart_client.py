@@ -25,10 +25,9 @@ from pathlib import Path
 from xzap.client import XZAPClient
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
-logging.getLogger("websockets").setLevel(logging.WARNING)
 
 
 def load_key(key_file: str) -> bytes | None:

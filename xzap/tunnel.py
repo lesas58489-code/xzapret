@@ -74,27 +74,18 @@ class XZAPTunnelClient:
         return await self._connect_tcp(target_host, target_port)
 
     async def _connect_ws(self, target_host: str, target_port: int):
-        """Connect via WebSocket bridge (through Cloudflare Tunnel).
-        Each tunnel = one WSS connection. Bridge forwards WS↔TCP to XZAP server.
-        """
-        import aiohttp
+        """Connect via WebSocket (through Cloudflare CDN)."""
+        import websockets.client
         from .transport.ws_tunnel import WSReader, WSWriter
 
-        if not hasattr(self, '_ws_session') or self._ws_session is None or self._ws_session.closed:
-            self._ws_session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=None, connect=15)
-            )
-
-        ws = await self._ws_session.ws_connect(
-            self.ws_url,
-            max_msg_size=2 ** 20,
-            compress=0,
-            autoping=True,
+        ws = await websockets.client.connect(
+            self.ws_url, max_size=2 ** 20,
+            ping_interval=30, ping_timeout=15,
         )
         reader = WSReader(ws)
         writer = WSWriter(ws)
 
-        # XZAP handshake (goes through: WS → bridge → XZAP TLS server)
+        # Handshake (no fragmentation — CDN handles transport)
         req = json.dumps({
             "cmd": "connect",
             "host": target_host,
@@ -104,7 +95,6 @@ class XZAPTunnelClient:
 
         response = json.loads(await _recv_frame(reader, self.crypto))
         if not response.get("ok"):
-            await ws.close()
             raise ConnectionError(f"XZAP tunnel refused: {response.get('err')}")
 
         log.info("Tunnel open (WS) → %s:%d", target_host, target_port)
@@ -127,12 +117,8 @@ class XZAPTunnelClient:
             import socket
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        if self.use_tls:
-            # Micro-fragmentation only for direct TLS (anti-DPI)
-            reader, writer = wrap_connection(raw_reader, raw_writer)
-        else:
-            # Plain TCP (e.g. through cloudflared) — no fragmentation needed
-            reader, writer = raw_reader, raw_writer
+        # Micro-fragmentation layer (anti-DPI)
+        reader, writer = wrap_connection(raw_reader, raw_writer)
 
         # Handshake
         req = json.dumps({
@@ -176,9 +162,8 @@ class XZAPTunnelStream:
 class XZAPTunnelServer:
     """Серверная сторона туннеля."""
 
-    def __init__(self, crypto: XZAPCrypto, obfuscator=None, use_fragmentation: bool = True):
+    def __init__(self, crypto: XZAPCrypto, obfuscator=None):
         self.crypto = crypto
-        self.use_fragmentation = use_fragmentation
 
     async def handle(self, raw_reader, raw_writer):
         addr = raw_writer.get_extra_info("peername")
@@ -188,10 +173,8 @@ class XZAPTunnelServer:
             import socket
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        if self.use_fragmentation:
-            reader, writer = wrap_connection(raw_reader, raw_writer)
-        else:
-            reader, writer = raw_reader, raw_writer
+        # Micro-fragmentation layer (anti-DPI)
+        reader, writer = wrap_connection(raw_reader, raw_writer)
 
         try:
             # Handshake (30s timeout against resource exhaustion)

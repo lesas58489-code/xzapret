@@ -36,8 +36,6 @@ class XZAPClient:
         self.transport = None
         self.router = XZAPRouter()
         self._seqno = 0
-        # WebSocket session (shared for connection pooling)
-        self._ws_session = None
 
     async def connect(self):
         """Establish multi-path connections to server."""
@@ -108,10 +106,6 @@ class XZAPClient:
             use_tls=self.use_tls,
             ws_url=self.ws_url,
         )
-        # Share aiohttp session for connection pooling
-        if self.ws_url and self._ws_session:
-            tunnel._ws_session = self._ws_session
-
         stream = await tunnel.connect_tunnel(hostname, port)
         log.debug("Tunnel open → %s:%d", hostname, port)
         return stream
