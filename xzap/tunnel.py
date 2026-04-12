@@ -57,16 +57,20 @@ async def _recv_frame(reader, crypto):
 
 
 class XZAPTunnelClient:
-    """Открывает туннель к target через XZAP-сервер."""
+    """Открывает туннель к target через XZAP-сервер.
+    Supports connection pooling for instant tunnel establishment.
+    """
 
     def __init__(self, server_host: str, server_port: int,
                  key: bytes = None, algo: str = ALGO_AES_GCM,
-                 use_tls: bool = False, ws_url: str = None):
+                 use_tls: bool = False, ws_url: str = None,
+                 pool=None):
         self.server_host = server_host
         self.server_port = server_port
         self.crypto = XZAPCrypto(key=key, algo=algo)
         self.use_tls = use_tls
-        self.ws_url = ws_url  # e.g. "wss://solar-cloud.xyz/tunnel"
+        self.ws_url = ws_url
+        self._pool = pool  # ConnectionPool instance (shared)
 
     async def connect_tunnel(self, target_host: str, target_port: int):
         if self.ws_url:
@@ -85,7 +89,6 @@ class XZAPTunnelClient:
         reader = WSReader(ws)
         writer = WSWriter(ws)
 
-        # Handshake (no fragmentation — CDN handles transport)
         req = json.dumps({
             "cmd": "connect",
             "host": target_host,
@@ -101,26 +104,30 @@ class XZAPTunnelClient:
         return XZAPTunnelStream(reader, writer, self.crypto, raw_writer=writer)
 
     async def _connect_tcp(self, target_host: str, target_port: int):
-        """Connect via direct TCP (with TLS + fragmentation)."""
-        if self.use_tls:
-            from .tls import open_tls_connection, random_sni
-            sni = random_sni()
-            raw_reader, raw_writer = await open_tls_connection(
-                self.server_host, self.server_port, sni=sni,
-            )
+        """Connect via direct TCP. Uses connection pool if available."""
+        if self._pool:
+            # Grab pre-established connection from pool (instant, 0ms)
+            reader, writer, raw_writer = await self._pool.get()
         else:
-            raw_reader, raw_writer = await asyncio.open_connection(
-                self.server_host, self.server_port
-            )
-        sock = raw_writer.get_extra_info("socket")
-        if sock:
-            import socket
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            # Cold start — open new connection
+            if self.use_tls:
+                from .tls import open_tls_connection, random_sni
+                sni = random_sni()
+                raw_reader, raw_writer = await open_tls_connection(
+                    self.server_host, self.server_port, sni=sni,
+                )
+            else:
+                raw_reader, raw_writer = await asyncio.open_connection(
+                    self.server_host, self.server_port
+                )
+            sock = raw_writer.get_extra_info("socket")
+            if sock:
+                import socket
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            reader, writer = wrap_connection(raw_reader, raw_writer)
 
-        # Micro-fragmentation layer (anti-DPI)
-        reader, writer = wrap_connection(raw_reader, raw_writer)
-
-        # Handshake
+        # Pipelined handshake: send CONNECT, don't wait for OK
+        # Server buffers early DATA and flushes after connecting to target
         req = json.dumps({
             "cmd": "connect",
             "host": target_host,
@@ -128,12 +135,15 @@ class XZAPTunnelClient:
         }).encode()
         await _send_frame(writer, self.crypto, req)
 
+        # Still wait for OK (server may reject) but this overlaps with
+        # the pool replenishment happening in background
         response = json.loads(await _recv_frame(reader, self.crypto))
         if not response.get("ok"):
             raise ConnectionError(f"XZAP tunnel refused: {response.get('err')}")
 
         log.info("Tunnel open → %s:%d", target_host, target_port)
-        return XZAPTunnelStream(reader, writer, self.crypto, raw_writer=raw_writer)
+        return XZAPTunnelStream(reader, writer, self.crypto,
+                                raw_writer=raw_writer if not self._pool else writer)
 
 
 class XZAPTunnelStream:

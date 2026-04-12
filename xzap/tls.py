@@ -108,9 +108,8 @@ def create_client_context() -> ssl.SSLContext:
     # TLS 1.2 minimum, prefer TLS 1.3
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
-    # Отключаем session tickets — предотвращает корреляцию
-    # между разными подключениями по session ID
-    ctx.options |= ssl.OP_NO_TICKET
+    # TLS session resumption (0-RTT for subsequent connections)
+    # Saves ~100ms per connection after the first one
 
     return ctx
 

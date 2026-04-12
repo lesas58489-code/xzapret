@@ -96,15 +96,28 @@ class XZAPClient:
         log.debug("Sent msg seqno=%d (%d fragments, level=%d)",
                   msg.seqno, len(fragments), self.adaptive.level)
 
+    async def init_pool(self):
+        """Initialize connection pool for fast tunnel establishment."""
+        if self.ws_url:
+            return  # WS mode doesn't use pool
+        from .conn_pool import ConnectionPool
+        self._pool = ConnectionPool(
+            self.server_host, self.server_port,
+            use_tls=self.use_tls, pool_size=8,
+        )
+        await self._pool.start()
+
     async def proxy_connect(self, hostname: str, port: int):
         """Открывает туннель к hostname:port через XZAP-сервер.
         Возвращает XZAPTunnelStream с методами read/write.
         """
+        pool = getattr(self, '_pool', None)
         tunnel = XZAPTunnelClient(
             self.server_host, self.server_port,
             key=self.crypto.key, algo=self.crypto.algo,
             use_tls=self.use_tls,
             ws_url=self.ws_url,
+            pool=pool,
         )
         stream = await tunnel.connect_tunnel(hostname, port)
         log.debug("Tunnel open → %s:%d", hostname, port)
