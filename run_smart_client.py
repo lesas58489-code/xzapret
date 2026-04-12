@@ -25,9 +25,11 @@ from pathlib import Path
 from xzap.client import XZAPClient
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
+# Suppress noisy Windows IocpProactor socket shutdown errors
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
 
 
 def load_key(key_file: str) -> bytes | None:
