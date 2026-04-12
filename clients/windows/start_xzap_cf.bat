@@ -5,5 +5,5 @@ echo.
 echo Configure browser proxy: SOCKS5 127.0.0.1:1080
 echo Press Ctrl+C to stop.
 echo.
-ssh -N -D 1080 -o StrictHostKeyChecking=no root@151.244.111.186
+ssh -N -D 1080 warsaw
 pause
