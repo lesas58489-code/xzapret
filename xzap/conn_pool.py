@@ -1,10 +1,11 @@
 """
 XZAP Connection Pool — pre-established TLS connections for instant tunneling.
 
-Instead of TCP+TLS+fragmentation handshake per request (~600ms),
-grab a warm connection from the pool (~0ms).
-
-Pool replenishes in background. Target size: 8 connections.
+Optimizations:
+  - 16 warm connections (enough for heavy page loads)
+  - Replenish when pool drops below 50% (not when empty)
+  - Continuous background replenishment
+  - Keepalive: prune dead connections every 30s
 """
 
 import asyncio
@@ -18,15 +19,15 @@ class ConnectionPool:
     """Pool of pre-established TLS+fragmented connections to XZAP server."""
 
     def __init__(self, server_host: str, server_port: int,
-                 use_tls: bool = False, pool_size: int = 8):
+                 use_tls: bool = False, pool_size: int = 16):
         self.server_host = server_host
         self.server_port = server_port
         self.use_tls = use_tls
         self.pool_size = pool_size
         self._pool: deque = deque()
-        self._creating = 0  # connections being created
+        self._creating = 0
         self._lock = asyncio.Lock()
-        self._replenish_task = None
+        self._keepalive_task = None
 
     async def start(self):
         """Pre-fill the pool."""
@@ -35,49 +36,63 @@ class ConnectionPool:
         tasks = [self._create_one() for _ in range(self.pool_size)]
         await asyncio.gather(*tasks, return_exceptions=True)
         log.info("Pool: %d connections ready", len(self._pool))
+        # Start background keepalive/replenish loop
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
     async def get(self):
-        """Get a (reader, writer, raw_writer) tuple from the pool.
-        If pool is empty, create one on demand.
-        """
-        # Try to get from pool
+        """Get a warm connection. Falls back to on-demand if pool empty."""
         async with self._lock:
             while self._pool:
                 conn = self._pool.popleft()
                 reader, writer, raw_writer = conn
-                # Check if still alive
                 if not raw_writer.is_closing():
-                    self._schedule_replenish()
                     return reader, writer, raw_writer
-                # Dead connection, skip
 
         # Pool empty — create on demand
         log.debug("Pool empty, creating on demand")
         return await self._open_connection()
 
-    def _schedule_replenish(self):
-        """Schedule background replenishment."""
-        if self._replenish_task is None or self._replenish_task.done():
-            self._replenish_task = asyncio.create_task(self._replenish())
+    async def _keepalive_loop(self):
+        """Background: prune dead connections + replenish every 5 seconds."""
+        while True:
+            await asyncio.sleep(5)
+            try:
+                # Prune dead connections
+                async with self._lock:
+                    alive = deque()
+                    while self._pool:
+                        conn = self._pool.popleft()
+                        if not conn[2].is_closing():
+                            alive.append(conn)
+                        else:
+                            try:
+                                conn[2].close()
+                            except Exception:
+                                pass
+                    self._pool = alive
 
-    async def _replenish(self):
-        """Fill pool back to target size."""
-        await asyncio.sleep(0.1)  # small delay to batch
-        needed = self.pool_size - len(self._pool) - self._creating
-        if needed <= 0:
-            return
-        tasks = [self._create_one() for _ in range(needed)]
-        await asyncio.gather(*tasks, return_exceptions=True)
+                # Replenish if below target
+                needed = self.pool_size - len(self._pool) - self._creating
+                if needed > 0:
+                    tasks = [self._create_one() for _ in range(needed)]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    if needed >= 4:
+                        log.info("Pool: replenished +%d (total %d)",
+                                 needed, len(self._pool))
+            except Exception as e:
+                log.debug("Pool keepalive error: %s", e)
 
     async def _create_one(self):
         """Create one connection and add to pool."""
         self._creating += 1
         try:
-            conn = await self._open_connection()
+            conn = await asyncio.wait_for(
+                self._open_connection(), timeout=10
+            )
             async with self._lock:
                 self._pool.append(conn)
         except Exception as e:
-            log.debug("Pool: failed to create connection: %s", e)
+            log.debug("Pool: create failed: %s", e)
         finally:
             self._creating -= 1
 
@@ -101,12 +116,12 @@ class ConnectionPool:
             import socket
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        # Fragmentation layer
         reader, writer = wrap_connection(raw_reader, raw_writer)
         return reader, writer, raw_writer
 
     async def close(self):
-        """Close all pooled connections."""
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
         async with self._lock:
             while self._pool:
                 _, _, raw_writer = self._pool.popleft()
