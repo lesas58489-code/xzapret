@@ -238,7 +238,7 @@ class XzapSocksProxy(
             out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
 
             val tunnelInp = java.io.BufferedInputStream(tunnel.getInputStream(), BUFFER_SIZE)
-            val tunnelOut = java.io.BufferedOutputStream(tunnel.getOutputStream(), BUFFER_SIZE)
+            val tunnelOut = tunnel.getOutputStream()  // no buffering — TLS handles it
 
             val t1 = Thread {
                 try {
@@ -247,8 +247,6 @@ class XzapSocksProxy(
                         val n = inp.read(buf)
                         if (n <= 0) break
                         sendFrame(tunnelOut, buf, n)
-                        // Flush if no more data immediately available
-                        if (inp.available() == 0) tunnelOut.flush()
                     }
                 } catch (_: Exception) {}
                 try { tunnel.close() } catch (_: Exception) {}
@@ -319,7 +317,7 @@ class XzapSocksProxy(
             val tunnelInp = sock.getInputStream()
 
             val req = """{"cmd":"connect","host":"$host","port":$port}""".toByteArray()
-            sendFrame(tunnelOut, req, flush = true)
+            sendFrame(tunnelOut, req)
 
             val resp = recvFrame(tunnelInp) ?: return null
             val respStr = String(resp)
@@ -335,7 +333,7 @@ class XzapSocksProxy(
 
     // ==================== XZAP frame I/O + fragmentation ====================
 
-    private fun sendFrame(out: OutputStream, data: ByteArray, len: Int = data.size, flush: Boolean = false) {
+    private fun sendFrame(out: OutputStream, data: ByteArray, len: Int = data.size) {
         val toEncrypt = if (len == data.size) data else data.copyOf(len)
         val encrypted = encrypt(toEncrypt)
         val prefix = ByteArray(PREFIX_SIZE).also { random.nextBytes(it) }
@@ -352,8 +350,7 @@ class XzapSocksProxy(
             } else {
                 writeBulkFragment(out, xzapFrame)
             }
-            if (flush) out.flush()
-            // For bulk data: BufferedOutputStream flushes automatically at 128KB
+            out.flush()
         }
     }
 
