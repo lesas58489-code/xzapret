@@ -180,14 +180,21 @@ class XZAPTunnelServer:
         log.debug("Tunnel connection from %s", addr)
         sock = raw_writer.get_extra_info("socket")
         if sock:
-            import socket
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            import socket as _socket
+            sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
 
-        # Micro-fragmentation layer (anti-DPI)
         reader, writer = wrap_connection(raw_reader, raw_writer)
+        target_w = None
 
         try:
-            ctrl = await _recv_frame(reader, self.crypto)
+            # Handshake with timeout — pool connections expire cleanly
+            try:
+                ctrl = await asyncio.wait_for(
+                    _recv_frame(reader, self.crypto), timeout=300
+                )
+            except asyncio.TimeoutError:
+                return  # pool connection expired, close silently
+
             req = json.loads(ctrl)
             if req.get("cmd") != "connect":
                 await _send_frame(writer, self.crypto,
@@ -202,7 +209,7 @@ class XZAPTunnelServer:
                     asyncio.open_connection(target_host, target_port),
                     timeout=10,
                 )
-            except Exception as e:
+            except Exception:
                 await _send_frame(writer, self.crypto,
                                    json.dumps({"ok": False, "err": "connect failed"}).encode())
                 return
@@ -220,10 +227,9 @@ class XZAPTunnelServer:
                         await target_w.drain()
                         sent += len(data)
                 except asyncio.CancelledError:
-                    log.info("xzap→target CANCEL %s:%d sent=%d", target_host, target_port, sent)
                     raise
-                except Exception as e:
-                    log.info("xzap→target ended %s:%d sent=%d err=%s", target_host, target_port, sent, e)
+                except Exception:
+                    pass
                 finally:
                     log.info("xzap→target DONE %s:%d sent=%d", target_host, target_port, sent)
 
@@ -234,10 +240,9 @@ class XZAPTunnelServer:
                         await _send_frame(writer, self.crypto, chunk)
                         recv += len(chunk)
                 except asyncio.CancelledError:
-                    log.info("target→xzap CANCEL %s:%d recv=%d", target_host, target_port, recv)
                     raise
-                except Exception as e:
-                    log.info("target→xzap ended %s:%d recv=%d err=%s", target_host, target_port, recv, e)
+                except Exception:
+                    pass
                 finally:
                     log.info("target→xzap DONE %s:%d recv=%d", target_host, target_port, recv)
 
@@ -252,15 +257,17 @@ class XZAPTunnelServer:
                     await t
                 except (asyncio.CancelledError, Exception):
                     pass
-            try:
-                target_w.close()
-                await target_w.wait_closed()
-            except Exception:
-                pass
 
         except Exception as e:
             log.debug("Tunnel error: %s", e)
         finally:
+            # Clean up ALL resources
+            if target_w:
+                try:
+                    target_w.close()
+                    await target_w.wait_closed()
+                except Exception:
+                    pass
             try:
                 raw_writer.close()
                 await raw_writer.wait_closed()

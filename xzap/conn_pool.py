@@ -1,13 +1,17 @@
 """
 XZAP Connection Pool — pre-established TLS connections.
-Simple version: 8 connections, lazy replenish on get().
+TTL-based: connections expire after 240s (server timeout 300s).
+Lazy replenish on get(). Dead connections cleaned on access.
 """
 
 import asyncio
 import logging
+import time
 from collections import deque
 
 log = logging.getLogger("xzap.pool")
+
+CONN_TTL = 240  # must be < server handshake timeout (300s)
 
 
 class ConnectionPool:
@@ -18,30 +22,37 @@ class ConnectionPool:
         self.server_port = server_port
         self.use_tls = use_tls
         self.pool_size = pool_size
-        self._pool: deque = deque()
+        self._pool: deque = deque()  # (reader, writer, raw_writer, created_at)
         self._creating = 0
 
     async def start(self):
-        log.info("Pool: warming %d connections", self.pool_size)
+        log.info("Pool: warming %d connections (TTL=%ds)", self.pool_size, CONN_TTL)
         tasks = [self._create_one() for _ in range(self.pool_size)]
         await asyncio.gather(*tasks, return_exceptions=True)
         log.info("Pool: %d ready", len(self._pool))
 
     async def get(self):
+        now = time.monotonic()
         while self._pool:
-            reader, writer, raw_writer = self._pool.popleft()
-            if not raw_writer.is_closing():
-                # Replenish in background
-                asyncio.create_task(self._create_one())
-                return reader, writer, raw_writer
+            reader, writer, raw_writer, created = self._pool.popleft()
+            # Skip dead or expired
+            if raw_writer.is_closing() or (now - created) > CONN_TTL:
+                try:
+                    raw_writer.close()
+                except Exception:
+                    pass
+                continue
+            # Good connection — replenish in background
+            asyncio.create_task(self._create_one())
+            return reader, writer, raw_writer
         # Empty — create on demand
         return await self._open_connection()
 
     async def _create_one(self):
         self._creating += 1
         try:
-            conn = await asyncio.wait_for(self._open_connection(), timeout=10)
-            self._pool.append(conn)
+            r, w, rw = await asyncio.wait_for(self._open_connection(), timeout=10)
+            self._pool.append((r, w, rw, time.monotonic()))
         except Exception:
             pass
         finally:
