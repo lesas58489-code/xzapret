@@ -237,8 +237,8 @@ class XzapSocksProxy(
 
             out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
 
-            val tunnelInp = tunnel.getInputStream()
-            val tunnelOut = tunnel.getOutputStream()
+            val tunnelInp = java.io.BufferedInputStream(tunnel.getInputStream(), BUFFER_SIZE)
+            val tunnelOut = java.io.BufferedOutputStream(tunnel.getOutputStream(), BUFFER_SIZE)
 
             val t1 = Thread {
                 try {
@@ -246,17 +246,18 @@ class XzapSocksProxy(
                     while (running.get()) {
                         val n = inp.read(buf)
                         if (n <= 0) break
-                        sendFrame(tunnelOut, buf.copyOf(n))
+                        sendFrame(tunnelOut, buf, n)
                     }
                 } catch (_: Exception) {}
                 try { tunnel.close() } catch (_: Exception) {}
             }
             val t2 = Thread {
                 try {
+                    val bOut = java.io.BufferedOutputStream(out, BUFFER_SIZE)
                     while (running.get()) {
                         val data = recvFrame(tunnelInp) ?: break
-                        out.write(data)
-                        out.flush()
+                        bOut.write(data)
+                        bOut.flush()
                     }
                 } catch (_: Exception) {}
                 try { client.close() } catch (_: Exception) {}
@@ -332,8 +333,9 @@ class XzapSocksProxy(
 
     // ==================== XZAP frame I/O + fragmentation ====================
 
-    private fun sendFrame(out: OutputStream, data: ByteArray) {
-        val encrypted = encrypt(data)
+    private fun sendFrame(out: OutputStream, data: ByteArray, len: Int = data.size) {
+        val toEncrypt = if (len == data.size) data else data.copyOf(len)
+        val encrypted = encrypt(toEncrypt)
         val prefix = ByteArray(PREFIX_SIZE).also { random.nextBytes(it) }
         val payload = prefix + encrypted
 
