@@ -47,7 +47,7 @@ class XzapSocksProxy(
         private const val NONCE_SIZE = 12
         private const val TAG_BITS = 128
         private const val PREFIX_SIZE = 16
-        private const val BUFFER_SIZE = 65536
+        private const val BUFFER_SIZE = 131072  // 128KB for better throughput
         private const val FRAG_THRESHOLD = 150
         private const val FRAG_MIN = 24
         private const val FRAG_MAX = 68
@@ -69,6 +69,10 @@ class XzapSocksProxy(
     private var serverSocket: ServerSocket? = null
     private var executor: ExecutorService? = null
     private lateinit var sslFactory: SSLSocketFactory
+
+    // Thread-local cached Cipher instances (avoid Cipher.getInstance overhead)
+    private val encCipher = ThreadLocal.withInitial { Cipher.getInstance("AES/GCM/NoPadding") }
+    private val decCipher = ThreadLocal.withInitial { Cipher.getInstance("AES/GCM/NoPadding") }
 
     // Connection pool
     private val pool = ConcurrentLinkedDeque<Socket>()
@@ -378,7 +382,7 @@ class XzapSocksProxy(
     }
 
     private fun recvFrame(inp: InputStream): ByteArray? {
-        val buffer = mutableListOf<Byte>()
+        val buffer = java.io.ByteArrayOutputStream(4096)
         while (true) {
             val fragHdr = readExactly(inp, 4) ?: return null
             val fragTotal = getInt(fragHdr, 0)
@@ -388,16 +392,16 @@ class XzapSocksProxy(
             val flags = fragPayload[0].toInt() and 0xFF
             if (flags == 0x01) continue // chaff
 
-            val fragData = fragPayload.copyOfRange(1, fragPayload.size)
-            buffer.addAll(fragData.toList())
+            buffer.write(fragPayload, 1, fragPayload.size - 1)
 
-            if (buffer.size >= 4) {
+            val size = buffer.size()
+            if (size >= 4) {
                 val buf = buffer.toByteArray()
                 val xzapLen = getInt(buf, 0)
-                if (buf.size >= 4 + xzapLen) {
-                    val payload = buf.copyOfRange(4, 4 + xzapLen)
-                    val encrypted = payload.copyOfRange(PREFIX_SIZE, payload.size)
-                    return decrypt(encrypted)
+                if (size >= 4 + xzapLen) {
+                    return decrypt(ByteArray(xzapLen - PREFIX_SIZE).also {
+                        System.arraycopy(buf, 4 + PREFIX_SIZE, it, 0, it.size)
+                    })
                 }
             }
         }
@@ -431,16 +435,20 @@ class XzapSocksProxy(
 
     private fun encrypt(plaintext: ByteArray): ByteArray {
         val nonce = ByteArray(NONCE_SIZE).also { random.nextBytes(it) }
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        val cipher = encCipher.get()!!
         cipher.init(Cipher.ENCRYPT_MODE, keySpec, GCMParameterSpec(TAG_BITS, nonce))
-        return nonce + cipher.doFinal(plaintext)
+        val ct = cipher.doFinal(plaintext)
+        // nonce + ciphertext in one allocation
+        val result = ByteArray(NONCE_SIZE + ct.size)
+        System.arraycopy(nonce, 0, result, 0, NONCE_SIZE)
+        System.arraycopy(ct, 0, result, NONCE_SIZE, ct.size)
+        return result
     }
 
     private fun decrypt(data: ByteArray): ByteArray {
-        val nonce = data.copyOfRange(0, NONCE_SIZE)
-        val ct = data.copyOfRange(NONCE_SIZE, data.size)
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, keySpec, GCMParameterSpec(TAG_BITS, nonce))
-        return cipher.doFinal(ct)
+        val cipher = decCipher.get()!!
+        cipher.init(Cipher.DECRYPT_MODE, keySpec,
+            GCMParameterSpec(TAG_BITS, data, 0, NONCE_SIZE))
+        return cipher.doFinal(data, NONCE_SIZE, data.size - NONCE_SIZE)
     }
 }
