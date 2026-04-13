@@ -161,12 +161,7 @@ class XzapSocksProxy(
     // ==================== TLS with SNI rotation ====================
 
     private fun openTlsConnection(): Socket {
-        val sni = WHITE_DOMAINS[random.nextInt(WHITE_DOMAINS.size)]
         val sock = sslFactory.createSocket() as SSLSocket
-        sock.sslParameters = sock.sslParameters.apply {
-            serverNames = listOf(javax.net.ssl.SNIHostName(sni))
-            protocols = arrayOf("TLSv1.3", "TLSv1.2")
-        }
         sock.connect(InetSocketAddress(serverHost, serverPort), 10000)
         sock.soTimeout = 0
         sock.tcpNoDelay = true
