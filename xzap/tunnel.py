@@ -245,7 +245,7 @@ class XZAPTunnelServer:
                     while True:
                         data = await _recv_frame(reader, crypto)
                         target_w.write(data)
-                        await asyncio.wait_for(target_w.drain(), timeout=30)
+                        await target_w.drain()
                         sent += len(data)
                 except asyncio.CancelledError:
                     raise
