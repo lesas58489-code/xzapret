@@ -17,7 +17,7 @@ CONN_TTL = 240  # must be < server handshake timeout (300s)
 class ConnectionPool:
 
     def __init__(self, server_host: str, server_port: int,
-                 use_tls: bool = False, pool_size: int = 8):
+                 use_tls: bool = False, pool_size: int = 16):
         self.server_host = server_host
         self.server_port = server_port
         self.use_tls = use_tls

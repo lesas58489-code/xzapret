@@ -245,7 +245,7 @@ class XZAPTunnelServer:
                     while True:
                         data = await _recv_frame(reader, crypto)
                         target_w.write(data)
-                        await target_w.drain()
+                        await asyncio.wait_for(target_w.drain(), timeout=30)
                         sent += len(data)
                 except asyncio.CancelledError:
                     raise
@@ -257,7 +257,10 @@ class XZAPTunnelServer:
             async def target_to_xzap():
                 recv = 0
                 try:
-                    while chunk := await target_r.read(65536):
+                    while True:
+                        chunk = await asyncio.wait_for(target_r.read(65536), timeout=120)
+                        if not chunk:
+                            break
                         await _send_frame(writer, crypto, chunk)
                         recv += len(chunk)
                 except asyncio.CancelledError:
