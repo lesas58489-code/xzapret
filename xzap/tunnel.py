@@ -170,10 +170,11 @@ class XZAPTunnelStream:
 
 
 class XZAPTunnelServer:
-    """Серверная сторона туннеля."""
+    """Серверная сторона туннеля. Supports multi-user keys."""
 
-    def __init__(self, crypto: XZAPCrypto, obfuscator=None):
+    def __init__(self, crypto: XZAPCrypto = None, obfuscator=None, keystore=None):
         self.crypto = crypto
+        self.keystore = keystore  # Multi-user key store
 
     async def handle(self, raw_reader, raw_writer):
         addr = raw_writer.get_extra_info("peername")
@@ -185,19 +186,39 @@ class XZAPTunnelServer:
 
         reader, writer = wrap_connection(raw_reader, raw_writer)
         target_w = None
+        username = None
 
         try:
-            # Handshake with timeout — pool connections expire cleanly
+            # Read raw frame for key identification
             try:
-                ctrl = await asyncio.wait_for(
-                    _recv_frame(reader, self.crypto), timeout=300
+                hdr = await asyncio.wait_for(
+                    reader.readexactly(4), timeout=300
                 )
             except asyncio.TimeoutError:
-                return  # pool connection expired, close silently
+                return  # pool connection expired
+
+            length = struct.unpack(">I", hdr)[0]
+            if length > MAX_FRAME_SIZE:
+                return
+            payload = await reader.readexactly(length)
+
+            # Identify user by trying each key
+            if self.keystore:
+                crypto, username = self.keystore.identify(payload)
+                if not crypto:
+                    log.warning("Unknown key from %s", addr)
+                    return
+                log.info("User '%s' connected from %s", username, addr)
+            else:
+                crypto = self.crypto
+
+            # Decrypt the handshake frame
+            encrypted = payload[PREFIX_SIZE:]
+            ctrl = crypto.decrypt(encrypted)
 
             req = json.loads(ctrl)
             if req.get("cmd") != "connect":
-                await _send_frame(writer, self.crypto,
+                await _send_frame(writer, crypto,
                                    json.dumps({"ok": False, "err": "bad cmd"}).encode())
                 return
 
@@ -210,11 +231,11 @@ class XZAPTunnelServer:
                     timeout=10,
                 )
             except Exception:
-                await _send_frame(writer, self.crypto,
+                await _send_frame(writer, crypto,
                                    json.dumps({"ok": False, "err": "connect failed"}).encode())
                 return
 
-            await _send_frame(writer, self.crypto,
+            await _send_frame(writer, crypto,
                                json.dumps({"ok": True}).encode())
             log.info("Tunnelling → %s:%d", target_host, target_port)
 
@@ -222,7 +243,7 @@ class XZAPTunnelServer:
                 sent = 0
                 try:
                     while True:
-                        data = await _recv_frame(reader, self.crypto)
+                        data = await _recv_frame(reader, crypto)
                         target_w.write(data)
                         await target_w.drain()
                         sent += len(data)
@@ -237,7 +258,7 @@ class XZAPTunnelServer:
                 recv = 0
                 try:
                     while chunk := await target_r.read(65536):
-                        await _send_frame(writer, self.crypto, chunk)
+                        await _send_frame(writer, crypto, chunk)
                         recv += len(chunk)
                 except asyncio.CancelledError:
                     raise

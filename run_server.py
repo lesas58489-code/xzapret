@@ -59,12 +59,20 @@ async def run_tls_server(host: str, port: int, key: bytes,
     # Generate cert if not exists
     generate_self_signed_cert(cert_file, key_file_tls)
 
-    crypto = XZAPCrypto(key=key)
-    tunnel_handler = XZAPTunnelServer(crypto)
+    from xzap.keystore import KeyStore
+
+    # Multi-user keys (keys.json) or single key (legacy)
+    keystore = KeyStore("keys.json")
+    if keystore.users:
+        tunnel_handler = XZAPTunnelServer(keystore=keystore)
+        log.info("Multi-user mode: %d users", len(keystore.users))
+    else:
+        crypto = XZAPCrypto(key=key)
+        tunnel_handler = XZAPTunnelServer(crypto=crypto)
 
     ssl_ctx = create_server_context(cert_file, key_file_tls)
 
-    # Memory manager: gc every 60s, cleanup every 5min, restart at 200MB
+    # Memory manager
     mem = MemoryManager(gc_interval=60, cleanup_interval=300, max_rss_mb=200)
     await mem.start()
 
