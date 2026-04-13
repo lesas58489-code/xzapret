@@ -54,13 +54,13 @@ class XzapSocksProxy(
         private const val POOL_SIZE = 8
 
         private val WHITE_DOMAINS = listOf(
-            "www.youtube.com", "youtube.com",
-            "www.google.com", "google.com",
+            // Only NON-BLOCKED domains — DPI checks SNI
             "www.cloudflare.com", "cloudflare.com",
             "www.microsoft.com", "microsoft.com",
             "www.apple.com", "apple.com",
             "www.amazon.com", "amazon.com",
-            "cdn.jsdelivr.net", "ajax.googleapis.com",
+            "cdn.jsdelivr.net", "cdnjs.cloudflare.com",
+            "ajax.aspnetcdn.com", "cdn.shopify.com",
         )
     }
 
@@ -161,7 +161,11 @@ class XzapSocksProxy(
     // ==================== TLS with SNI rotation ====================
 
     private fun openTlsConnection(): Socket {
+        val sni = WHITE_DOMAINS[random.nextInt(WHITE_DOMAINS.size)]
         val sock = sslFactory.createSocket() as SSLSocket
+        sock.sslParameters = sock.sslParameters.apply {
+            serverNames = listOf(javax.net.ssl.SNIHostName(sni))
+        }
         sock.connect(InetSocketAddress(serverHost, serverPort), 10000)
         sock.soTimeout = 0
         sock.tcpNoDelay = true

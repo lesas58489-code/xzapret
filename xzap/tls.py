@@ -28,16 +28,17 @@ log = logging.getLogger("xzap.tls")
 # Белые домены — популярные сайты, трафик к которым DPI не блокирует.
 # Используем полные домены с www и без — как в реальном браузере.
 WHITE_DOMAINS = [
-    "www.youtube.com", "youtube.com",
-    "www.google.com", "google.com",
+    # Only NON-BLOCKED domains — DPI checks SNI regardless of dest IP
     "www.cloudflare.com", "cloudflare.com",
     "www.microsoft.com", "microsoft.com",
     "www.apple.com", "apple.com",
     "www.amazon.com", "amazon.com",
     "cdn.jsdelivr.net",
-    "ajax.googleapis.com",
-    "fonts.googleapis.com",
     "cdnjs.cloudflare.com",
+    "ajax.aspnetcdn.com",
+    "fonts.gstatic.com",
+    "cdn.shopify.com",
+    "s3.amazonaws.com",
 ]
 
 # Chrome 120+ cipher suite order — DPI проверяет порядок cipher suites
