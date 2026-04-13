@@ -17,7 +17,7 @@
     <com.google.android.material.textfield.TextInputLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:hint="Server">
+        android:hint="SSH Server">
         <EditText
             android:id="@+id/et_server"
             android:layout_width="match_parent"
@@ -30,28 +30,29 @@
     <com.google.android.material.textfield.TextInputLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:hint="Port"
+        android:hint="SSH Port"
         android:layout_marginTop="8dp">
         <EditText
             android:id="@+id/et_port"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:inputType="number"
-            android:text="8443"
+            android:text="22"
             android:singleLine="true" />
     </com.google.android.material.textfield.TextInputLayout>
 
     <com.google.android.material.textfield.TextInputLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:hint="Key (base64)"
+        android:hint="SSH Private Key (PEM)"
         android:layout_marginTop="8dp">
         <EditText
             android:id="@+id/et_key"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:inputType="textPassword"
-            android:singleLine="true" />
+            android:inputType="textMultiLine"
+            android:minLines="3"
+            android:gravity="top" />
     </com.google.android.material.textfield.TextInputLayout>
 
     <Button
