@@ -317,7 +317,7 @@ class XzapSocksProxy(
             val tunnelInp = sock.getInputStream()
 
             val req = """{"cmd":"connect","host":"$host","port":$port}""".toByteArray()
-            sendFrame(tunnelOut, req)
+            sendFrame(tunnelOut, req, flush = true)
 
             val resp = recvFrame(tunnelInp) ?: return null
             val respStr = String(resp)
@@ -333,7 +333,7 @@ class XzapSocksProxy(
 
     // ==================== XZAP frame I/O + fragmentation ====================
 
-    private fun sendFrame(out: OutputStream, data: ByteArray, len: Int = data.size) {
+    private fun sendFrame(out: OutputStream, data: ByteArray, len: Int = data.size, flush: Boolean = false) {
         val toEncrypt = if (len == data.size) data else data.copyOf(len)
         val encrypted = encrypt(toEncrypt)
         val prefix = ByteArray(PREFIX_SIZE).also { random.nextBytes(it) }
@@ -346,13 +346,12 @@ class XzapSocksProxy(
 
         synchronized(out) {
             if (xzapFrame.size <= FRAG_THRESHOLD) {
-                // Micro-fragmentation: split into 24-68 byte pieces
                 writeMicroFragmented(out, xzapFrame)
             } else {
-                // Bulk: single fragment
                 writeBulkFragment(out, xzapFrame)
             }
-            out.flush()
+            if (flush) out.flush()
+            // For bulk data: BufferedOutputStream flushes automatically at 128KB
         }
     }
 
