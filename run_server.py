@@ -54,6 +54,7 @@ async def run_tls_server(host: str, port: int, key: bytes,
     """TLS-сервер — DPI видит HTTPS к белому домену."""
     import ssl as _ssl
     from xzap.tls import generate_self_signed_cert, create_server_context
+    from xzap.memory import MemoryManager
 
     # Generate cert if not exists
     generate_self_signed_cert(cert_file, key_file_tls)
@@ -62,6 +63,10 @@ async def run_tls_server(host: str, port: int, key: bytes,
     tunnel_handler = XZAPTunnelServer(crypto)
 
     ssl_ctx = create_server_context(cert_file, key_file_tls)
+
+    # Memory manager: gc every 60s, cleanup every 5min, restart at 200MB
+    mem = MemoryManager(gc_interval=60, cleanup_interval=300, max_rss_mb=200)
+    await mem.start()
 
     server = await asyncio.start_server(
         tunnel_handler.handle, host, port, ssl=ssl_ctx,
