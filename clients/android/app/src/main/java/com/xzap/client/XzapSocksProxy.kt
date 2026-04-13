@@ -247,6 +247,8 @@ class XzapSocksProxy(
                         val n = inp.read(buf)
                         if (n <= 0) break
                         sendFrame(tunnelOut, buf, n)
+                        // Flush if no more data immediately available
+                        if (inp.available() == 0) tunnelOut.flush()
                     }
                 } catch (_: Exception) {}
                 try { tunnel.close() } catch (_: Exception) {}
