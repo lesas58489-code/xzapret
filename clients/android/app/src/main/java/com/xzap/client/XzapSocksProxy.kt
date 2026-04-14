@@ -389,18 +389,21 @@ class XzapSocksProxy(
                 val tOut = tunnel.getOutputStream()
                 val tInp = java.io.BufferedInputStream(tunnel.getInputStream(), 512)
 
-                // TCP DNS: 2-byte length prefix + query
+                // TCP DNS: 2-byte length prefix + query.
+                // sendFrame encrypts → server decrypts → forwards [2B len][query] to 8.8.8.8:53.
+                // Server reads [2B len][response] back → wraps in XZAP frame → we recvFrame().
+                // recvFrame() decrypts, returning [2B len][DNS response] — strip the 2B prefix.
                 val tcpQuery = ByteArray(2 + query.size)
                 tcpQuery[0] = ((query.size shr 8) and 0xFF).toByte()
                 tcpQuery[1] = (query.size and 0xFF).toByte()
                 System.arraycopy(query, 0, tcpQuery, 2, query.size)
                 sendFrame(tOut, tcpQuery)
 
-                // Read response: 2-byte length + response
-                val lenBuf = readExactly(tInp, 2) ?: return
-                val respLen = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
-                if (respLen <= 0 || respLen > 4096) return
-                val response = readExactly(tInp, respLen) ?: return
+                // Response arrives as an XZAP-encrypted frame — MUST use recvFrame, not readExactly.
+                val resp = recvFrame(tInp) ?: return
+                if (resp.size < 2) return
+                // Drop the 2-byte TCP DNS length prefix; keep raw DNS response bytes.
+                val response = resp.copyOfRange(2, resp.size)
 
                 // SOCKS5 UDP datagram reply: [2B RSV=0][1B FRAG=0][1B ATYP=3(domain)]
                 //   [1B len][domain bytes][2B port=53][response]
