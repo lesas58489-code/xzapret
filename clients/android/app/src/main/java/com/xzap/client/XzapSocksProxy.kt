@@ -201,28 +201,21 @@ class XzapSocksProxy(
             // SOCKS5 request
             val req = readExactly(inp, 4) ?: return
             if (req[1] == 0x03.toByte()) {
-                // UDP ASSOCIATE — tun2socks uses this for QUIC (YouTube etc.)
-                // We set up a fake UDP relay: accept the association, create a local
-                // UDP socket, return its address as the relay endpoint.
-                // tun2socks sends QUIC datagrams there; we receive but discard them.
-                // Chrome sees UDP "working" but getting no responses → marks QUIC broken
-                // after 2-3s → falls back to clean TCP (which routes fine through XZAP).
-                // This eliminates Chrome's QUIC↔TCP race that caused recv=0 hangs.
+                // UDP ASSOCIATE — used by tun2socks for QUIC (YouTube, Chrome etc.)
+                // Strategy: accept the association (so tun2socks doesn't panic),
+                // then immediately close the TCP control connection.
+                // Per SOCKS5 spec, closing the control connection invalidates the relay
+                // instantly → tun2socks drops the QUIC session → Chrome/Cronet marks
+                // the server as QUIC-broken and falls back to TCP with zero wait time.
                 skipSocksAddr(inp, req[3].toInt() and 0xFF)
                 val udpSock = java.net.DatagramSocket(0, java.net.InetAddress.getLoopbackAddress())
                 val udpPort = udpSock.localPort
-                try {
-                    out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01,
-                        127, 0, 0, 1,
-                        ((udpPort shr 8) and 0xFF).toByte(),
-                        (udpPort and 0xFF).toByte()))
-                    // Keep TCP control connection alive — SOCKS5 requires this.
-                    // tun2socks closes it once QUIC is abandoned → we exit.
-                    try { inp.read() } catch (_: Exception) {}
-                } finally {
-                    udpSock.close()
-                }
-                return
+                udpSock.close()
+                out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01,
+                    127, 0, 0, 1,
+                    ((udpPort shr 8) and 0xFF).toByte(),
+                    (udpPort and 0xFF).toByte()))
+                return  // immediate close → QUIC dies → TCP fallback, no delay
             }
             if (req[1] != 0x01.toByte()) {
                 // BIND or unknown — general failure
