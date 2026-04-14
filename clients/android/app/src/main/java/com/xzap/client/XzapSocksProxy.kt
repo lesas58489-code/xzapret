@@ -78,6 +78,18 @@ class XzapSocksProxy(
     private val pool = ConcurrentLinkedDeque<Socket>()
     private val poolCreating = AtomicInteger(0)
 
+    // Signals that at least one pool connection is ready.
+    // XzapVpnService waits on this before activating the VPN so Android's
+    // connectivity probe (connectivitycheck.gstatic.com) doesn't time out on
+    // an empty pool — which would mark the network as NOT_VALIDATED and
+    // cause YouTube app (and other apps that check NET_CAPABILITY_VALIDATED)
+    // to spin indefinitely even though the tunnel works fine.
+    private val poolReadyLatch = java.util.concurrent.CountDownLatch(1)
+    private val poolSignaled = AtomicBoolean(false)
+
+    fun waitReady(timeoutMs: Long): Boolean =
+        poolReadyLatch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+
     fun start(port: Int) {
         executor = Executors.newCachedThreadPool()
 
@@ -138,6 +150,8 @@ class XzapSocksProxy(
         try {
             val sock = openTlsConnection()
             pool.offer(sock)
+            // Signal first ready connection so XzapVpnService can activate VPN
+            if (!poolSignaled.getAndSet(true)) poolReadyLatch.countDown()
         } catch (e: Exception) {
             Log.d(TAG, "Pool create failed: ${e.message}")
         } finally {
@@ -432,7 +446,11 @@ class XzapSocksProxy(
 
     private fun openXzapTunnelForUdp(host: String, port: Int): Socket? {
         return try {
-            val sock = getPoolConnection()
+            // Use a fresh TLS connection, NOT from the pool.
+            // Pool connections are reserved for TCP CONNECT (browser/app traffic).
+            // UDP relay tunnels are long-lived (for the QUIC session duration) and
+            // would starve the pool causing 2-3 min delays for all TCP traffic.
+            val sock = openTlsConnection()
             val tunnelOut = sock.getOutputStream()
             val req = """{"cmd":"udpfwd","host":"$host","port":$port}""".toByteArray()
             sendFrame(tunnelOut, req)

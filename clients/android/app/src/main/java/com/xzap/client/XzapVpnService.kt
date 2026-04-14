@@ -72,7 +72,12 @@ class XzapVpnService : VpnService() {
             socksProxy = XzapSocksProxy(server, port, key, running, bypass)
             socksProxy!!.start(SOCKS_PORT)
 
-            Thread.sleep(500) // wait for SOCKS to bind
+            // Wait until at least one pool connection is ready (up to 8s).
+            // Android fires a connectivity probe (connectivitycheck.gstatic.com)
+            // immediately after VPN comes up. If the pool isn't ready, the probe
+            // times out → VPN network marked NOT_VALIDATED → YouTube app and
+            // other apps that check NET_CAPABILITY_VALIDATED spin indefinitely.
+            socksProxy!!.waitReady(8000)
 
             setupVpn()
             startTun2Socks()
