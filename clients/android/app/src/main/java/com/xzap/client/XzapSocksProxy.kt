@@ -52,6 +52,9 @@ class XzapSocksProxy(
         private const val FRAG_MIN = 24
         private const val FRAG_MAX = 68
         private const val POOL_SIZE = 8
+        private const val POOL_MAX_AGE_MS = 45_000L   // discard pool connections older than 45s (mobile NAT kills idle TCP in 30-120s)
+        private const val HANDSHAKE_TIMEOUT_MS = 10_000 // 10s timeout for XZAP handshake (detect stale pool sockets)
+        private const val DATA_TIMEOUT_MS = 120_000     // 120s timeout for data relay (detect dead connections mid-stream)
 
         private val WHITE_DOMAINS = listOf(
             // Only NON-BLOCKED domains — DPI checks SNI
@@ -64,6 +67,9 @@ class XzapSocksProxy(
         )
     }
 
+    /** Pool entry with creation timestamp for age-based eviction. */
+    private data class PooledSocket(val socket: Socket, val createdAt: Long = System.currentTimeMillis())
+
     private val random = SecureRandom()
     private val keySpec = SecretKeySpec(key, "AES")
     private var serverSocket: ServerSocket? = null
@@ -74,8 +80,8 @@ class XzapSocksProxy(
     private val encCipher = ThreadLocal.withInitial { Cipher.getInstance("AES/GCM/NoPadding") }
     private val decCipher = ThreadLocal.withInitial { Cipher.getInstance("AES/GCM/NoPadding") }
 
-    // Connection pool
-    private val pool = ConcurrentLinkedDeque<Socket>()
+    // Connection pool with age tracking
+    private val pool = ConcurrentLinkedDeque<PooledSocket>()
     private val poolCreating = AtomicInteger(0)
 
     // Signals that at least one pool connection is ready.
@@ -128,7 +134,7 @@ class XzapSocksProxy(
     fun stop() {
         serverSocket?.close()
         while (pool.isNotEmpty()) {
-            try { pool.poll()?.close() } catch (_: Exception) {}
+            try { pool.poll()?.socket?.close() } catch (_: Exception) {}
         }
         executor?.shutdownNow()
     }
@@ -149,7 +155,7 @@ class XzapSocksProxy(
         poolCreating.incrementAndGet()
         try {
             val sock = openTlsConnection()
-            pool.offer(sock)
+            pool.offer(PooledSocket(sock))
             // Signal first ready connection so XzapVpnService can activate VPN
             if (!poolSignaled.getAndSet(true)) poolReadyLatch.countDown()
         } catch (e: Exception) {
@@ -159,17 +165,22 @@ class XzapSocksProxy(
         }
     }
 
-    private fun getPoolConnection(): Socket {
+    /** Get a connection from pool, discarding stale ones (age > 45s).
+     *  Java's isClosed/isConnected do NOT detect remote close — age check is essential. */
+    private fun getPoolConnection(): Socket? {
+        val now = System.currentTimeMillis()
         while (pool.isNotEmpty()) {
-            val sock = pool.poll() ?: continue
-            if (!sock.isClosed && sock.isConnected) {
-                // Replenish in background
-                executor?.submit { createPoolConnection() }
-                return sock
+            val ps = pool.poll() ?: continue
+            if (ps.socket.isClosed) continue
+            if (now - ps.createdAt > POOL_MAX_AGE_MS) {
+                try { ps.socket.close() } catch (_: Exception) {}
+                continue
             }
+            // Replenish in background
+            executor?.submit { createPoolConnection() }
+            return ps.socket
         }
-        // Pool empty — create on demand
-        return openTlsConnection()
+        return null  // pool empty — caller decides
     }
 
     // ==================== TLS with SNI rotation ====================
@@ -183,6 +194,7 @@ class XzapSocksProxy(
         sock.connect(InetSocketAddress(serverHost, serverPort), 10000)
         sock.soTimeout = 0
         sock.tcpNoDelay = true
+        sock.keepAlive = true  // detect dead connections via TCP keepalive
         return sock
     }
 
@@ -215,80 +227,11 @@ class XzapSocksProxy(
             // SOCKS5 request
             val req = readExactly(inp, 4) ?: return
             if (req[1] == 0x03.toByte()) {
-                // UDP ASSOCIATE — relay UDP through XZAP TCP tunnel so QUIC works.
-                //
-                // Architecture: main dispatcher thread never blocks.
-                // Each unique (dstHost:dstPort) gets its own worker thread that opens
-                // an XZAP tunnel independently. All CDN TLS handshakes run in parallel,
-                // eliminating the "serialized hangs" when YouTube connects to 10-20 CDNs.
+                // UDP ASSOCIATE — server doesn't support UDP relay.
+                // Reject immediately so apps (YouTube QUIC) fall back to TCP
+                // instead of hanging on timeouts for 5-30 seconds.
                 skipSocksAddr(inp, req[3].toInt() and 0xFF)
-                val udpSock = java.net.DatagramSocket(0, java.net.InetAddress.getLoopbackAddress())
-                udpSock.soTimeout = 500
-                val udpPort = udpSock.localPort
-                out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01,
-                    127, 0, 0, 1,
-                    ((udpPort shr 8) and 0xFF).toByte(),
-                    (udpPort and 0xFF).toByte()))
-
-                // Map: destination key → packet queue for that destination's worker.
-                val dstQueues = java.util.concurrent.ConcurrentHashMap<String,
-                    java.util.concurrent.LinkedBlockingQueue<ByteArray>>()
-
-                executor?.submit {
-                    try {
-                        val recvBuf = ByteArray(65536)
-                        while (!client.isClosed && running.get()) {
-                            val pkt = java.net.DatagramPacket(recvBuf, recvBuf.size)
-                            try { udpSock.receive(pkt) }
-                            catch (e: java.net.SocketTimeoutException) { continue }
-
-                            val d = pkt.data
-                            if (pkt.length < 4) continue
-                            val atyp = d[3].toInt() and 0xFF
-                            val dstHost: String; val dstPort: Int; val payloadOff: Int
-                            when (atyp) {
-                                0x01 -> {
-                                    if (pkt.length < 10) continue
-                                    dstHost = "${d[4].toInt() and 0xFF}.${d[5].toInt() and 0xFF}" +
-                                              ".${d[6].toInt() and 0xFF}.${d[7].toInt() and 0xFF}"
-                                    dstPort = ((d[8].toInt() and 0xFF) shl 8) or (d[9].toInt() and 0xFF)
-                                    payloadOff = 10
-                                }
-                                0x03 -> {
-                                    val dlen = d[4].toInt() and 0xFF
-                                    if (pkt.length < 7 + dlen) continue
-                                    dstHost = String(d, 5, dlen)
-                                    dstPort = ((d[5+dlen].toInt() and 0xFF) shl 8) or (d[6+dlen].toInt() and 0xFF)
-                                    payloadOff = 7 + dlen
-                                }
-                                else -> continue
-                            }
-                            val payloadLen = pkt.length - payloadOff
-                            if (payloadLen <= 0) continue
-
-                            val key = "$dstHost:$dstPort"
-                            val srcAddr = pkt.socketAddress as java.net.InetSocketAddress
-                            val payload = d.copyOfRange(payloadOff, payloadOff + payloadLen)
-
-                            // computeIfAbsent is effectively single-threaded here (one dispatcher),
-                            // so the lambda runs exactly once per key. When a worker dies
-                            // it removes its own key so the next packet re-spawns a fresh worker.
-                            val queue = dstQueues.computeIfAbsent(key) {
-                                val q = java.util.concurrent.LinkedBlockingQueue<ByteArray>(512)
-                                executor?.submit {
-                                    handleUdpDestination(dstHost, dstPort, q, srcAddr, udpSock, dstQueues, key)
-                                }
-                                q
-                            }
-                            queue.offer(payload) // non-blocking; drops on overflow (backpressure)
-                        }
-                    } catch (_: Exception) {
-                    } finally { udpSock.close() }
-                }
-
-                // Keep control connection open per SOCKS5 spec
-                try { while (inp.read() != -1 && !client.isClosed && running.get()) {} }
-                catch (_: Exception) {}
+                out.write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0)) // 0x07 = command not supported
                 return
             }
             if (req[1] != 0x01.toByte()) {
@@ -330,6 +273,11 @@ class XzapSocksProxy(
             }
 
             out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+
+            // Set read timeout for data phase — detect dead connections on mobile
+            // (cell tower switch, NAT timeout, server crash). Without this, relay
+            // threads hang forever when the network path breaks mid-stream.
+            tunnel.soTimeout = DATA_TIMEOUT_MS
 
             val tunnelInp = java.io.BufferedInputStream(tunnel.getInputStream(), BUFFER_SIZE)
             val tunnelOut = tunnel.getOutputStream()  // no buffering — TLS handles it
@@ -405,92 +353,45 @@ class XzapSocksProxy(
     // ==================== XZAP tunnel ====================
 
     private fun openXzapTunnel(host: String, port: Int): Socket? {
-        return try {
-            val sock = getPoolConnection()
-            val tunnelOut = sock.getOutputStream()
-            val tunnelInp = sock.getInputStream()
-
-            val req = """{"cmd":"connect","host":"$host","port":$port}""".toByteArray()
-            sendFrame(tunnelOut, req)
-
-            val resp = recvFrame(tunnelInp) ?: run { sock.close(); return null }
-            val respStr = String(resp)
-            if ("\"ok\":true" !in respStr && "\"ok\": true" !in respStr) {
-                sock.close(); return null
-            }
-            sock
-        } catch (e: Exception) {
-            Log.d(TAG, "Tunnel failed $host:$port: ${e.message}")
-            null
-        }
-    }
-
-    /** Per-destination UDP relay worker. Opens one XZAP tunnel, drains the queue.
-     *  Removes its own key from [dstQueues] on exit so the next incoming packet
-     *  triggers a fresh worker instead of draining an orphaned queue. */
-    private fun handleUdpDestination(
-        dstHost: String,
-        dstPort: Int,
-        queue: java.util.concurrent.LinkedBlockingQueue<ByteArray>,
-        srcAddr: java.net.InetSocketAddress,
-        udpSock: java.net.DatagramSocket,
-        dstQueues: java.util.concurrent.ConcurrentHashMap<String,
-                       java.util.concurrent.LinkedBlockingQueue<ByteArray>>,
-        key: String,
-    ) {
-        val sock = openXzapTunnelForUdp(dstHost, dstPort) ?: run {
-            dstQueues.remove(key)  // allow retry on next packet
-            return
-        }
-        val tOut = sock.getOutputStream()
-        val tInp = java.io.BufferedInputStream(sock.getInputStream(), BUFFER_SIZE)
-
-        // Response reader thread: Warsaw replies → relay back to tun2socks
-        Thread {
+        // Try pool connection first, retry with fresh on failure.
+        // Pool connections may be stale (mobile NAT kills idle TCP in 30-120s)
+        // and Java's isClosed/isConnected cannot detect remote close.
+        for (attempt in 0..1) {
+            val sock: Socket
             try {
-                while (!sock.isClosed && running.get()) {
-                    val resp = recvFrame(tInp) ?: break
-                    // resp = 10B SOCKS5 UDP header built by Warsaw + payload
-                    try { udpSock.send(java.net.DatagramPacket(resp, resp.size, srcAddr)) }
-                    catch (_: Exception) {}
+                sock = if (attempt == 0) {
+                    getPoolConnection() ?: openTlsConnection()
+                } else {
+                    openTlsConnection()
                 }
-            } catch (_: Exception) {
-            } finally { try { sock.close() } catch (_: Exception) {} }
-        }.apply { isDaemon = true }.start()
-
-        // Send loop: drain queue until tunnel or VPN closes
-        try {
-            while (!sock.isClosed && running.get()) {
-                val payload = queue.poll(500, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
-                sendFrameSlice(tOut, payload, 0, payload.size)
+            } catch (e: Exception) {
+                Log.d(TAG, "Connect failed $host:$port attempt=$attempt: ${e.message}")
+                continue
             }
-        } catch (_: Exception) {
-        } finally {
-            try { sock.close() } catch (_: Exception) {}
-            dstQueues.remove(key)  // re-open on next packet if needed
-        }
-    }
+            try {
+                sock.soTimeout = HANDSHAKE_TIMEOUT_MS
+                val tunnelOut = sock.getOutputStream()
+                val tunnelInp = sock.getInputStream()
 
-    private fun openXzapTunnelForUdp(host: String, port: Int): Socket? {
-        return try {
-            // Use a fresh TLS connection, NOT from the pool.
-            // Pool connections are reserved for TCP CONNECT (browser/app traffic).
-            // UDP relay tunnels are long-lived (for the QUIC session duration) and
-            // would starve the pool causing 2-3 min delays for all TCP traffic.
-            val sock = openTlsConnection()
-            val tunnelOut = sock.getOutputStream()
-            val req = """{"cmd":"udpfwd","host":"$host","port":$port}""".toByteArray()
-            sendFrame(tunnelOut, req)
-            val resp = recvFrame(sock.getInputStream()) ?: run { sock.close(); return null }
-            val respStr = String(resp)
-            if ("\"ok\":true" !in respStr && "\"ok\": true" !in respStr) {
-                sock.close(); return null
+                val req = """{"cmd":"connect","host":"$host","port":$port}""".toByteArray()
+                sendFrame(tunnelOut, req)
+
+                val resp = recvFrame(tunnelInp) ?: run { sock.close(); throw java.io.IOException("no response") }
+                val respStr = String(resp)
+                if ("\"ok\":true" !in respStr && "\"ok\": true" !in respStr) {
+                    sock.close(); return null  // server explicitly rejected — don't retry
+                }
+                return sock
+            } catch (e: Exception) {
+                try { sock.close() } catch (_: Exception) {}
+                if (attempt == 0) {
+                    Log.d(TAG, "Pool stale $host:$port, retrying fresh: ${e.message}")
+                } else {
+                    Log.d(TAG, "Tunnel failed $host:$port: ${e.message}")
+                }
             }
-            sock
-        } catch (e: Exception) {
-            Log.d(TAG, "UDP tunnel failed $host:$port: ${e.message}")
-            null
         }
+        return null
     }
 
     // ==================== XZAP frame I/O + fragmentation ====================
@@ -532,22 +433,6 @@ class XzapSocksProxy(
             System.arraycopy(chunk, 0, frag, 5, chunk.size)
             out.write(frag)
             offset += fragSize
-        }
-    }
-
-    /** sendFrame variant that encrypts data[offset .. offset+len). Used by UDP relay. */
-    private fun sendFrameSlice(out: OutputStream, data: ByteArray, offset: Int, len: Int) {
-        val prefix = ByteArray(PREFIX_SIZE).also { random.nextBytes(it) }
-        val encrypted = encrypt(data, offset, len)
-        val payloadSize = PREFIX_SIZE + encrypted.size
-        val xzapFrame = ByteArray(4 + payloadSize)
-        putInt(xzapFrame, 0, payloadSize)
-        System.arraycopy(prefix, 0, xzapFrame, 4, PREFIX_SIZE)
-        System.arraycopy(encrypted, 0, xzapFrame, 4 + PREFIX_SIZE, encrypted.size)
-        synchronized(out) {
-            if (xzapFrame.size <= FRAG_THRESHOLD) writeMicroFragmented(out, xzapFrame)
-            else writeBulkFragment(out, xzapFrame)
-            out.flush()
         }
     }
 
