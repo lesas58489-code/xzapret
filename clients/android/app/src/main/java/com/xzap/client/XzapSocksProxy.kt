@@ -227,11 +227,67 @@ class XzapSocksProxy(
             // SOCKS5 request
             val req = readExactly(inp, 4) ?: return
             if (req[1] == 0x03.toByte()) {
-                // UDP ASSOCIATE — server doesn't support UDP relay.
-                // Reject immediately so apps (YouTube QUIC) fall back to TCP
-                // instead of hanging on timeouts for 5-30 seconds.
+                // UDP ASSOCIATE — accept for DNS relay, drop non-DNS silently.
+                // Server has no native UDP tunneling, so:
+                //   DNS (port 53): relay via DNS-over-TCP through XZAP tunnel
+                //   QUIC/other:    drop silently → apps fall back to TCP fast
                 skipSocksAddr(inp, req[3].toInt() and 0xFF)
-                out.write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0)) // 0x07 = command not supported
+                val udpSock = java.net.DatagramSocket(0, java.net.InetAddress.getLoopbackAddress())
+                udpSock.soTimeout = 500
+                val udpPort = udpSock.localPort
+                out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01,
+                    127, 0, 0, 1,
+                    ((udpPort shr 8) and 0xFF).toByte(),
+                    (udpPort and 0xFF).toByte()))
+
+                executor?.submit {
+                    try {
+                        val recvBuf = ByteArray(65536)
+                        while (!client.isClosed && running.get()) {
+                            val pkt = java.net.DatagramPacket(recvBuf, recvBuf.size)
+                            try { udpSock.receive(pkt) }
+                            catch (_: java.net.SocketTimeoutException) { continue }
+
+                            val d = pkt.data
+                            if (pkt.length < 4) continue
+                            val atyp = d[3].toInt() and 0xFF
+                            val dstHost: String; val dstPort: Int; val payloadOff: Int
+                            when (atyp) {
+                                0x01 -> {
+                                    if (pkt.length < 10) continue
+                                    dstHost = "${d[4].toInt() and 0xFF}.${d[5].toInt() and 0xFF}" +
+                                              ".${d[6].toInt() and 0xFF}.${d[7].toInt() and 0xFF}"
+                                    dstPort = ((d[8].toInt() and 0xFF) shl 8) or (d[9].toInt() and 0xFF)
+                                    payloadOff = 10
+                                }
+                                0x03 -> {
+                                    val dlen = d[4].toInt() and 0xFF
+                                    if (pkt.length < 7 + dlen) continue
+                                    dstHost = String(d, 5, dlen)
+                                    dstPort = ((d[5+dlen].toInt() and 0xFF) shl 8) or (d[6+dlen].toInt() and 0xFF)
+                                    payloadOff = 7 + dlen
+                                }
+                                else -> continue
+                            }
+                            val payloadLen = pkt.length - payloadOff
+                            if (payloadLen <= 0) continue
+
+                            if (dstPort == 53) {
+                                // DNS → relay via TCP through XZAP tunnel
+                                val query = d.copyOfRange(payloadOff, payloadOff + payloadLen)
+                                val udpHdr = d.copyOfRange(0, payloadOff)
+                                val src = pkt.socketAddress as java.net.InetSocketAddress
+                                executor?.submit { relayDnsQuery(dstHost, query, udpHdr, src, udpSock) }
+                            }
+                            // Non-DNS UDP (QUIC etc): drop → instant TCP fallback
+                        }
+                    } catch (_: Exception) {
+                    } finally { udpSock.close() }
+                }
+
+                // Keep control connection open per SOCKS5 spec
+                try { while (inp.read() != -1 && !client.isClosed && running.get()) {} }
+                catch (_: Exception) {}
                 return
             }
             if (req[1] != 0x01.toByte()) {
@@ -392,6 +448,44 @@ class XzapSocksProxy(
             }
         }
         return null
+    }
+
+    /** Relay a single DNS query over TCP through XZAP tunnel (DNS-over-TCP).
+     *  Opens tunnel → sends [2B len][query] → reads [2B len][response] → UDP reply. */
+    private fun relayDnsQuery(dnsServer: String, query: ByteArray,
+                              udpHeader: ByteArray, srcAddr: java.net.InetSocketAddress,
+                              udpSock: java.net.DatagramSocket) {
+        val tunnel = openXzapTunnel(dnsServer, 53) ?: return
+        try {
+            tunnel.soTimeout = 5_000  // 5s DNS timeout
+            val tOut = tunnel.getOutputStream()
+            val tInp = java.io.BufferedInputStream(tunnel.getInputStream(), 4096)
+
+            // DNS-over-TCP: prepend 2-byte length to query
+            val tcpQuery = ByteArray(2 + query.size)
+            tcpQuery[0] = ((query.size shr 8) and 0xFF).toByte()
+            tcpQuery[1] = (query.size and 0xFF).toByte()
+            System.arraycopy(query, 0, tcpQuery, 2, query.size)
+            sendFrame(tOut, tcpQuery)
+
+            // Read DNS-over-TCP response via XZAP tunnel
+            val respData = recvFrame(tInp) ?: return
+            if (respData.size < 2) return
+            val respLen = ((respData[0].toInt() and 0xFF) shl 8) or (respData[1].toInt() and 0xFF)
+            val available = respData.size - 2
+            if (available < respLen) return
+            val dnsResp = respData.copyOfRange(2, 2 + respLen)
+
+            // Build SOCKS5 UDP reply: [same header as request][DNS response]
+            val udpReply = ByteArray(udpHeader.size + dnsResp.size)
+            System.arraycopy(udpHeader, 0, udpReply, 0, udpHeader.size)
+            System.arraycopy(dnsResp, 0, udpReply, udpHeader.size, dnsResp.size)
+            udpSock.send(java.net.DatagramPacket(udpReply, udpReply.size, srcAddr))
+        } catch (e: Exception) {
+            Log.d(TAG, "DNS relay failed $dnsServer: ${e.message}")
+        } finally {
+            try { tunnel.close() } catch (_: Exception) {}
+        }
     }
 
     // ==================== XZAP frame I/O + fragmentation ====================
