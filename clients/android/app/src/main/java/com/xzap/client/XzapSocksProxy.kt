@@ -70,6 +70,59 @@ class XzapSocksProxy(
     /** Pool entry with creation timestamp for age-based eviction. */
     private data class PooledSocket(val socket: Socket, val createdAt: Long = System.currentTimeMillis())
 
+    /**
+     * Stateful XZAP frame reader — correctly handles leftover bytes between frames.
+     *
+     * The old stateless recvFrame() created a fresh buffer per call and discarded
+     * everything after the first complete XZAP frame. When the server sent 2+ frames
+     * before we read them (e.g. TLS ServerHello + Certificate + ServerHelloDone in
+     * rapid succession), all frames after the first were silently dropped. The TCP
+     * stream then desynchronised → relay hung indefinitely waiting for data that
+     * had already been lost.
+     *
+     * FrameReader keeps a leftover slice and prepends it on the next call, so no
+     * bytes are ever dropped regardless of how many frames arrive in one batch.
+     */
+    private inner class FrameReader(private val inp: InputStream) {
+        private val accumulator = java.io.ByteArrayOutputStream(8192)
+        private var leftover: ByteArray? = null
+
+        fun next(): ByteArray? {
+            // Prepend any bytes that were buffered after the last complete frame
+            leftover?.let { accumulator.write(it); leftover = null }
+
+            while (true) {
+                val fragHdr = readExactly(inp, 4) ?: return null
+                val fragTotal = getInt(fragHdr, 0)
+                if (fragTotal <= 0 || fragTotal > 256 * 1024) return null
+
+                val fragPayload = readExactly(inp, fragTotal) ?: return null
+                val flags = fragPayload[0].toInt() and 0xFF
+                if (flags == 0x01) continue // chaff — skip
+
+                accumulator.write(fragPayload, 1, fragPayload.size - 1)
+
+                val size = accumulator.size()
+                if (size >= 4) {
+                    val bytes = accumulator.toByteArray()
+                    val xzapLen = getInt(bytes, 0)
+                    if (size >= 4 + xzapLen) {
+                        // Extract exactly one XZAP frame
+                        val frameData = ByteArray(xzapLen - PREFIX_SIZE).also {
+                            System.arraycopy(bytes, 4 + PREFIX_SIZE, it, 0, it.size)
+                        }
+                        val result = decrypt(frameData)
+                        // Preserve any bytes that belong to the *next* frame
+                        val consumed = 4 + xzapLen
+                        if (size > consumed) leftover = bytes.copyOfRange(consumed, size)
+                        accumulator.reset()
+                        return result
+                    }
+                }
+            }
+        }
+    }
+
     private val random = SecureRandom()
     private val keySpec = SecretKeySpec(key, "AES")
     private var serverSocket: ServerSocket? = null
@@ -337,6 +390,9 @@ class XzapSocksProxy(
 
             val tunnelInp = java.io.BufferedInputStream(tunnel.getInputStream(), BUFFER_SIZE)
             val tunnelOut = tunnel.getOutputStream()  // no buffering — TLS handles it
+            // One FrameReader per tunnel connection — preserves leftover bytes between
+            // frames so multiple server frames arriving in one batch are never dropped.
+            val reader = FrameReader(tunnelInp)
 
             val t1 = Thread {
                 try {
@@ -353,7 +409,7 @@ class XzapSocksProxy(
                 try {
                     val bOut = java.io.BufferedOutputStream(out, BUFFER_SIZE)
                     while (running.get()) {
-                        val data = recvFrame(tunnelInp) ?: break
+                        val data = reader.next() ?: break
                         bOut.write(data)
                         bOut.flush()
                     }
@@ -432,7 +488,7 @@ class XzapSocksProxy(
                 val req = """{"cmd":"connect","host":"$host","port":$port}""".toByteArray()
                 sendFrame(tunnelOut, req)
 
-                val resp = recvFrame(tunnelInp) ?: run { sock.close(); throw java.io.IOException("no response") }
+                val resp = FrameReader(tunnelInp).next() ?: run { sock.close(); throw java.io.IOException("no response") }
                 val respStr = String(resp)
                 if ("\"ok\":true" !in respStr && "\"ok\": true" !in respStr) {
                     sock.close(); return null  // server explicitly rejected — don't retry
@@ -469,7 +525,7 @@ class XzapSocksProxy(
             sendFrame(tOut, tcpQuery)
 
             // Read DNS-over-TCP response via XZAP tunnel
-            val respData = recvFrame(tInp) ?: return
+            val respData = FrameReader(tInp).next() ?: return
             if (respData.size < 2) return
             val respLen = ((respData[0].toInt() and 0xFF) shl 8) or (respData[1].toInt() and 0xFF)
             val available = respData.size - 2
@@ -538,32 +594,6 @@ class XzapSocksProxy(
         hdr[4] = 0x00 // FLAG_REAL
         out.write(hdr)
         out.write(data)
-    }
-
-    private fun recvFrame(inp: InputStream): ByteArray? {
-        val buffer = java.io.ByteArrayOutputStream(4096)
-        while (true) {
-            val fragHdr = readExactly(inp, 4) ?: return null
-            val fragTotal = getInt(fragHdr, 0)
-            if (fragTotal <= 0 || fragTotal > 256 * 1024) return null
-
-            val fragPayload = readExactly(inp, fragTotal) ?: return null
-            val flags = fragPayload[0].toInt() and 0xFF
-            if (flags == 0x01) continue // chaff
-
-            buffer.write(fragPayload, 1, fragPayload.size - 1)
-
-            val size = buffer.size()
-            if (size >= 4) {
-                val buf = buffer.toByteArray()
-                val xzapLen = getInt(buf, 0)
-                if (size >= 4 + xzapLen) {
-                    return decrypt(ByteArray(xzapLen - PREFIX_SIZE).also {
-                        System.arraycopy(buf, 4 + PREFIX_SIZE, it, 0, it.size)
-                    })
-                }
-            }
-        }
     }
 
     // ==================== Helpers ====================
