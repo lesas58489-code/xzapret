@@ -216,9 +216,11 @@ class XzapSocksProxy(
             val req = readExactly(inp, 4) ?: return
             if (req[1] == 0x03.toByte()) {
                 // UDP ASSOCIATE — relay UDP through XZAP TCP tunnel so QUIC works.
-                // Each UDP datagram (QUIC packet) is forwarded via a dedicated XZAP TCP
-                // connection using {"cmd":"udpfwd"}. Warsaw sends it as real UDP to the
-                // target and returns responses, eliminating QUIC blackhole / 4-min delay.
+                //
+                // Architecture: main dispatcher thread never blocks.
+                // Each unique (dstHost:dstPort) gets its own worker thread that opens
+                // an XZAP tunnel independently. All CDN TLS handshakes run in parallel,
+                // eliminating the "serialized hangs" when YouTube connects to 10-20 CDNs.
                 skipSocksAddr(inp, req[3].toInt() and 0xFF)
                 val udpSock = java.net.DatagramSocket(0, java.net.InetAddress.getLoopbackAddress())
                 udpSock.soTimeout = 500
@@ -228,11 +230,9 @@ class XzapSocksProxy(
                     ((udpPort shr 8) and 0xFF).toByte(),
                     (udpPort and 0xFF).toByte()))
 
-                // One XZAP TCP tunnel per unique (dstHost, dstPort).
-                data class UdpTunnel(val sock: Socket,
-                                     val tOut: OutputStream,
-                                     val tInp: java.io.BufferedInputStream)
-                val tunnels = mutableMapOf<String, UdpTunnel>()
+                // Map: destination key → packet queue for that destination's worker.
+                val dstQueues = java.util.concurrent.ConcurrentHashMap<String,
+                    java.util.concurrent.LinkedBlockingQueue<ByteArray>>()
 
                 executor?.submit {
                     try {
@@ -242,7 +242,6 @@ class XzapSocksProxy(
                             try { udpSock.receive(pkt) }
                             catch (e: java.net.SocketTimeoutException) { continue }
 
-                            // Parse SOCKS5 UDP header: RSV(2)+FRAG(1)+ATYP(1)+addr+port+payload
                             val d = pkt.data
                             if (pkt.length < 4) continue
                             val atyp = d[3].toInt() and 0xFF
@@ -268,44 +267,26 @@ class XzapSocksProxy(
                             if (payloadLen <= 0) continue
 
                             val key = "$dstHost:$dstPort"
-                            var tun = tunnels[key]
-                            if (tun == null || tun.sock.isClosed) {
-                                val sock = openXzapTunnelForUdp(dstHost, dstPort) ?: continue
-                                val tOut = sock.getOutputStream()
-                                val tInp = java.io.BufferedInputStream(sock.getInputStream(), BUFFER_SIZE)
-                                tun = UdpTunnel(sock, tOut, tInp)
-                                tunnels[key] = tun
+                            val srcAddr = pkt.socketAddress as java.net.InetSocketAddress
+                            val payload = d.copyOfRange(payloadOff, payloadOff + payloadLen)
 
-                                // Response reader: Warsaw sends SOCKS5 UDP frames back
-                                val srcAddr = pkt.socketAddress as java.net.InetSocketAddress
-                                val tunRef = tun
-                                Thread {
-                                    try {
-                                        while (!tunRef.sock.isClosed && running.get()) {
-                                            val resp = recvFrame(tunRef.tInp) ?: break
-                                            // resp = 10B SOCKS5 UDP header (Warsaw builds it) + payload
-                                            val rp = java.net.DatagramPacket(resp, resp.size, srcAddr)
-                                            try { udpSock.send(rp) } catch (_: Exception) {}
-                                        }
-                                    } catch (_: Exception) {
-                                    } finally { try { tunRef.sock.close() } catch (_: Exception) {} }
-                                }.apply { isDaemon = true }.start()
+                            // computeIfAbsent is effectively single-threaded here (one dispatcher),
+                            // so the lambda runs exactly once per key. When a worker dies
+                            // it removes its own key so the next packet re-spawns a fresh worker.
+                            val queue = dstQueues.computeIfAbsent(key) {
+                                val q = java.util.concurrent.LinkedBlockingQueue<ByteArray>(512)
+                                executor?.submit {
+                                    handleUdpDestination(dstHost, dstPort, q, srcAddr, udpSock, dstQueues, key)
+                                }
+                                q
                             }
-
-                            try { sendFrameSlice(tun.tOut, d, payloadOff, payloadLen) }
-                            catch (e: Exception) {
-                                try { tun.sock.close() } catch (_: Exception) {}
-                                tunnels.remove(key)
-                            }
+                            queue.offer(payload) // non-blocking; drops on overflow (backpressure)
                         }
                     } catch (_: Exception) {
-                    } finally {
-                        tunnels.values.forEach { try { it.sock.close() } catch (_: Exception) {} }
-                        udpSock.close()
-                    }
+                    } finally { udpSock.close() }
                 }
 
-                // Keep TCP control connection open per SOCKS5 spec
+                // Keep control connection open per SOCKS5 spec
                 try { while (inp.read() != -1 && !client.isClosed && running.get()) {} }
                 catch (_: Exception) {}
                 return
@@ -319,21 +300,21 @@ class XzapSocksProxy(
             val host: String
             when (req[3].toInt() and 0xFF) {
                 0x01 -> {
-                    val a = ByteArray(4); inp.read(a)
+                    val a = readExactly(inp, 4) ?: return
                     host = a.joinToString(".") { (it.toInt() and 0xFF).toString() }
                 }
                 0x03 -> {
                     val len = inp.read() and 0xFF
-                    val d = ByteArray(len); inp.read(d)
+                    val d = readExactly(inp, len) ?: return
                     host = String(d)
                 }
                 0x04 -> {
-                    val a = ByteArray(16); inp.read(a)
+                    val a = readExactly(inp, 16) ?: return
                     host = java.net.InetAddress.getByAddress(a).hostAddress ?: return
                 }
                 else -> return
             }
-            val pb = ByteArray(2); inp.read(pb)
+            val pb = readExactly(inp, 2) ?: return
             val port = ((pb[0].toInt() and 0xFF) shl 8) or (pb[1].toInt() and 0xFF)
 
             // Split tunneling
@@ -432,7 +413,7 @@ class XzapSocksProxy(
             val req = """{"cmd":"connect","host":"$host","port":$port}""".toByteArray()
             sendFrame(tunnelOut, req)
 
-            val resp = recvFrame(tunnelInp) ?: return null
+            val resp = recvFrame(tunnelInp) ?: run { sock.close(); return null }
             val respStr = String(resp)
             if ("\"ok\":true" !in respStr && "\"ok\": true" !in respStr) {
                 sock.close(); return null
@@ -441,6 +422,52 @@ class XzapSocksProxy(
         } catch (e: Exception) {
             Log.d(TAG, "Tunnel failed $host:$port: ${e.message}")
             null
+        }
+    }
+
+    /** Per-destination UDP relay worker. Opens one XZAP tunnel, drains the queue.
+     *  Removes its own key from [dstQueues] on exit so the next incoming packet
+     *  triggers a fresh worker instead of draining an orphaned queue. */
+    private fun handleUdpDestination(
+        dstHost: String,
+        dstPort: Int,
+        queue: java.util.concurrent.LinkedBlockingQueue<ByteArray>,
+        srcAddr: java.net.InetSocketAddress,
+        udpSock: java.net.DatagramSocket,
+        dstQueues: java.util.concurrent.ConcurrentHashMap<String,
+                       java.util.concurrent.LinkedBlockingQueue<ByteArray>>,
+        key: String,
+    ) {
+        val sock = openXzapTunnelForUdp(dstHost, dstPort) ?: run {
+            dstQueues.remove(key)  // allow retry on next packet
+            return
+        }
+        val tOut = sock.getOutputStream()
+        val tInp = java.io.BufferedInputStream(sock.getInputStream(), BUFFER_SIZE)
+
+        // Response reader thread: Warsaw replies → relay back to tun2socks
+        Thread {
+            try {
+                while (!sock.isClosed && running.get()) {
+                    val resp = recvFrame(tInp) ?: break
+                    // resp = 10B SOCKS5 UDP header built by Warsaw + payload
+                    try { udpSock.send(java.net.DatagramPacket(resp, resp.size, srcAddr)) }
+                    catch (_: Exception) {}
+                }
+            } catch (_: Exception) {
+            } finally { try { sock.close() } catch (_: Exception) {} }
+        }.apply { isDaemon = true }.start()
+
+        // Send loop: drain queue until tunnel or VPN closes
+        try {
+            while (!sock.isClosed && running.get()) {
+                val payload = queue.poll(500, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
+                sendFrameSlice(tOut, payload, 0, payload.size)
+            }
+        } catch (_: Exception) {
+        } finally {
+            try { sock.close() } catch (_: Exception) {}
+            dstQueues.remove(key)  // re-open on next packet if needed
         }
     }
 
