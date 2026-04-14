@@ -230,28 +230,30 @@ class XzapSocksProxy(
                         val d = dp.data
                         val len = dp.length
                         // SOCKS5 UDP datagram: [2B RSV][1B FRAG][1B ATYP][ADDR][2B PORT][DATA]
-                        if (len < 10 || d[2] != 0x00.toByte()) continue  // fragmented — skip
+                        if (len < 10 || d[2] != 0x00.toByte()) continue  // too short or fragmented
                         val atyp = d[3].toInt() and 0xFF
-                        val (dstAddr, payloadOff) = when (atyp) {
-                            0x01 -> {  // IPv4
-                                val ip = "${d[4].toInt() and 0xFF}.${d[5].toInt() and 0xFF}" +
-                                         ".${d[6].toInt() and 0xFF}.${d[7].toInt() and 0xFF}"
-                                Pair(ip, 10)
-                            }
-                            0x03 -> {  // domain
-                                val dlen = d[4].toInt() and 0xFF
-                                if (len < 7 + dlen) continue
-                                Pair(String(d, 5, dlen), 7 + dlen)
-                            }
-                            else -> continue  // IPv6 — skip (DNS doesn't use it here)
+                        val dstAddr: String
+                        val payloadOff: Int
+                        if (atyp == 0x01) {  // IPv4
+                            dstAddr = "${d[4].toInt() and 0xFF}.${d[5].toInt() and 0xFF}" +
+                                      ".${d[6].toInt() and 0xFF}.${d[7].toInt() and 0xFF}"
+                            payloadOff = 10
+                        } else if (atyp == 0x03) {  // domain
+                            val dlen = d[4].toInt() and 0xFF
+                            if (len < 7 + dlen) continue
+                            dstAddr = String(d, 5, dlen)
+                            payloadOff = 7 + dlen
+                        } else {
+                            continue  // IPv6 or unknown — skip
                         }
-                        if (payloadOff + 2 > len) continue
+                        if (payloadOff >= len) continue
                         val dstPort = ((d[payloadOff - 2].toInt() and 0xFF) shl 8) or
                                        (d[payloadOff - 1].toInt() and 0xFF)
-                        if (dstPort != 53) continue  // non-DNS UDP — discard (QUIC suppression)
+                        if (dstPort != 53) continue  // non-DNS (QUIC etc.) — discard
                         val query = d.copyOfRange(payloadOff, len)
+                        val sender = dp.socketAddress
                         executor?.submit {
-                            forwardDnsViaTcp(udpSock, dp.socketAddress, dstAddr, query)
+                            forwardDnsViaTcp(udpSock, sender, dstAddr, query)
                         }
                     }
                 } finally {
