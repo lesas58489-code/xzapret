@@ -210,12 +210,24 @@ class XzapSocksProxy(
                 skipSocksAddr(inp, req[3].toInt() and 0xFF)
                 val udpSock = java.net.DatagramSocket(0, java.net.InetAddress.getLoopbackAddress())
                 val udpPort = udpSock.localPort
-                udpSock.close()
-                out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01,
-                    127, 0, 0, 1,
-                    ((udpPort shr 8) and 0xFF).toByte(),
-                    (udpPort and 0xFF).toByte()))
-                return  // immediate close → QUIC dies → TCP fallback, no delay
+                try {
+                    out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01,
+                        127, 0, 0, 1,
+                        ((udpPort shr 8) and 0xFF).toByte(),
+                        (udpPort and 0xFF).toByte()))
+                    // Hold relay for 3s, then close the control connection.
+                    // Immediate close (0ms) makes Chrome fall back to TCP but causes
+                    // YouTube app to retry QUIC in a loop without ever trying TCP.
+                    // With 3s hold: both Chrome and YouTube app's Cronet detect
+                    // "QUIC relay is up but server never responds" → mark QUIC broken
+                    // → fall back to TCP. One-time 3s penalty on first connection,
+                    // then all subsequent connections use TCP directly.
+                    client.soTimeout = 3000
+                    try { inp.read() } catch (_: Exception) {}
+                    client.soTimeout = 0
+                } finally {
+                    udpSock.close()
+                }
             }
             if (req[1] != 0x01.toByte()) {
                 // BIND or unknown — general failure
