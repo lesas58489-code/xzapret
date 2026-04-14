@@ -201,18 +201,99 @@ class XzapSocksProxy(
             // SOCKS5 request
             val req = readExactly(inp, 4) ?: return
             if (req[1] == 0x03.toByte()) {
-                // UDP ASSOCIATE — tun2socks uses this for QUIC (YouTube, Chrome etc.)
-                // Accept and immediately close: tun2socks sees relay gone → falls back
-                // to TCP DNS immediately. Chrome marks QUIC broken → falls back to TCP.
+                // UDP ASSOCIATE — relay UDP through XZAP TCP tunnel so QUIC works.
+                // Each UDP datagram (QUIC packet) is forwarded via a dedicated XZAP TCP
+                // connection using {"cmd":"udpfwd"}. Warsaw sends it as real UDP to the
+                // target and returns responses, eliminating QUIC blackhole / 4-min delay.
                 skipSocksAddr(inp, req[3].toInt() and 0xFF)
                 val udpSock = java.net.DatagramSocket(0, java.net.InetAddress.getLoopbackAddress())
+                udpSock.soTimeout = 500
                 val udpPort = udpSock.localPort
-                try {
-                    out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01,
-                        127, 0, 0, 1,
-                        ((udpPort shr 8) and 0xFF).toByte(),
-                        (udpPort and 0xFF).toByte()))
-                } finally { udpSock.close() }
+                out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01,
+                    127, 0, 0, 1,
+                    ((udpPort shr 8) and 0xFF).toByte(),
+                    (udpPort and 0xFF).toByte()))
+
+                // One XZAP TCP tunnel per unique (dstHost, dstPort).
+                data class UdpTunnel(val sock: Socket,
+                                     val tOut: OutputStream,
+                                     val tInp: java.io.BufferedInputStream)
+                val tunnels = mutableMapOf<String, UdpTunnel>()
+
+                executor?.submit {
+                    try {
+                        val recvBuf = ByteArray(65536)
+                        while (!client.isClosed && running.get()) {
+                            val pkt = java.net.DatagramPacket(recvBuf, recvBuf.size)
+                            try { udpSock.receive(pkt) }
+                            catch (e: java.net.SocketTimeoutException) { continue }
+
+                            // Parse SOCKS5 UDP header: RSV(2)+FRAG(1)+ATYP(1)+addr+port+payload
+                            val d = pkt.data
+                            if (pkt.length < 4) continue
+                            val atyp = d[3].toInt() and 0xFF
+                            val dstHost: String; val dstPort: Int; val payloadOff: Int
+                            when (atyp) {
+                                0x01 -> {
+                                    if (pkt.length < 10) continue
+                                    dstHost = "${d[4].toInt() and 0xFF}.${d[5].toInt() and 0xFF}" +
+                                              ".${d[6].toInt() and 0xFF}.${d[7].toInt() and 0xFF}"
+                                    dstPort = ((d[8].toInt() and 0xFF) shl 8) or (d[9].toInt() and 0xFF)
+                                    payloadOff = 10
+                                }
+                                0x03 -> {
+                                    val dlen = d[4].toInt() and 0xFF
+                                    if (pkt.length < 7 + dlen) continue
+                                    dstHost = String(d, 5, dlen)
+                                    dstPort = ((d[5+dlen].toInt() and 0xFF) shl 8) or (d[6+dlen].toInt() and 0xFF)
+                                    payloadOff = 7 + dlen
+                                }
+                                else -> continue
+                            }
+                            val payloadLen = pkt.length - payloadOff
+                            if (payloadLen <= 0) continue
+
+                            val key = "$dstHost:$dstPort"
+                            var tun = tunnels[key]
+                            if (tun == null || tun.sock.isClosed) {
+                                val sock = openXzapTunnelForUdp(dstHost, dstPort) ?: continue
+                                val tOut = sock.getOutputStream()
+                                val tInp = java.io.BufferedInputStream(sock.getInputStream(), BUFFER_SIZE)
+                                tun = UdpTunnel(sock, tOut, tInp)
+                                tunnels[key] = tun
+
+                                // Response reader: Warsaw sends SOCKS5 UDP frames back
+                                val srcAddr = pkt.socketAddress as java.net.InetSocketAddress
+                                val tunRef = tun
+                                Thread {
+                                    try {
+                                        while (!tunRef.sock.isClosed && running.get()) {
+                                            val resp = recvFrame(tunRef.tInp) ?: break
+                                            // resp = 10B SOCKS5 UDP header (Warsaw builds it) + payload
+                                            val rp = java.net.DatagramPacket(resp, resp.size, srcAddr)
+                                            try { udpSock.send(rp) } catch (_: Exception) {}
+                                        }
+                                    } catch (_: Exception) {
+                                    } finally { try { tunRef.sock.close() } catch (_: Exception) {} }
+                                }.apply { isDaemon = true }.start()
+                            }
+
+                            try { sendFrameSlice(tun.tOut, d, payloadOff, payloadLen) }
+                            catch (e: Exception) {
+                                try { tun.sock.close() } catch (_: Exception) {}
+                                tunnels.remove(key)
+                            }
+                        }
+                    } catch (_: Exception) {
+                    } finally {
+                        tunnels.values.forEach { try { it.sock.close() } catch (_: Exception) {} }
+                        udpSock.close()
+                    }
+                }
+
+                // Keep TCP control connection open per SOCKS5 spec
+                try { while (inp.read() != -1 && !client.isClosed && running.get()) {} }
+                catch (_: Exception) {}
                 return
             }
             if (req[1] != 0x01.toByte()) {
@@ -349,6 +430,24 @@ class XzapSocksProxy(
         }
     }
 
+    private fun openXzapTunnelForUdp(host: String, port: Int): Socket? {
+        return try {
+            val sock = getPoolConnection()
+            val tunnelOut = sock.getOutputStream()
+            val req = """{"cmd":"udpfwd","host":"$host","port":$port}""".toByteArray()
+            sendFrame(tunnelOut, req)
+            val resp = recvFrame(sock.getInputStream()) ?: run { sock.close(); return null }
+            val respStr = String(resp)
+            if ("\"ok\":true" !in respStr && "\"ok\": true" !in respStr) {
+                sock.close(); return null
+            }
+            sock
+        } catch (e: Exception) {
+            Log.d(TAG, "UDP tunnel failed $host:$port: ${e.message}")
+            null
+        }
+    }
+
     // ==================== XZAP frame I/O + fragmentation ====================
 
     private fun sendFrame(out: OutputStream, data: ByteArray, len: Int = data.size) {
@@ -388,6 +487,22 @@ class XzapSocksProxy(
             System.arraycopy(chunk, 0, frag, 5, chunk.size)
             out.write(frag)
             offset += fragSize
+        }
+    }
+
+    /** sendFrame variant that encrypts data[offset .. offset+len). Used by UDP relay. */
+    private fun sendFrameSlice(out: OutputStream, data: ByteArray, offset: Int, len: Int) {
+        val prefix = ByteArray(PREFIX_SIZE).also { random.nextBytes(it) }
+        val encrypted = encrypt(data, offset, len)
+        val payloadSize = PREFIX_SIZE + encrypted.size
+        val xzapFrame = ByteArray(4 + payloadSize)
+        putInt(xzapFrame, 0, payloadSize)
+        System.arraycopy(prefix, 0, xzapFrame, 4, PREFIX_SIZE)
+        System.arraycopy(encrypted, 0, xzapFrame, 4 + PREFIX_SIZE, encrypted.size)
+        synchronized(out) {
+            if (xzapFrame.size <= FRAG_THRESHOLD) writeMicroFragmented(out, xzapFrame)
+            else writeBulkFragment(out, xzapFrame)
+            out.flush()
         }
     }
 
