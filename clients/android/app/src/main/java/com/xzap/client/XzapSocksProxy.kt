@@ -192,19 +192,20 @@ class XzapSocksProxy(
             val out = client.getOutputStream()
 
             // SOCKS5 greeting
-            val greeting = ByteArray(2)
-            if (inp.read(greeting) != 2 || greeting[0] != 0x05.toByte()) return
-            val methods = ByteArray(greeting[1].toInt() and 0xFF)
-            inp.read(methods)
+            val greeting = readExactly(inp, 2) ?: return
+            if (greeting[0] != 0x05.toByte()) return
+            val methodCount = greeting[1].toInt() and 0xFF
+            if (methodCount > 0) readExactly(inp, methodCount) ?: return
             out.write(byteArrayOf(0x05, 0x00))
 
             // SOCKS5 request
-            val req = ByteArray(4)
-            if (inp.read(req) != 4) return
+            val req = readExactly(inp, 4) ?: return
             if (req[1] != 0x01.toByte()) {
-                // Not CONNECT (e.g. UDP ASSOCIATE 0x03) — reject explicitly so
-                // tun2socks gets a fast failure and QUIC falls back to TCP
-                out.write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                // UDP ASSOCIATE / BIND not supported.
+                // MUST use 0x01 (general failure), NOT 0x07 (command not supported).
+                // 0x07 causes tun2socks to mark the proxy as broken → kills ALL traffic.
+                // With 0x01, tun2socks silently drops UDP and TCP still routes normally.
+                out.write(byteArrayOf(0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
                 return
             }
 
