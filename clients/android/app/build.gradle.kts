@@ -35,5 +35,6 @@ dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
-    implementation("com.jcraft:jsch:0.1.55")  // SSH tunnel
+    implementation(files("libs/tun2socks.aar"))  // VPN packet handling
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")  // MuxConnection WebSocket
 }

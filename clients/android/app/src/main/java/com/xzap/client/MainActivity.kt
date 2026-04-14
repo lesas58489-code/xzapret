@@ -36,7 +36,7 @@ class MainActivity : AppCompatActivity() {
 
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         etServer.setText(prefs.getString("server", "151.244.111.186"))
-        etPort.setText(prefs.getString("port", "22"))
+        etPort.setText(prefs.getString("port", "8443"))
         etKey.setText(prefs.getString("key", ""))
 
         btnConnect.setOnClickListener {
@@ -76,7 +76,7 @@ class MainActivity : AppCompatActivity() {
         val intent = Intent(this, XzapVpnService::class.java).apply {
             action = XzapVpnService.ACTION_CONNECT
             putExtra(XzapVpnService.EXTRA_SERVER, etServer.text.toString().trim())
-            putExtra(XzapVpnService.EXTRA_PORT, etPort.text.toString().trim().toIntOrNull() ?: 22)
+            putExtra(XzapVpnService.EXTRA_PORT, etPort.text.toString().trim().toIntOrNull() ?: 8443)
             putExtra(XzapVpnService.EXTRA_KEY, etKey.text.toString().trim())
         }
         startService(intent)

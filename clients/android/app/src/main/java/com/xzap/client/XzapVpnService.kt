@@ -8,14 +8,14 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.util.Base64
 import android.util.Log
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * VPN service: tun2socks → SOCKS5 (SSH tunnel) → remote server → internet.
+ * VPN service: tun2socks (Go) → SOCKS5 → XZAP TLS (direct to server).
  *
- * SSH handles all encryption. No XZAP protocol, no SNI issues.
- * DPI sees only SSH traffic to Warsaw.
+ * Same proven protocol as Windows client: AES-256-GCM + fragmentation + SNI masquerade.
  */
 class XzapVpnService : VpnService() {
 
@@ -26,12 +26,12 @@ class XzapVpnService : VpnService() {
         const val ACTION_DISCONNECT = "com.xzap.DISCONNECT"
         const val EXTRA_SERVER = "server"
         const val EXTRA_PORT = "port"
-        const val EXTRA_KEY = "key"  // SSH private key (PEM)
+        const val EXTRA_KEY = "key"  // AES-256 key, base64-encoded
         const val SOCKS_PORT = 10808
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private var sshTunnel: SshTunnel? = null
+    private var socksProxy: XzapSocksProxy? = null
     private val running = AtomicBoolean(false)
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -39,15 +39,15 @@ class XzapVpnService : VpnService() {
             ACTION_DISCONNECT -> disconnect()
             ACTION_CONNECT -> {
                 val server = intent.getStringExtra(EXTRA_SERVER) ?: return START_NOT_STICKY
-                val port = intent.getIntExtra(EXTRA_PORT, 22)
-                val key = intent.getStringExtra(EXTRA_KEY) ?: return START_NOT_STICKY
-                connect(server, port, key)
+                val port = intent.getIntExtra(EXTRA_PORT, 8443)
+                val keyB64 = intent.getStringExtra(EXTRA_KEY) ?: return START_NOT_STICKY
+                connect(server, port, keyB64)
             }
         }
         return START_STICKY
     }
 
-    private fun connect(server: String, port: Int, privateKey: String) {
+    private fun connect(server: String, port: Int, keyB64: String) {
         if (running.get()) {
             disconnect()
             Thread.sleep(500)
@@ -55,27 +55,30 @@ class XzapVpnService : VpnService() {
 
         createNotificationChannel()
         startForeground(1, buildNotification("Connecting..."))
+
+        val key = Base64.decode(keyB64, Base64.DEFAULT)
         running.set(true)
 
+        // Bypass domains (Russian sites go direct, no tunnel needed)
+        val bypass = setOf(
+            "vk.com", "ok.ru", "yandex.ru", "yandex.net", "mail.ru",
+            "rambler.ru", "avito.ru", "sberbank.ru", "gosuslugi.ru",
+            "mos.ru", "rbc.ru", "lenta.ru", "ria.ru", "rt.com",
+            "tinkoff.ru", "ozon.ru", "wildberries.ru", "kinopoisk.ru",
+            "2gis.ru", "dzen.ru",
+        )
+
         Thread {
-            try {
-                // Start SSH tunnel with SOCKS5
-                sshTunnel = SshTunnel(server, port, "root", privateKey, running)
-                sshTunnel!!.start(SOCKS_PORT)
+            socksProxy = XzapSocksProxy(server, port, key, running, bypass)
+            socksProxy!!.start(SOCKS_PORT)
 
-                Thread.sleep(500)
+            Thread.sleep(500) // wait for SOCKS to bind
 
-                // Setup VPN + tun2socks
-                setupVpn()
-                startTun2Socks()
+            setupVpn()
+            startTun2Socks()
 
-                updateNotification("Connected to $server")
-                Log.i(TAG, "VPN ready (SSH tunnel)")
-            } catch (e: Exception) {
-                Log.e(TAG, "Connect failed: ${e.message}")
-                updateNotification("Failed: ${e.message}")
-                running.set(false)
-            }
+            updateNotification("Connected to $server:$port")
+            Log.i(TAG, "VPN ready (tun2socks + XZAP TLS)")
         }.start()
     }
 
@@ -112,10 +115,10 @@ class XzapVpnService : VpnService() {
     private fun disconnect() {
         running.set(false)
         try { engine.Engine.stop() } catch (_: Exception) {}
-        sshTunnel?.stop()
+        socksProxy?.stop()
         vpnInterface?.close()
         vpnInterface = null
-        sshTunnel = null
+        socksProxy = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         Log.i(TAG, "Disconnected")
