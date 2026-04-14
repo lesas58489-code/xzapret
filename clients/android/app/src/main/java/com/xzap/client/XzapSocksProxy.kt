@@ -354,15 +354,16 @@ class XzapSocksProxy(
     // ==================== XZAP frame I/O + fragmentation ====================
 
     private fun sendFrame(out: OutputStream, data: ByteArray, len: Int = data.size) {
-        val toEncrypt = if (len == data.size) data else data.copyOf(len)
-        val encrypted = encrypt(toEncrypt)
         val prefix = ByteArray(PREFIX_SIZE).also { random.nextBytes(it) }
-        val payload = prefix + encrypted
+        val encrypted = encrypt(data, 0, len)  // no copy — accepts offset+length
 
-        // XZAP frame: [4B length][payload]
-        val xzapFrame = ByteArray(4 + payload.size)
-        putInt(xzapFrame, 0, payload.size)
-        System.arraycopy(payload, 0, xzapFrame, 4, payload.size)
+        // XZAP frame: [4B payload_len][16B prefix][nonce+ciphertext]
+        // Build directly — no intermediate `payload = prefix + encrypted` copy.
+        val payloadSize = PREFIX_SIZE + encrypted.size
+        val xzapFrame = ByteArray(4 + payloadSize)
+        putInt(xzapFrame, 0, payloadSize)
+        System.arraycopy(prefix, 0, xzapFrame, 4, PREFIX_SIZE)
+        System.arraycopy(encrypted, 0, xzapFrame, 4 + PREFIX_SIZE, encrypted.size)
 
         synchronized(out) {
             if (xzapFrame.size <= FRAG_THRESHOLD) {
@@ -393,12 +394,13 @@ class XzapSocksProxy(
     }
 
     private fun writeBulkFragment(out: OutputStream, data: ByteArray) {
-        val total = data.size + 1
-        val frag = ByteArray(4 + total)
-        putInt(frag, 0, total)
-        frag[4] = 0x00 // FLAG_REAL
-        System.arraycopy(data, 0, frag, 5, data.size)
-        out.write(frag)
+        // Write 5-byte header + data separately — no copy of data into a new array.
+        // TLS output stream buffers both writes into the same TLS records.
+        val hdr = ByteArray(5)
+        putInt(hdr, 0, data.size + 1)
+        hdr[4] = 0x00 // FLAG_REAL
+        out.write(hdr)
+        out.write(data)
     }
 
     private fun recvFrame(inp: InputStream): ByteArray? {
@@ -462,12 +464,11 @@ class XzapSocksProxy(
         return buf
     }
 
-    private fun encrypt(plaintext: ByteArray): ByteArray {
+    private fun encrypt(data: ByteArray, offset: Int = 0, length: Int = data.size): ByteArray {
         val nonce = ByteArray(NONCE_SIZE).also { random.nextBytes(it) }
         val cipher = encCipher.get()!!
         cipher.init(Cipher.ENCRYPT_MODE, keySpec, GCMParameterSpec(TAG_BITS, nonce))
-        val ct = cipher.doFinal(plaintext)
-        // nonce + ciphertext in one allocation
+        val ct = cipher.doFinal(data, offset, length)  // no copy — uses offset/length
         val result = ByteArray(NONCE_SIZE + ct.size)
         System.arraycopy(nonce, 0, result, 0, NONCE_SIZE)
         System.arraycopy(ct, 0, result, NONCE_SIZE, ct.size)
