@@ -201,19 +201,9 @@ class XzapSocksProxy(
             // SOCKS5 request
             val req = readExactly(inp, 4) ?: return
             if (req[1] == 0x03.toByte()) {
-                // UDP ASSOCIATE — used by tun2socks for QUIC and DNS.
-                // Strategy:
-                //   • DNS (port 53): forward via TCP through XZAP, relay response back.
-                //     Without this, tun2socks sends DNS datagrams to our relay, we
-                //     discard them, DNS fails → blank screen. When UDP ASSOCIATE is
-                //     rejected, tun2socks falls back to TCP DNS on its own — but
-                //     with a successful association it trusts the relay and never falls
-                //     back, so we MUST handle DNS ourselves.
-                //   • Everything else (QUIC port 443 etc.): discard datagrams.
-                //     tun2socks sees the relay is alive but the server never responds
-                //     → Cronet marks QUIC broken → falls back to TCP.
-                //   Hold the control connection open while handling datagrams so that
-                //   the relay stays valid. Close after inactivity (3s timeout).
+                // UDP ASSOCIATE — tun2socks uses this for QUIC (YouTube, Chrome etc.)
+                // Accept and immediately close: tun2socks sees relay gone → falls back
+                // to TCP DNS immediately. Chrome marks QUIC broken → falls back to TCP.
                 skipSocksAddr(inp, req[3].toInt() and 0xFF)
                 val udpSock = java.net.DatagramSocket(0, java.net.InetAddress.getLoopbackAddress())
                 val udpPort = udpSock.localPort
@@ -222,43 +212,7 @@ class XzapSocksProxy(
                         127, 0, 0, 1,
                         ((udpPort shr 8) and 0xFF).toByte(),
                         (udpPort and 0xFF).toByte()))
-                    udpSock.soTimeout = 3000
-                    val dgBuf = ByteArray(4096)
-                    val dp = java.net.DatagramPacket(dgBuf, dgBuf.size)
-                    while (true) {
-                        try { udpSock.receive(dp) } catch (_: java.net.SocketTimeoutException) { break }
-                        val d = dp.data
-                        val len = dp.length
-                        // SOCKS5 UDP datagram: [2B RSV][1B FRAG][1B ATYP][ADDR][2B PORT][DATA]
-                        if (len < 10 || d[2] != 0x00.toByte()) continue  // too short or fragmented
-                        val atyp = d[3].toInt() and 0xFF
-                        val dstAddr: String
-                        val payloadOff: Int
-                        if (atyp == 0x01) {  // IPv4
-                            dstAddr = "${d[4].toInt() and 0xFF}.${d[5].toInt() and 0xFF}" +
-                                      ".${d[6].toInt() and 0xFF}.${d[7].toInt() and 0xFF}"
-                            payloadOff = 10
-                        } else if (atyp == 0x03) {  // domain
-                            val dlen = d[4].toInt() and 0xFF
-                            if (len < 7 + dlen) continue
-                            dstAddr = String(d, 5, dlen)
-                            payloadOff = 7 + dlen
-                        } else {
-                            continue  // IPv6 or unknown — skip
-                        }
-                        if (payloadOff >= len) continue
-                        val dstPort = ((d[payloadOff - 2].toInt() and 0xFF) shl 8) or
-                                       (d[payloadOff - 1].toInt() and 0xFF)
-                        if (dstPort != 53) continue  // non-DNS (QUIC etc.) — discard
-                        val query = d.copyOfRange(payloadOff, len)
-                        val sender = dp.socketAddress
-                        executor?.submit {
-                            forwardDnsViaTcp(udpSock, sender, dstAddr, query)
-                        }
-                    }
-                } finally {
-                    udpSock.close()
-                }
+                } finally { udpSock.close() }
                 return
             }
             if (req[1] != 0x01.toByte()) {
@@ -370,61 +324,6 @@ class XzapSocksProxy(
         } catch (_: Exception) {
             out.write(byteArrayOf(0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
         }
-    }
-
-    // ==================== DNS UDP relay via XZAP TCP ====================
-
-    /**
-     * Forward a single DNS query (from a SOCKS5 UDP ASSOCIATE relay) through XZAP TCP.
-     * DNS-over-TCP uses a 2-byte big-endian length prefix before the query/response.
-     * After receiving the response, wrap it in a SOCKS5 UDP datagram and send back.
-     */
-    private fun forwardDnsViaTcp(
-        udpSock: java.net.DatagramSocket,
-        sender: java.net.SocketAddress,
-        dnsHost: String,
-        query: ByteArray,
-    ) {
-        try {
-            val tunnel = openXzapTunnel(dnsHost, 53) ?: return
-            try {
-                val tOut = tunnel.getOutputStream()
-                val tInp = java.io.BufferedInputStream(tunnel.getInputStream(), 512)
-
-                // TCP DNS: 2-byte length prefix + query.
-                // sendFrame encrypts → server decrypts → forwards [2B len][query] to 8.8.8.8:53.
-                // Server reads [2B len][response] back → wraps in XZAP frame → we recvFrame().
-                // recvFrame() decrypts, returning [2B len][DNS response] — strip the 2B prefix.
-                val tcpQuery = ByteArray(2 + query.size)
-                tcpQuery[0] = ((query.size shr 8) and 0xFF).toByte()
-                tcpQuery[1] = (query.size and 0xFF).toByte()
-                System.arraycopy(query, 0, tcpQuery, 2, query.size)
-                sendFrame(tOut, tcpQuery)
-
-                // Response arrives as an XZAP-encrypted frame — MUST use recvFrame, not readExactly.
-                val resp = recvFrame(tInp) ?: return
-                if (resp.size < 2) return
-                // Drop the 2-byte TCP DNS length prefix; keep raw DNS response bytes.
-                val response = resp.copyOfRange(2, resp.size)
-
-                // SOCKS5 UDP datagram reply: [2B RSV=0][1B FRAG=0][1B ATYP=3(domain)]
-                //   [1B len][domain bytes][2B port=53][response]
-                val domBytes = dnsHost.toByteArray()
-                val reply = ByteArray(2 + 1 + 1 + 1 + domBytes.size + 2 + response.size)
-                var i = 0
-                reply[i++] = 0x00; reply[i++] = 0x00  // RSV
-                reply[i++] = 0x00                       // FRAG
-                reply[i++] = 0x03                       // ATYP=domain
-                reply[i++] = domBytes.size.toByte()
-                System.arraycopy(domBytes, 0, reply, i, domBytes.size); i += domBytes.size
-                reply[i++] = 0x00; reply[i++] = 0x35   // port 53
-                System.arraycopy(response, 0, reply, i, response.size)
-
-                udpSock.send(java.net.DatagramPacket(reply, reply.size, sender))
-            } finally {
-                try { tunnel.close() } catch (_: Exception) {}
-            }
-        } catch (_: Exception) {}
     }
 
     // ==================== XZAP tunnel ====================
