@@ -200,11 +200,32 @@ class XzapSocksProxy(
 
             // SOCKS5 request
             val req = readExactly(inp, 4) ?: return
+            if (req[1] == 0x03.toByte()) {
+                // UDP ASSOCIATE — tun2socks uses this for QUIC (YouTube etc.)
+                // We set up a fake UDP relay: accept the association, create a local
+                // UDP socket, return its address as the relay endpoint.
+                // tun2socks sends QUIC datagrams there; we receive but discard them.
+                // Chrome sees UDP "working" but getting no responses → marks QUIC broken
+                // after 2-3s → falls back to clean TCP (which routes fine through XZAP).
+                // This eliminates Chrome's QUIC↔TCP race that caused recv=0 hangs.
+                skipSocksAddr(inp, req[3].toInt() and 0xFF)
+                val udpSock = java.net.DatagramSocket(0, java.net.InetAddress.getLoopbackAddress())
+                val udpPort = udpSock.localPort
+                try {
+                    out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01,
+                        127, 0, 0, 1,
+                        ((udpPort shr 8) and 0xFF).toByte(),
+                        (udpPort and 0xFF).toByte()))
+                    // Keep TCP control connection alive — SOCKS5 requires this.
+                    // tun2socks closes it once QUIC is abandoned → we exit.
+                    try { inp.read() } catch (_: Exception) {}
+                } finally {
+                    udpSock.close()
+                }
+                return
+            }
             if (req[1] != 0x01.toByte()) {
-                // UDP ASSOCIATE / BIND not supported.
-                // MUST use 0x01 (general failure), NOT 0x07 (command not supported).
-                // 0x07 causes tun2socks to mark the proxy as broken → kills ALL traffic.
-                // With 0x01, tun2socks silently drops UDP and TCP still routes normally.
+                // BIND or unknown — general failure
                 out.write(byteArrayOf(0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
                 return
             }
@@ -414,6 +435,15 @@ class XzapSocksProxy(
     }
 
     // ==================== Helpers ====================
+
+    /** Read and discard SOCKS5 address (ATYP already read) + 2-byte port. */
+    private fun skipSocksAddr(inp: InputStream, atyp: Int) {
+        when (atyp) {
+            0x01 -> readExactly(inp, 6)   // 4B IPv4 + 2B port
+            0x03 -> { val len = inp.read() and 0xFF; readExactly(inp, len + 2) }  // domain + 2B port
+            0x04 -> readExactly(inp, 18)  // 16B IPv6 + 2B port
+        }
+    }
 
     private fun putInt(buf: ByteArray, off: Int, v: Int) {
         buf[off] = ((v shr 24) and 0xFF).toByte()
