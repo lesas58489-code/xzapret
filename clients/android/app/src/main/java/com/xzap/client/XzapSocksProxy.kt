@@ -198,9 +198,15 @@ class XzapSocksProxy(
             inp.read(methods)
             out.write(byteArrayOf(0x05, 0x00))
 
-            // SOCKS5 CONNECT
+            // SOCKS5 request
             val req = ByteArray(4)
-            if (inp.read(req) != 4 || req[1] != 0x01.toByte()) return
+            if (inp.read(req) != 4) return
+            if (req[1] != 0x01.toByte()) {
+                // Not CONNECT (e.g. UDP ASSOCIATE 0x03) — reject explicitly so
+                // tun2socks gets a fast failure and QUIC falls back to TCP
+                out.write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                return
+            }
 
             val host: String
             when (req[3].toInt() and 0xFF) {
