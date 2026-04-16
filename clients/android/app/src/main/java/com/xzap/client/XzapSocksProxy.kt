@@ -272,13 +272,15 @@ class XzapSocksProxy(
 
             // SOCKS5 greeting
             val greeting = readExactly(inp, 2) ?: return
-            if (greeting[0] != 0x05.toByte()) return
+            if (greeting[0] != 0x05.toByte()) { Log.w(TAG, "bad SOCKS version: ${greeting[0]}"); return }
             val methodCount = greeting[1].toInt() and 0xFF
             if (methodCount > 0) readExactly(inp, methodCount) ?: return
             out.write(byteArrayOf(0x05, 0x00))
 
             // SOCKS5 request
             val req = readExactly(inp, 4) ?: return
+            val cmd = req[1].toInt() and 0xFF
+            Log.i(TAG, "SOCKS5 cmd=0x${cmd.toString(16)} atyp=0x${(req[3].toInt() and 0xFF).toString(16)}")
             if (req[1] == 0x03.toByte()) {
                 // UDP ASSOCIATE — accept for DNS relay, drop non-DNS silently.
                 // Server has no native UDP tunneling, so:
@@ -369,17 +371,22 @@ class XzapSocksProxy(
             val pb = readExactly(inp, 2) ?: return
             val port = ((pb[0].toInt() and 0xFF) shl 8) or (pb[1].toInt() and 0xFF)
 
+            Log.i(TAG, "CONNECT $host:$port")
+
             // Split tunneling
             if (shouldBypass(host)) {
+                Log.i(TAG, "bypass $host")
                 handleDirect(client, inp, out, host, port)
                 return
             }
 
             // XZAP tunnel
             val tunnel = openXzapTunnel(host, port) ?: run {
+                Log.w(TAG, "tunnel failed $host:$port")
                 out.write(byteArrayOf(0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
                 return
             }
+            Log.i(TAG, "tunnel open $host:$port")
 
             out.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
 
@@ -394,6 +401,9 @@ class XzapSocksProxy(
             // frames so multiple server frames arriving in one batch are never dropped.
             val reader = FrameReader(tunnelInp)
 
+            val sentBytes = java.util.concurrent.atomic.AtomicLong(0)
+            val recvBytes = java.util.concurrent.atomic.AtomicLong(0)
+
             val t1 = Thread {
                 try {
                     val buf = ByteArray(BUFFER_SIZE)
@@ -401,6 +411,7 @@ class XzapSocksProxy(
                         val n = inp.read(buf)
                         if (n <= 0) break
                         sendFrame(tunnelOut, buf, n)
+                        sentBytes.addAndGet(n.toLong())
                     }
                 } catch (_: Exception) {}
                 try { tunnel.close() } catch (_: Exception) {}
@@ -412,6 +423,7 @@ class XzapSocksProxy(
                         val data = reader.next() ?: break
                         bOut.write(data)
                         bOut.flush()
+                        recvBytes.addAndGet(data.size.toLong())
                     }
                 } catch (_: Exception) {}
                 try { client.close() } catch (_: Exception) {}
@@ -419,6 +431,7 @@ class XzapSocksProxy(
 
             t1.start(); t2.start()
             t1.join(); t2.join()
+            Log.i(TAG, "done $host:$port sent=${sentBytes.get()} recv=${recvBytes.get()}")
         } catch (_: Exception) {
         } finally {
             try { client.close() } catch (_: Exception) {}
