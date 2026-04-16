@@ -137,6 +137,11 @@ class XzapSocksProxy(
     private val pool = ConcurrentLinkedDeque<PooledSocket>()
     private val poolCreating = AtomicInteger(0)
 
+    // Limit concurrent UDP ASSOCIATE handlers — QUIC storms from Chrome/YouTube
+    // open 20-50 UDP ASSOCIATE connections per second, each creating a thread.
+    // Without a cap, newCachedThreadPool grows to hundreds of idle threads.
+    private val udpAssociateSemaphore = java.util.concurrent.Semaphore(12)
+
     // Signals that at least one pool connection is ready.
     // XzapVpnService waits on this before activating the VPN so Android's
     // connectivity probe (connectivitycheck.gstatic.com) doesn't time out on
@@ -286,7 +291,15 @@ class XzapSocksProxy(
                 // Server has no native UDP tunneling, so:
                 //   DNS (port 53): relay via DNS-over-TCP through XZAP tunnel
                 //   QUIC/other:    drop silently → apps fall back to TCP fast
+                //
+                // Rate-limit: Chrome/YouTube opens 20-50 UDP ASSOCIATE per second
+                // (QUIC connection attempts). Semaphore caps concurrent handlers at 12;
+                // excess requests get rejected with SOCKS5 error → instant TCP fallback.
                 skipSocksAddr(inp, req[3].toInt() and 0xFF)
+                if (!udpAssociateSemaphore.tryAcquire()) {
+                    out.write(byteArrayOf(0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
+                    return
+                }
                 val udpSock = java.net.DatagramSocket(0, java.net.InetAddress.getLoopbackAddress())
                 udpSock.soTimeout = 500
                 val udpPort = udpSock.localPort
@@ -298,7 +311,11 @@ class XzapSocksProxy(
                 executor?.submit {
                     try {
                         val recvBuf = ByteArray(65536)
-                        while (!client.isClosed && running.get()) {
+                        // 10s max lifetime for a UDP ASSOCIATE session — QUIC sessions
+                        // that get no response (all dropped) should time out quickly.
+                        val deadline = System.currentTimeMillis() + 10_000L
+                        while (!client.isClosed && running.get() &&
+                               System.currentTimeMillis() < deadline) {
                             val pkt = java.net.DatagramPacket(recvBuf, recvBuf.size)
                             try { udpSock.receive(pkt) }
                             catch (_: java.net.SocketTimeoutException) { continue }
@@ -334,10 +351,13 @@ class XzapSocksProxy(
                                 val src = pkt.socketAddress as java.net.InetSocketAddress
                                 executor?.submit { relayDnsQuery(dstHost, query, udpHdr, src, udpSock) }
                             }
-                            // Non-DNS UDP (QUIC etc): drop → instant TCP fallback
+                            // Non-DNS UDP (QUIC etc): drop → TCP fallback
                         }
                     } catch (_: Exception) {
-                    } finally { udpSock.close() }
+                    } finally {
+                        udpSock.close()
+                        udpAssociateSemaphore.release()
+                    }
                 }
 
                 // Keep control connection open per SOCKS5 spec
