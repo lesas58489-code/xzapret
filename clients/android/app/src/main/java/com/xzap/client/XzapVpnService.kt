@@ -96,6 +96,18 @@ class XzapVpnService : VpnService() {
             .addDnsServer("1.1.1.1")
             .setMtu(1500)
         try { builder.addDisallowedApplication(packageName) } catch (_: Exception) {}
+        // Inherit NET_CAPABILITY_VALIDATED from the underlying physical network (WiFi/LTE).
+        // Without this, Android performs its own connectivity check through the VPN tunnel:
+        // the probe hits Xiaomi's server (180.153.201.124) via Warsaw (Polish IP) which
+        // returns a non-204 redirect → VPN marked NOT_VALIDATED → Chrome refuses to use
+        // it (Telegram ignores this flag and works anyway).
+        // With setUnderlyingNetworks(activeNetwork), the VPN inherits validated status
+        // from the already-validated physical network — no separate probe needed.
+        try {
+            val cm = getSystemService(android.net.ConnectivityManager::class.java)
+            val active = cm?.activeNetwork
+            if (active != null) builder.setUnderlyingNetworks(arrayOf(active))
+        } catch (_: Exception) {}
         vpnInterface = builder.establish()
         Log.i(TAG, "VPN established")
     }

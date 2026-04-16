@@ -51,10 +51,11 @@ class XzapSocksProxy(
         private const val FRAG_THRESHOLD = 150
         private const val FRAG_MIN = 24
         private const val FRAG_MAX = 68
-        private const val POOL_SIZE = 8
-        private const val POOL_MAX_AGE_MS = 45_000L   // discard pool connections older than 45s (mobile NAT kills idle TCP in 30-120s)
+        private const val POOL_SIZE = 12
+        private const val POOL_MAX_AGE_MS = 90_000L   // discard pool connections older than 90s (mobile NAT kills idle TCP in 30-120s)
         private const val HANDSHAKE_TIMEOUT_MS = 10_000 // 10s timeout for XZAP handshake (detect stale pool sockets)
         private const val DATA_TIMEOUT_MS = 120_000     // 120s timeout for data relay (detect dead connections mid-stream)
+        private const val MAX_PARALLEL_TLS = 3          // max simultaneous new TLS handshakes to server — prevent operator DPI throttling on burst
 
         private val WHITE_DOMAINS = listOf(
             // Only NON-BLOCKED domains — DPI checks SNI
@@ -136,6 +137,8 @@ class XzapSocksProxy(
     // Connection pool with age tracking
     private val pool = ConcurrentLinkedDeque<PooledSocket>()
     private val poolCreating = AtomicInteger(0)
+    // Throttle simultaneous TLS handshakes to Warsaw — prevents DPI burst detection
+    private val tlsHandshakeSemaphore = java.util.concurrent.Semaphore(MAX_PARALLEL_TLS)
 
     // Limit concurrent UDP ASSOCIATE handlers — QUIC storms from Chrome/YouTube
     // open 20-50 UDP ASSOCIATE connections per second, each creating a thread.
@@ -212,12 +215,23 @@ class XzapSocksProxy(
     private fun createPoolConnection() {
         poolCreating.incrementAndGet()
         try {
-            val sock = openTlsConnection()
-            pool.offer(PooledSocket(sock))
-            // Signal first ready connection so XzapVpnService can activate VPN
-            if (!poolSignaled.getAndSet(true)) poolReadyLatch.countDown()
-        } catch (e: Exception) {
-            Log.d(TAG, "Pool create failed: ${e.message}")
+            var delay = 3_000L
+            repeat(3) { attempt ->
+                if (!running.get()) return
+                try {
+                    val sock = openTlsConnection()
+                    pool.offer(PooledSocket(sock))
+                    // Signal first ready connection so XzapVpnService can activate VPN
+                    if (!poolSignaled.getAndSet(true)) poolReadyLatch.countDown()
+                    return  // success
+                } catch (e: Exception) {
+                    Log.d(TAG, "Pool create failed (attempt ${attempt+1}/3): ${e.message}")
+                    if (attempt < 2 && running.get()) {
+                        Thread.sleep(delay)
+                        delay *= 2  // 3s → 6s backoff
+                    }
+                }
+            }
         } finally {
             poolCreating.decrementAndGet()
         }
@@ -244,16 +258,24 @@ class XzapSocksProxy(
     // ==================== TLS with SNI rotation ====================
 
     private fun openTlsConnection(): Socket {
-        val sni = WHITE_DOMAINS[random.nextInt(WHITE_DOMAINS.size)]
-        val sock = sslFactory.createSocket() as SSLSocket
-        sock.sslParameters = sock.sslParameters.apply {
-            serverNames = listOf(javax.net.ssl.SNIHostName(sni))
+        // Throttle: at most MAX_PARALLEL_TLS simultaneous new TLS handshakes.
+        // Without this, YouTube opening 8-10 connections simultaneously triggers
+        // a burst of TLS handshakes to Warsaw → operator DPI detects and throttles.
+        tlsHandshakeSemaphore.acquire()
+        try {
+            val sni = WHITE_DOMAINS[random.nextInt(WHITE_DOMAINS.size)]
+            val sock = sslFactory.createSocket() as SSLSocket
+            sock.sslParameters = sock.sslParameters.apply {
+                serverNames = listOf(javax.net.ssl.SNIHostName(sni))
+            }
+            sock.connect(InetSocketAddress(serverHost, serverPort), 10000)
+            sock.soTimeout = 0
+            sock.tcpNoDelay = true
+            sock.keepAlive = true  // detect dead connections via TCP keepalive
+            return sock
+        } finally {
+            tlsHandshakeSemaphore.release()
         }
-        sock.connect(InetSocketAddress(serverHost, serverPort), 10000)
-        sock.soTimeout = 0
-        sock.tcpNoDelay = true
-        sock.keepAlive = true  // detect dead connections via TCP keepalive
-        return sock
     }
 
     // ==================== Split tunneling ====================
