@@ -38,13 +38,15 @@ class XzapSocksProxy(
     companion object {
         private const val TAG = "XzapSocks"
         private const val BUFFER_SIZE = 131072
-        private const val MAX_TUNNELS = 3              // persistent mux tunnels
+        private const val MAX_TUNNELS = 5              // persistent mux tunnels — more redundancy on aggressive DPI networks
         private const val MAX_STREAMS_PER_TUNNEL = 100 // soft cap before spreading
         private const val TUNNEL_OPEN_TIMEOUT_MS = 10_000L
         private const val STREAM_OPEN_TIMEOUT_MS = 10_000L
         private const val QUIC_DROP_WINDOW_MS = 2_000L
         private const val QUIC_DROP_THRESHOLD = 3
         private const val QUIC_BLOCK_DURATION_MS = 30_000L
+        private const val TUNNEL_MAX_AGE_MS = 25_000L  // proactively rotate before DPI kills it
+        private const val ROTATOR_CHECK_INTERVAL_MS = 5_000L
 
         private val WHITE_DOMAINS = listOf(
             "www.cloudflare.com", "cloudflare.com",
@@ -108,6 +110,9 @@ class XzapSocksProxy(
         // Warm mux tunnels in background
         executor?.submit { warmTunnels() }
 
+        // Proactive tunnel rotator — replaces tunnels before DPI kills them
+        executor?.submit { rotatorLoop() }
+
         executor?.submit {
             while (running.get()) {
                 try {
@@ -166,7 +171,7 @@ class XzapSocksProxy(
         }
     }
 
-    /** Pick least-loaded alive tunnel. Eagerly replaces dead ones in background. */
+    /** Pick least-loaded alive NON-RETIRING tunnel. */
     private fun pickTunnel(): XzapMuxTunnel? {
         // Drop dead ones, count alive
         val iter = tunnels.iterator()
@@ -178,8 +183,6 @@ class XzapSocksProxy(
         if (dead > 0) Log.w(TAG, "$dead tunnels died, replacing")
 
         // Eager replacement: kick creation for every missing slot, up to MAX.
-        // First replacement immediately (to restore service), rest staggered
-        // so they don't align on the DPI clock again.
         val needed = MAX_TUNNELS - tunnels.size - creatingTunnels.get()
         for (i in 0 until maxOf(0, needed)) {
             val delay = if (i == 0) 0L else 3_000L * i + (Math.random() * 2_000L).toLong()
@@ -189,9 +192,14 @@ class XzapSocksProxy(
             }
         }
 
-        // Use least-loaded
-        var best: XzapMuxTunnel? = tunnels.minByOrNull { it.streamCount }
-        if (best != null && best.isAlive) return best
+        // Prefer non-retiring tunnels for new streams
+        val fresh = tunnels.filter { it.isAlive && !it.retiring }
+        var best: XzapMuxTunnel? = fresh.minByOrNull { it.streamCount }
+        if (best != null) return best
+
+        // Everything is retiring? Fall back to any alive
+        best = tunnels.firstOrNull { it.isAlive }
+        if (best != null) return best
 
         // Pool fully empty: wait up to 3s for background creation to finish
         val deadline = System.currentTimeMillis() + 3_000L
@@ -206,6 +214,37 @@ class XzapSocksProxy(
             best = tunnels.firstOrNull { it.isAlive }
             if (best != null) return best
             return createTunnel()
+        }
+    }
+
+    /** Proactive rotator: periodically retires tunnels that are about to be
+     *  DPI-killed, gives a fresh tunnel time to take over. */
+    private fun rotatorLoop() {
+        while (running.get()) {
+            try { Thread.sleep(ROTATOR_CHECK_INTERVAL_MS) } catch (_: InterruptedException) { return }
+            try {
+                val now = System.currentTimeMillis()
+                val freshAlive = tunnels.count { it.isAlive && !it.retiring }
+                for (t in tunnels) {
+                    if (t.isAlive && !t.retiring && now - t.createdAt > TUNNEL_MAX_AGE_MS) {
+                        // Only retire if we have enough healthy replacements in flight/up
+                        val totalReplacements = freshAlive - 1 + creatingTunnels.get()
+                        if (totalReplacements >= MAX_TUNNELS - 1) {
+                            t.retiring = true
+                            Log.i(TAG, "retiring tunnel age=${(now - t.createdAt)/1000}s")
+                            // Close it after a short grace so in-flight streams can drain
+                            executor?.submit {
+                                Thread.sleep(3_000L)
+                                t.close()
+                            }
+                        } else {
+                            // Not enough replacements — kick creation
+                            executor?.submit { createTunnel() }
+                        }
+                        break  // retire at most 1 per cycle
+                    }
+                }
+            } catch (_: Exception) {}
         }
     }
 
