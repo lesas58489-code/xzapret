@@ -28,6 +28,58 @@ class XzapVpnService : VpnService() {
         const val EXTRA_PORT = "port"
         const val EXTRA_KEY = "key"  // AES-256 key, base64-encoded
         const val SOCKS_PORT = 10808
+
+        // Russian apps that detect VPN and refuse to work (banks, gov, marketplaces).
+        // These are routed direct, bypassing tun2socks entirely. Missing packages
+        // are silently ignored (the bypass list is a superset of what any one user
+        // might have installed).
+        val BYPASS_APPS = listOf(
+            // Sber
+            "ru.sberbankmobile", "ru.sberbank.online", "ru.sberbankmobile_beta",
+            "ru.sberbank.sbol", "ru.sberbank.spasibo", "ru.sberbank.sberdevices.smartapp",
+            // Tinkoff / T-Bank
+            "com.idamob.tinkoff.android", "com.tinkoff.investing",
+            "com.tinkoff.tinkoffbusiness", "ru.tinkoff.mb",
+            // VTB
+            "ru.vtb24.mobilebanking.android", "ru.vtb.mobilebanking",
+            // Alfa
+            "ru.alfabank.mobile.android", "ru.alfabank.oavdo.amc",
+            // Other Russian banks
+            "ru.raiffeisennews", "ru.gazprombank.android.mobilebank.app",
+            "ru.rosbank.android", "ru.mtsbank.mobile", "ru.psbank.mobile",
+            "ru.akbars.mobile", "ru.uralsib.mobile", "ru.rshb.mbank",
+            "ru.otpbank.mobile", "ru.pochta.post",
+            // Ozon / Ozon Bank / Ozon Card
+            "ru.ozon.app.android", "ru.ozon.seller", "ru.ozon.card.android",
+            "ru.ozon.fintech.finance",
+            // Wildberries
+            "com.wildberries.ru", "com.wildberries.ru_seller",
+            // Yandex ecosystem (Taxi, Eda, Lavka, Market, Maps, Music, Mail, etc.)
+            "ru.yandex.taxi", "ru.yandex.eda", "ru.yandex.lavka",
+            "ru.yandex.market", "ru.yandex.yandexmaps",
+            "ru.yandex.yandexnavi", "ru.yandex.searchplugin",
+            "ru.yandex.mail", "ru.yandex.music", "ru.yandex.disk",
+            "ru.yandex.weatherplugin", "ru.yandex.metro",
+            "ru.yandex.rasp", "ru.yandex.pay",
+            "ru.yandex.kinopoisk", "ru.yandex.kinopoisk.tv",
+            "com.yandex.browser", "com.yandex.messenger", "com.yandex.mobile.realty",
+            "com.yandex.bank", "com.yandex.toloka.androidapp",
+            // Gov / official
+            "ru.rostel", "ru.gosuslugi.goskey", "ru.mos.polis.ooms", "ru.mos.ru",
+            // Travel
+            "ru.aeroflot", "ru.rzd.pass", "ru.s7.airlines",
+            // VK / Mail
+            "com.vkontakte.android", "com.vk.vkclient", "ru.mail.mailapp",
+            // Marketplaces / retailers
+            "ru.mvideo.androidapp", "ru.dns.dnsshop", "ru.sima.land",
+            "ru.leroymerlin.mobileapp",
+            // Media / misc
+            "ru.rbc.news", "ru.rambler.news", "ru.yoomoney.android",
+            "ru.litres.android",
+            // Delivery / food
+            "ru.dodopizza.app", "ru.kfc.kfcrus", "ru.burgerking",
+            "ru.foodfox.client", "ru.foodband.customer",
+        )
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
@@ -96,6 +148,16 @@ class XzapVpnService : VpnService() {
             .addDnsServer("1.1.1.1")
             .setMtu(1500)
         try { builder.addDisallowedApplication(packageName) } catch (_: Exception) {}
+
+        // Russian banks/marketplaces/gov apps detect VPN and block. Route direct.
+        // Missing packages throw NameNotFoundException → swallow per-item so one
+        // missing pkg doesn't abort the whole list.
+        var bypassed = 0
+        for (pkg in BYPASS_APPS) {
+            try { builder.addDisallowedApplication(pkg); bypassed++ } catch (_: Exception) {}
+        }
+        Log.i(TAG, "Bypass: $bypassed of ${BYPASS_APPS.size} Russian apps installed → routed direct")
+
         // Inherit NET_CAPABILITY_VALIDATED from the underlying physical network (WiFi/LTE).
         // Without this, Android performs its own connectivity check through the VPN tunnel:
         // the probe hits Xiaomi's server (180.153.201.124) via Warsaw (Polish IP) which
