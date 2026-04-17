@@ -61,6 +61,7 @@ class XzapSocksProxy(
     private val tunnels = ConcurrentLinkedDeque<XzapMuxTunnel>()
     private val tunnelLock = Object()
     private val udpAssociateSemaphore = java.util.concurrent.Semaphore(12)
+    private val creatingTunnels = java.util.concurrent.atomic.AtomicInteger(0)
 
     private val poolReadyLatch = java.util.concurrent.CountDownLatch(1)
     private val poolSignaled = AtomicBoolean(false)
@@ -77,6 +78,12 @@ class XzapSocksProxy(
             override fun checkServerTrusted(c: Array<java.security.cert.X509Certificate>, t: String) {}
             override fun getAcceptedIssuers() = arrayOf<java.security.cert.X509Certificate>()
         }), random)
+        // Session resumption cache — speeds up tunnel reconnects (1-RTT handshake).
+        // Default cache is small / short-lived. Make it big and long-lived.
+        try {
+            sslCtx.clientSessionContext?.sessionCacheSize = 64
+            sslCtx.clientSessionContext?.sessionTimeout = 3600  // 1h
+        } catch (_: Exception) {}
         sslFactory = sslCtx.socketFactory
 
         try { ServerSocket().apply { reuseAddress = true; bind(InetSocketAddress("127.0.0.1", port)); close() } } catch (_: Exception) {}
@@ -118,30 +125,38 @@ class XzapSocksProxy(
 
     private fun createTunnel(): XzapMuxTunnel? {
         if (!running.get()) return null
-        val sni = WHITE_DOMAINS[random.nextInt(WHITE_DOMAINS.size)]
-        val t = XzapMuxTunnel(serverHost, serverPort, key, sslFactory, sni)
-        return try {
-            t.connect()
-            tunnels.offer(t)
-            if (!poolSignaled.getAndSet(true)) poolReadyLatch.countDown()
-            t
-        } catch (e: Exception) {
-            Log.w(TAG, "tunnel create failed: ${e.message}")
-            null
+        creatingTunnels.incrementAndGet()
+        try {
+            val sni = WHITE_DOMAINS[random.nextInt(WHITE_DOMAINS.size)]
+            val t = XzapMuxTunnel(serverHost, serverPort, key, sslFactory, sni)
+            return try {
+                t.connect()
+                tunnels.offer(t)
+                if (!poolSignaled.getAndSet(true)) poolReadyLatch.countDown()
+                t
+            } catch (e: Exception) {
+                Log.w(TAG, "tunnel create failed: ${e.message}")
+                null
+            }
+        } finally {
+            creatingTunnels.decrementAndGet()
         }
     }
 
-    /** Pick least-loaded alive tunnel. Create new one if none alive. */
+    /** Pick least-loaded alive tunnel. Eagerly replaces dead ones in background. */
     private fun pickTunnel(): XzapMuxTunnel? {
-        // Drop dead ones
+        // Drop dead ones, count alive
         val iter = tunnels.iterator()
+        var dead = 0
         while (iter.hasNext()) {
             val t = iter.next()
-            if (!t.isAlive) iter.remove()
+            if (!t.isAlive) { iter.remove(); dead++ }
         }
+        if (dead > 0) Log.w(TAG, "$dead tunnels died, replacing")
 
-        // If we have fewer than MAX, kick off creation in background
-        if (tunnels.size < MAX_TUNNELS) {
+        // Eager replacement: kick creation for every missing slot, up to MAX
+        val needed = MAX_TUNNELS - tunnels.size - creatingTunnels.get()
+        repeat(maxOf(0, needed)) {
             executor?.submit { createTunnel() }
         }
 
@@ -149,9 +164,16 @@ class XzapSocksProxy(
         var best: XzapMuxTunnel? = tunnels.minByOrNull { it.streamCount }
         if (best != null && best.isAlive) return best
 
-        // Pool empty: synchronous create
+        // Pool fully empty: wait up to 3s for background creation to finish
+        val deadline = System.currentTimeMillis() + 3_000L
+        while (System.currentTimeMillis() < deadline) {
+            best = tunnels.firstOrNull { it.isAlive }
+            if (best != null) return best
+            Thread.sleep(50)
+        }
+
+        // Still empty: synchronous create as last resort
         synchronized(tunnelLock) {
-            // Re-check inside lock
             best = tunnels.firstOrNull { it.isAlive }
             if (best != null) return best
             return createTunnel()

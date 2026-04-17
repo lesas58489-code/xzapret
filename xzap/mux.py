@@ -38,11 +38,15 @@ CMD_SYN_ACK = 0x02
 CMD_DATA = 0x03
 CMD_FIN = 0x04
 CMD_RST = 0x05
+CMD_PING = 0x06
+CMD_PONG = 0x07
+CMD_WINDOW = 0x08
 
 MUX_HDR_SIZE = 9  # 4 + 1 + 4
 MAX_PAYLOAD = 256 * 1024
 MUX_VERSION = "mux1"
 CONTROL_STREAM_ID = 0
+INITIAL_WINDOW = 256 * 1024  # per-stream send window
 
 
 def pack_frame(stream_id: int, cmd: int, payload: bytes = b"") -> bytes:
@@ -65,6 +69,11 @@ class MuxStream:
         self.closed = False
         self._incoming: asyncio.Queue[bytes | None] = asyncio.Queue()
         self._target_task: asyncio.Task | None = None
+        # Flow control: we can send this many bytes to client before needing a WINDOW update
+        self._send_window = INITIAL_WINDOW
+        self._window_event = asyncio.Event()
+        self._window_event.set()
+        self._consumed = 0  # bytes consumed from client → credit back periodically
 
     async def connect_target(self, host: str, port: int) -> bool:
         try:
@@ -80,15 +89,30 @@ class MuxStream:
         """Pump: read from target → send DATA frames; consume incoming → write to target."""
         async def target_to_mux():
             try:
-                while True:
+                while not self.closed:
                     chunk = await self.target_reader.read(32 * 1024)
                     if not chunk:
                         break
-                    await self.mux.send_frame(self.id, CMD_DATA, chunk)
+                    # Respect client's send window
+                    pos = 0
+                    while pos < len(chunk):
+                        if self._send_window <= 0:
+                            self._window_event.clear()
+                            try:
+                                await asyncio.wait_for(self._window_event.wait(), timeout=30)
+                            except asyncio.TimeoutError:
+                                return
+                        take = min(len(chunk) - pos, self._send_window, 32 * 1024)
+                        await self.mux.send_frame(self.id, CMD_DATA, chunk[pos:pos+take])
+                        self._send_window -= take
+                        pos += take
             except Exception:
                 pass
             finally:
-                await self.mux.send_frame(self.id, CMD_FIN)
+                try:
+                    await self.mux.send_frame(self.id, CMD_FIN)
+                except Exception:
+                    pass
                 await self.close(notify=False)
 
         async def mux_to_target():
@@ -99,6 +123,16 @@ class MuxStream:
                         break
                     self.target_writer.write(chunk)
                     await self.target_writer.drain()
+                    # Credit: tell client we consumed N bytes (so they can send more)
+                    self._consumed += len(chunk)
+                    if self._consumed >= 64 * 1024:
+                        credit = self._consumed
+                        self._consumed = 0
+                        try:
+                            await self.mux.send_frame(self.id, CMD_WINDOW,
+                                                       credit.to_bytes(4, "big"))
+                        except Exception:
+                            pass
             except Exception:
                 pass
             finally:
@@ -109,6 +143,11 @@ class MuxStream:
                     pass
 
         await asyncio.gather(target_to_mux(), mux_to_target(), return_exceptions=True)
+
+    def on_window_update(self, delta: int):
+        if delta > 0:
+            self._send_window += delta
+            self._window_event.set()
 
     async def feed(self, data: bytes):
         """Called by mux dispatcher when DATA frame arrives for this stream."""
@@ -186,12 +225,27 @@ class MuxServerSession:
             return
         payload = data[MUX_HDR_SIZE:MUX_HDR_SIZE + plen]
 
+        # Control stream (id=0): ping/pong — keepalive heartbeat
+        if stream_id == CONTROL_STREAM_ID:
+            if cmd == CMD_PING:
+                try:
+                    await self.send_frame(CONTROL_STREAM_ID, CMD_PONG, b"")
+                except Exception:
+                    pass
+            # PONG ignored on server (client is the pinger in our design)
+            return
+
         if cmd == CMD_SYN:
             await self._handle_syn(stream_id, payload)
         elif cmd == CMD_DATA:
             s = self.streams.get(stream_id)
             if s:
                 await s.feed(payload)
+        elif cmd == CMD_WINDOW:
+            s = self.streams.get(stream_id)
+            if s and len(payload) >= 4:
+                delta = int.from_bytes(payload[:4], "big")
+                s.on_window_update(delta)
         elif cmd in (CMD_FIN, CMD_RST):
             s = self.streams.get(stream_id)
             if s:

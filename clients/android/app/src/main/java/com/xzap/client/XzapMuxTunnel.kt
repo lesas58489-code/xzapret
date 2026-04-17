@@ -50,7 +50,14 @@ class XzapMuxTunnel(
         private const val CMD_DATA = 0x03
         private const val CMD_FIN = 0x04
         private const val CMD_RST = 0x05
+        private const val CMD_PING = 0x06
+        private const val CMD_PONG = 0x07
+        private const val CMD_WINDOW = 0x08  // flow control update
         private const val MUX_HDR = 9
+        private const val PING_INTERVAL_MS = 15_000L
+        private const val PING_TIMEOUT_MS = 10_000L
+        private const val CONTROL_STREAM_ID = 0
+        private const val STREAM_RECV_WINDOW = 256 * 1024  // per-stream inbound buffer cap
         private const val PREFIX_SIZE = 16
         private const val NONCE_SIZE = 12
         private const val TAG_BITS = 128
@@ -74,6 +81,9 @@ class XzapMuxTunnel(
     private val nextStreamId = AtomicInteger(1)  // 0 reserved for control
     private val alive = AtomicBoolean(false)
     private var readerThread: Thread? = null
+    private var pingThread: Thread? = null
+    @Volatile private var lastPongAt = 0L
+    @Volatile private var lastPingAt = 0L
 
     val isAlive: Boolean get() = alive.get()
     val streamCount: Int get() = streams.size
@@ -88,6 +98,9 @@ class XzapMuxTunnel(
         sock.soTimeout = 10_000
         sock.tcpNoDelay = true
         sock.keepAlive = true
+        // Aggressive keepalive for mobile NAT (default linux is 2h idle — useless).
+        // Not all Android versions expose these as named options; try reflection.
+        trySetKeepAliveParams(sock, idleSec = 30, intervalSec = 10, count = 3)
 
         socket = sock
         sockOut = sock.getOutputStream()
@@ -106,8 +119,52 @@ class XzapMuxTunnel(
 
         sock.soTimeout = 0  // disable timeout now, data phase
         alive.set(true)
+        lastPongAt = System.currentTimeMillis()
         readerThread = Thread({ readerLoop() }, "XzapMux-reader").also { it.start() }
+        pingThread = Thread({ pingLoop() }, "XzapMux-ping").also { it.isDaemon = true; it.start() }
         Log.i(TAG, "mux tunnel established → $serverHost:$serverPort")
+    }
+
+    private fun trySetKeepAliveParams(sock: Socket, idleSec: Int, intervalSec: Int, count: Int) {
+        // Android API 29+ supports ExtendedSocketOptions via reflection — best-effort.
+        try {
+            val cls = Class.forName("jdk.net.ExtendedSocketOptions")
+            val keepIdle = cls.getField("TCP_KEEPIDLE").get(null) as java.net.SocketOption<Int>
+            val keepIntvl = cls.getField("TCP_KEEPINTERVAL").get(null) as java.net.SocketOption<Int>
+            val keepCnt = cls.getField("TCP_KEEPCOUNT").get(null) as java.net.SocketOption<Int>
+            sock.setOption(keepIdle, idleSec)
+            sock.setOption(keepIntvl, intervalSec)
+            sock.setOption(keepCnt, count)
+        } catch (_: Throwable) {
+            // Not available — application-level ping will compensate
+        }
+    }
+
+    private fun pingLoop() {
+        while (alive.get()) {
+            try { Thread.sleep(PING_INTERVAL_MS) } catch (_: InterruptedException) { break }
+            if (!alive.get()) break
+            val now = System.currentTimeMillis()
+            // Dead-peer detection: sent a ping but no pong arrived in time
+            if (lastPingAt > lastPongAt && now - lastPingAt > PING_TIMEOUT_MS) {
+                Log.w(TAG, "ping timeout → tunnel dead")
+                forceClose()
+                return
+            }
+            try {
+                lastPingAt = now
+                sendMuxFrame(CONTROL_STREAM_ID, CMD_PING, ByteArray(0))
+            } catch (e: Exception) {
+                Log.w(TAG, "ping send failed: ${e.message}")
+                forceClose()
+                return
+            }
+        }
+    }
+
+    private fun forceClose() {
+        alive.set(false)
+        try { socket?.close() } catch (_: Exception) {}
     }
 
     /** Open a new logical stream to host:port. Returns null on failure. */
@@ -153,12 +210,28 @@ class XzapMuxTunnel(
                 if (plen < 0 || MUX_HDR + plen > frame.size) continue
                 val payload = if (plen > 0) frame.copyOfRange(MUX_HDR, MUX_HDR + plen) else ByteArray(0)
 
+                if (sid == CONTROL_STREAM_ID) {
+                    when (cmd) {
+                        CMD_PING -> {
+                            // Echo back — mostly for server-initiated health checks
+                            try { sendMuxFrame(CONTROL_STREAM_ID, CMD_PONG, ByteArray(0)) } catch (_: Exception) {}
+                        }
+                        CMD_PONG -> {
+                            lastPongAt = System.currentTimeMillis()
+                        }
+                    }
+                    continue
+                }
                 val stream = streams[sid]
                 when (cmd) {
                     CMD_SYN_ACK -> stream?.onAck(true)
                     CMD_DATA -> stream?.onData(payload)
+                    CMD_WINDOW -> {
+                        val delta = if (payload.size >= 4) getInt(payload, 0) else 0
+                        stream?.onWindowUpdate(delta)
+                    }
                     CMD_FIN, CMD_RST -> {
-                        stream?.onAck(false)  // unblock any pending openStream
+                        stream?.onAck(false)
                         stream?.onClosed()
                         streams.remove(sid)
                     }
@@ -310,6 +383,12 @@ class MuxStream(val id: Int, private val tunnel: XzapMuxTunnel) {
     private val closed = AtomicBoolean(false)
     private var rxLeftover: ByteArray? = null
 
+    // Flow control: peer's send window to us (we inform peer via WINDOW frames
+    // after we've consumed bytes). Our send window to peer (peer informs us).
+    private val sendWindow = AtomicInteger(256 * 1024)
+    private val consumedBytes = AtomicInteger(0)
+    private val sendWindowLock = Object()
+
     internal fun onAck(ok: Boolean) {
         ackResult = ok
         ackSignal.countDown()
@@ -319,9 +398,18 @@ class MuxStream(val id: Int, private val tunnel: XzapMuxTunnel) {
         if (!closed.get()) rxQueue.offer(data)
     }
 
+    internal fun onWindowUpdate(delta: Int) {
+        if (delta <= 0) return
+        synchronized(sendWindowLock) {
+            sendWindow.addAndGet(delta)
+            (sendWindowLock as java.lang.Object).notifyAll()
+        }
+    }
+
     internal fun onClosed() {
         if (closed.compareAndSet(false, true)) {
-            rxQueue.offer(EOF_SENTINEL)  // wake readers
+            rxQueue.offer(EOF_SENTINEL)
+            synchronized(sendWindowLock) { (sendWindowLock as java.lang.Object).notifyAll() }
         }
     }
 
@@ -339,12 +427,12 @@ class MuxStream(val id: Int, private val tunnel: XzapMuxTunnel) {
 
     /** Read up to `buf.size` bytes into buf; returns bytes read or -1 on EOF. */
     fun read(buf: ByteArray): Int {
-        // Drain leftover first
         val lo = rxLeftover
         if (lo != null) {
             val n = minOf(lo.size, buf.size)
             System.arraycopy(lo, 0, buf, 0, n)
             rxLeftover = if (n < lo.size) lo.copyOfRange(n, lo.size) else null
+            creditConsumed(n)
             return n
         }
         val chunk = rxQueue.take()
@@ -352,13 +440,47 @@ class MuxStream(val id: Int, private val tunnel: XzapMuxTunnel) {
         val n = minOf(chunk.size, buf.size)
         System.arraycopy(chunk, 0, buf, 0, n)
         if (n < chunk.size) rxLeftover = chunk.copyOfRange(n, chunk.size)
+        creditConsumed(n)
         return n
+    }
+
+    /** After consuming N bytes from rx queue, credit them back to peer as WINDOW frame
+     *  when batch accumulates to 64KB. Prevents peer from outrunning us. */
+    private fun creditConsumed(n: Int) {
+        val total = consumedBytes.addAndGet(n)
+        if (total >= 64 * 1024) {
+            consumedBytes.addAndGet(-total)
+            try {
+                val buf = ByteArray(4)
+                buf[0] = ((total shr 24) and 0xFF).toByte()
+                buf[1] = ((total shr 16) and 0xFF).toByte()
+                buf[2] = ((total shr 8) and 0xFF).toByte()
+                buf[3] = (total and 0xFF).toByte()
+                tunnel.sendMuxFrame(id, 0x08, buf)  // CMD_WINDOW
+            } catch (_: Exception) {}
+        }
     }
 
     fun write(data: ByteArray, off: Int = 0, len: Int = data.size) {
         if (closed.get()) throw IOException("stream closed")
-        val slice = if (off == 0 && len == data.size) data else data.copyOfRange(off, off + len)
-        tunnel.sendMuxFrame(id, 0x03, slice)  // CMD_DATA
+        var remaining = len
+        var pos = off
+        while (remaining > 0 && !closed.get()) {
+            // Block until we have send credit
+            synchronized(sendWindowLock) {
+                while (sendWindow.get() <= 0 && !closed.get()) {
+                    try { (sendWindowLock as java.lang.Object).wait(5000) }
+                    catch (_: InterruptedException) { return }
+                }
+            }
+            if (closed.get()) throw IOException("stream closed")
+            val allowed = minOf(remaining, sendWindow.get(), 32 * 1024)
+            val slice = data.copyOfRange(pos, pos + allowed)
+            tunnel.sendMuxFrame(id, 0x03, slice)  // CMD_DATA
+            sendWindow.addAndGet(-allowed)
+            pos += allowed
+            remaining -= allowed
+        }
     }
 
     fun close() {
