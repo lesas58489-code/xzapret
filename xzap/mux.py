@@ -69,7 +69,10 @@ class MuxStream:
         self.closed = False
         self._incoming: asyncio.Queue[bytes | None] = asyncio.Queue()
         self._target_task: asyncio.Task | None = None
-        # Flow control: we can send this many bytes to client before needing a WINDOW update
+        # Flow control is opt-in: disabled until we see the client send its first
+        # WINDOW frame. Old clients (no FC support) never send one → we never block.
+        # New clients send their first WINDOW frame after consuming 64KB → FC engages.
+        self._fc_enabled = False
         self._send_window = INITIAL_WINDOW
         self._window_event = asyncio.Event()
         self._window_event.set()
@@ -93,7 +96,10 @@ class MuxStream:
                     chunk = await self.target_reader.read(32 * 1024)
                     if not chunk:
                         break
-                    # Respect client's send window
+                    # Respect client's send window only when FC is engaged
+                    if not self._fc_enabled:
+                        await self.mux.send_frame(self.id, CMD_DATA, chunk)
+                        continue
                     pos = 0
                     while pos < len(chunk):
                         if self._send_window <= 0:
@@ -123,16 +129,17 @@ class MuxStream:
                         break
                     self.target_writer.write(chunk)
                     await self.target_writer.drain()
-                    # Credit: tell client we consumed N bytes (so they can send more)
-                    self._consumed += len(chunk)
-                    if self._consumed >= 64 * 1024:
-                        credit = self._consumed
-                        self._consumed = 0
-                        try:
-                            await self.mux.send_frame(self.id, CMD_WINDOW,
-                                                       credit.to_bytes(4, "big"))
-                        except Exception:
-                            pass
+                    # Credit client only if they asked for FC (engaged).
+                    if self._fc_enabled:
+                        self._consumed += len(chunk)
+                        if self._consumed >= 64 * 1024:
+                            credit = self._consumed
+                            self._consumed = 0
+                            try:
+                                await self.mux.send_frame(self.id, CMD_WINDOW,
+                                                           credit.to_bytes(4, "big"))
+                            except Exception:
+                                pass
             except Exception:
                 pass
             finally:
@@ -145,9 +152,13 @@ class MuxStream:
         await asyncio.gather(target_to_mux(), mux_to_target(), return_exceptions=True)
 
     def on_window_update(self, delta: int):
-        if delta > 0:
+        # First WINDOW frame from client = FC opt-in. Reset window to this delta.
+        if not self._fc_enabled:
+            self._fc_enabled = True
+            self._send_window = delta
+        elif delta > 0:
             self._send_window += delta
-            self._window_event.set()
+        self._window_event.set()
 
     async def feed(self, data: bytes):
         """Called by mux dispatcher when DATA frame arrives for this stream."""
