@@ -217,6 +217,34 @@ class XZAPTunnelServer:
             ctrl = crypto.decrypt(encrypted)
 
             req = json.loads(ctrl)
+
+            # Mux protocol detection: first mux frame is [4B sid=0][1B cmd=SYN][4B len][{"v":"mux1"}]
+            # which after JSON-decode attempt above fails (it's not JSON at top level).
+            # But the client actually wraps the version JSON *as the payload* of a mux frame,
+            # so the decrypted bytes are the mux frame itself. We detect that path by
+            # trying to parse as a mux SYN on control stream.
+            #
+            # Legacy path: req = {"cmd": "connect", "host":..., "port":...}
+            if req.get("v") == "mux1":
+                # Client sent a raw version JSON — enter mux mode
+                from .mux import MuxServerSession, CMD_SYN_ACK, MUX_VERSION, CONTROL_STREAM_ID, pack_frame
+                session = MuxServerSession(reader, writer, crypto, _send_frame, username=username)
+                # Reply with a bare version JSON (symmetric to client's send)
+                await _send_frame(writer, crypto,
+                                   json.dumps({"v": MUX_VERSION}).encode())
+                log.info("Mux session (plain-version handshake) user=%s", username)
+                try:
+                    while True:
+                        try:
+                            frame_bytes = await _recv_frame(reader, crypto)
+                        except Exception:
+                            break
+                        await session._process_mux_frame(frame_bytes)
+                finally:
+                    for s in list(session.streams.values()):
+                        await s.close(notify=False)
+                return
+
             if req.get("cmd") != "connect":
                 await _send_frame(writer, crypto,
                                    json.dumps({"ok": False, "err": "bad cmd"}).encode())
