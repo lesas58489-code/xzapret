@@ -54,8 +54,8 @@ class XzapMuxTunnel(
         private const val CMD_PONG = 0x07
         private const val CMD_WINDOW = 0x08  // flow control update
         private const val MUX_HDR = 9
-        private const val PING_INTERVAL_MS = 5_000L   // faster dead-peer detection
-        private const val PING_TIMEOUT_MS = 3_000L    // no pong in 3s = dead
+        private const val PING_INTERVAL_MS = 5_000L
+        private const val PING_TIMEOUT_MS = 10_000L   // loose timeout — any server frame counts as liveness
         private const val CONTROL_STREAM_ID = 0
         private const val STREAM_RECV_WINDOW = 256 * 1024  // per-stream inbound buffer cap
         private const val PREFIX_SIZE = 16
@@ -84,6 +84,7 @@ class XzapMuxTunnel(
     private var pingThread: Thread? = null
     @Volatile private var lastPongAt = 0L
     @Volatile private var lastPingAt = 0L
+    @Volatile private var lastFrameAt = 0L   // any frame from server = tunnel is alive
 
     val isAlive: Boolean get() = alive.get()
     val streamCount: Int get() = streams.size
@@ -119,7 +120,9 @@ class XzapMuxTunnel(
 
         sock.soTimeout = 0  // disable timeout now, data phase
         alive.set(true)
-        lastPongAt = System.currentTimeMillis()
+        val now = System.currentTimeMillis()
+        lastPongAt = now
+        lastFrameAt = now
         readerThread = Thread({ readerLoop() }, "XzapMux-reader").also { it.start() }
         pingThread = Thread({ pingLoop() }, "XzapMux-ping").also { it.isDaemon = true; it.start() }
         Log.i(TAG, "mux tunnel established → $serverHost:$serverPort")
@@ -145,9 +148,12 @@ class XzapMuxTunnel(
             try { Thread.sleep(PING_INTERVAL_MS) } catch (_: InterruptedException) { break }
             if (!alive.get()) break
             val now = System.currentTimeMillis()
-            // Dead-peer detection: sent a ping but no pong arrived in time
-            if (lastPingAt > lastPongAt && now - lastPingAt > PING_TIMEOUT_MS) {
-                Log.w(TAG, "ping timeout → tunnel dead")
+            // Dead-peer detection: tunnel is considered dead only if NO frames
+            // of any kind arrived from server within PING_TIMEOUT. This tolerates
+            // CPU spikes / bursty traffic where a PONG gets delayed but data is
+            // still flowing, while still catching true disconnections.
+            if (now - lastFrameAt > PING_TIMEOUT_MS && lastPingAt > lastFrameAt) {
+                Log.w(TAG, "ping timeout → tunnel dead (${now - lastFrameAt}ms silent)")
                 forceClose()
                 return
             }
@@ -212,6 +218,7 @@ class XzapMuxTunnel(
         try {
             while (alive.get()) {
                 val frame = recvXzapFrame() ?: break
+                lastFrameAt = System.currentTimeMillis()  // any frame = alive signal
                 if (frame.size < MUX_HDR) continue
                 val sid = getInt(frame, 0)
                 val cmd = frame[4].toInt() and 0xFF

@@ -63,7 +63,9 @@ class XzapSocksProxy(
 
     private val tunnels = ConcurrentLinkedDeque<XzapMuxTunnel>()
     private val tunnelLock = Object()
-    private val udpAssociateSemaphore = java.util.concurrent.Semaphore(12)
+    // High cap — some phones' system resolvers spam UDP DNS aggressively.
+    // Too low a cap = DNS starts failing → whole VPN looks broken.
+    private val udpAssociateSemaphore = java.util.concurrent.Semaphore(64)
     private val creatingTunnels = java.util.concurrent.atomic.AtomicInteger(0)
 
     // QUIC circuit breaker: after detecting N non-DNS UDP attempts within a window,
