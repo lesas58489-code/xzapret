@@ -108,7 +108,20 @@ class XzapVpnService : VpnService() {
         createNotificationChannel()
         startForeground(1, buildNotification("Connecting..."))
 
-        val key = Base64.decode(keyB64, Base64.DEFAULT)
+        val key = try {
+            Base64.decode(keyB64.replace(Regex("\\s"), ""), Base64.DEFAULT)
+        } catch (e: IllegalArgumentException) {
+            Log.e(TAG, "Invalid base64 key — aborting: ${e.message}")
+            updateNotification("Error: invalid key")
+            stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
+            return
+        }
+        if (key.size != 32) {
+            Log.e(TAG, "Key must be 32 bytes, got ${key.size} — aborting")
+            updateNotification("Error: key must be 32 bytes")
+            stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
+            return
+        }
         running.set(true)
 
         // Bypass domains (Russian sites go direct, no tunnel needed)

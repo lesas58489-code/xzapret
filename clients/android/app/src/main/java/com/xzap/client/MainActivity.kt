@@ -46,11 +46,23 @@ class MainActivity : AppCompatActivity() {
 
     private fun requestVpn() {
         val server = etServer.text.toString().trim()
-        val key = etKey.text.toString().trim()
+        // Strip all whitespace from key (users often paste with trailing newline / spaces)
+        val key = etKey.text.toString().replace(Regex("\\s"), "")
         if (server.isEmpty() || key.isEmpty()) {
-            Toast.makeText(this, "Server and SSH Key required", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Server and Key required", Toast.LENGTH_SHORT).show()
             return
         }
+        try {
+            val decoded = android.util.Base64.decode(key, android.util.Base64.DEFAULT)
+            if (decoded.size != 32) {
+                Toast.makeText(this, "Key must decode to 32 bytes, got ${decoded.size}", Toast.LENGTH_LONG).show()
+                return
+            }
+        } catch (e: IllegalArgumentException) {
+            Toast.makeText(this, "Invalid key (not valid base64)", Toast.LENGTH_LONG).show()
+            return
+        }
+        etKey.setText(key)
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
             .putString("server", server)
             .putString("port", etPort.text.toString())
