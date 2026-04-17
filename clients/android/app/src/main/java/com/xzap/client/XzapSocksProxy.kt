@@ -313,7 +313,9 @@ class XzapSocksProxy(
         executor?.submit {
             try {
                 val recvBuf = ByteArray(65536)
-                val deadline = System.currentTimeMillis() + 10_000L
+                // Deadline: if session idle for this long, close. DNS queries get
+                // a fresh tunnel per query, so a session doing DNS won't need much.
+                val deadline = System.currentTimeMillis() + 3_000L
                 while (!client.isClosed && running.get() && System.currentTimeMillis() < deadline) {
                     val pkt = java.net.DatagramPacket(recvBuf, recvBuf.size)
                     try { udpSock.receive(pkt) } catch (_: java.net.SocketTimeoutException) { continue }
@@ -346,6 +348,15 @@ class XzapSocksProxy(
                         val udpHdr = d.copyOfRange(0, payloadOff)
                         val src = pkt.socketAddress as java.net.InetSocketAddress
                         executor?.submit { relayDnsQuery(dstHost, query, udpHdr, src, udpSock) }
+                    } else {
+                        // Non-DNS UDP (QUIC, WebRTC, etc): explicitly signal
+                        // "UDP broken" by closing the SOCKS5 control connection.
+                        // Per SOCKS5 RFC, tun2socks MUST tear down the UDP flow when
+                        // control conn closes → app gets ECONNREFUSED → instant fallback
+                        // to TCP. Without this, app waits up to 10s for QUIC reply.
+                        Log.i(TAG, "reject UDP $dstHost:$dstPort (QUIC) → signal fallback")
+                        try { client.close() } catch (_: Exception) {}
+                        return@submit
                     }
                 }
             } catch (_: Exception) {
