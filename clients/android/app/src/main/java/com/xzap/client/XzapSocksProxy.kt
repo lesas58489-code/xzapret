@@ -42,6 +42,9 @@ class XzapSocksProxy(
         private const val MAX_STREAMS_PER_TUNNEL = 100 // soft cap before spreading
         private const val TUNNEL_OPEN_TIMEOUT_MS = 10_000L
         private const val STREAM_OPEN_TIMEOUT_MS = 10_000L
+        private const val QUIC_DROP_WINDOW_MS = 2_000L
+        private const val QUIC_DROP_THRESHOLD = 3
+        private const val QUIC_BLOCK_DURATION_MS = 30_000L
 
         private val WHITE_DOMAINS = listOf(
             "www.cloudflare.com", "cloudflare.com",
@@ -62,6 +65,14 @@ class XzapSocksProxy(
     private val tunnelLock = Object()
     private val udpAssociateSemaphore = java.util.concurrent.Semaphore(12)
     private val creatingTunnels = java.util.concurrent.atomic.AtomicInteger(0)
+
+    // QUIC circuit breaker: after detecting N non-DNS UDP attempts within a window,
+    // stop accepting UDP ASSOCIATE entirely for BLOCK_DURATION. This tells tun2socks
+    // "UDP not supported" so apps (YouTube, Chrome) fallback to TCP instantly.
+    // DNS over port 53 still works because Android's system resolver falls back to
+    // TCP DNS quickly, and apps using raw UDP DNS are rare on Android.
+    private val quicDropTimes = ConcurrentLinkedDeque<Long>()
+    @Volatile private var quicBlockUntil = 0L
 
     private val poolReadyLatch = java.util.concurrent.CountDownLatch(1)
     private val poolSignaled = AtomicBoolean(false)
@@ -300,6 +311,16 @@ class XzapSocksProxy(
 
     private fun handleUdpAssociate(client: Socket, inp: InputStream, out: OutputStream, req: ByteArray) {
         skipSocksAddr(inp, req[3].toInt() and 0xFF)
+
+        // QUIC circuit breaker: if recently we dropped lots of non-DNS UDP,
+        // reject UDP ASSOCIATE immediately so tun2socks signals apps that UDP is
+        // unavailable → apps fallback to TCP instantly instead of retrying QUIC.
+        val now = System.currentTimeMillis()
+        if (now < quicBlockUntil) {
+            out.write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0))  // cmd not supported
+            return
+        }
+
         if (!udpAssociateSemaphore.tryAcquire()) {
             out.write(byteArrayOf(0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
             return
@@ -349,11 +370,11 @@ class XzapSocksProxy(
                         val src = pkt.socketAddress as java.net.InetSocketAddress
                         executor?.submit { relayDnsQuery(dstHost, query, udpHdr, src, udpSock) }
                     } else {
-                        // Non-DNS UDP (QUIC, WebRTC, etc): explicitly signal
-                        // "UDP broken" by closing the SOCKS5 control connection.
-                        // Per SOCKS5 RFC, tun2socks MUST tear down the UDP flow when
-                        // control conn closes → app gets ECONNREFUSED → instant fallback
-                        // to TCP. Without this, app waits up to 10s for QUIC reply.
+                        // Non-DNS UDP (QUIC, WebRTC, etc): register as QUIC-drop
+                        // and signal "UDP broken" by closing the SOCKS5 control conn.
+                        // If drops pile up within a short window → activate block mode
+                        // so subsequent UDP ASSOCIATE requests are rejected instantly.
+                        registerQuicDrop()
                         Log.i(TAG, "reject UDP $dstHost:$dstPort (QUIC) → signal fallback")
                         try { client.close() } catch (_: Exception) {}
                         return@submit
@@ -366,6 +387,19 @@ class XzapSocksProxy(
             }
         }
         try { while (inp.read() != -1 && !client.isClosed && running.get()) {} } catch (_: Exception) {}
+    }
+
+    private fun registerQuicDrop() {
+        val now = System.currentTimeMillis()
+        quicDropTimes.offer(now)
+        // Trim old entries outside window
+        val cutoff = now - QUIC_DROP_WINDOW_MS
+        while (quicDropTimes.peekFirst()?.let { it < cutoff } == true) quicDropTimes.pollFirst()
+        if (quicDropTimes.size >= QUIC_DROP_THRESHOLD && now >= quicBlockUntil) {
+            quicBlockUntil = now + QUIC_BLOCK_DURATION_MS
+            Log.w(TAG, "UDP block mode engaged for ${QUIC_BLOCK_DURATION_MS/1000}s " +
+                    "(${quicDropTimes.size} QUIC drops in last ${QUIC_DROP_WINDOW_MS/1000}s)")
+        }
     }
 
     private fun relayDnsQuery(dnsServer: String, query: ByteArray,
