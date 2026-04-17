@@ -128,10 +128,20 @@ class XzapSocksProxy(
     // ==================== Mux tunnel pool ====================
 
     private fun warmTunnels() {
-        val threads = (1..MAX_TUNNELS).map { Thread { createTunnel() } }
+        // First tunnel: synchronous, signals poolReady ASAP for VPN activation.
+        createTunnel()
+        // Remaining tunnels: staggered so they don't all die at the same DPI-clock
+        // tick. Mobile operator / DPI often RSTs long TLS flows on a timer; if all
+        // started together, all die together → brief service gap. With jitter,
+        // deaths spread → majority always alive.
+        val threads = (1 until MAX_TUNNELS).map { idx ->
+            Thread {
+                Thread.sleep(5_000L * idx + (Math.random() * 2_000L).toLong())
+                createTunnel()
+            }
+        }
         threads.forEach { it.start() }
-        threads.forEach { it.join() }
-        Log.i(TAG, "Mux pool: ${tunnels.size}/${MAX_TUNNELS} ready")
+        Log.i(TAG, "Mux pool: first ready, ${threads.size} more staggered")
     }
 
     private fun createTunnel(): XzapMuxTunnel? {
@@ -165,10 +175,16 @@ class XzapSocksProxy(
         }
         if (dead > 0) Log.w(TAG, "$dead tunnels died, replacing")
 
-        // Eager replacement: kick creation for every missing slot, up to MAX
+        // Eager replacement: kick creation for every missing slot, up to MAX.
+        // First replacement immediately (to restore service), rest staggered
+        // so they don't align on the DPI clock again.
         val needed = MAX_TUNNELS - tunnels.size - creatingTunnels.get()
-        repeat(maxOf(0, needed)) {
-            executor?.submit { createTunnel() }
+        for (i in 0 until maxOf(0, needed)) {
+            val delay = if (i == 0) 0L else 3_000L * i + (Math.random() * 2_000L).toLong()
+            executor?.submit {
+                if (delay > 0) Thread.sleep(delay)
+                createTunnel()
+            }
         }
 
         // Use least-loaded
