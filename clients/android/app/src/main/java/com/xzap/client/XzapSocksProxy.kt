@@ -38,15 +38,20 @@ class XzapSocksProxy(
     companion object {
         private const val TAG = "XzapSocks"
         private const val BUFFER_SIZE = 131072
-        private const val MAX_TUNNELS = 5              // persistent mux tunnels — more redundancy on aggressive DPI networks
-        private const val MAX_STREAMS_PER_TUNNEL = 100 // soft cap before spreading
+        private const val MAX_TUNNELS = 4               // +1 buffer for proactive rotation
+        private const val MAX_STREAMS_PER_TUNNEL = 100
         private const val TUNNEL_OPEN_TIMEOUT_MS = 10_000L
         private const val STREAM_OPEN_TIMEOUT_MS = 10_000L
         private const val QUIC_DROP_WINDOW_MS = 2_000L
         private const val QUIC_DROP_THRESHOLD = 3
         private const val QUIC_BLOCK_DURATION_MS = 30_000L
-        private const val TUNNEL_MAX_AGE_MS = 25_000L  // proactively rotate before DPI kills it
-        private const val ROTATOR_CHECK_INTERVAL_MS = 5_000L
+        // Proactive rotation parameters
+        private const val ROTATOR_WARMUP_MS = 60_000L        // no rotation in first minute
+        private const val ROTATOR_CHECK_INTERVAL_MS = 10_000L
+        private const val ROTATOR_MIN_RETIRE_GAP_MS = 20_000L // at most 1 retire per 20s
+        private const val TUNNEL_MAX_AGE_MS = 45_000L         // proactive retire at this age
+        private const val TUNNEL_RETIRE_GRACE_MS = 15_000L    // let streams drain this long
+        private const val MIN_FRESH_FOR_RETIRE = 2            // need this many non-retiring alive
 
         private val WHITE_DOMAINS = listOf(
             "www.cloudflare.com", "cloudflare.com",
@@ -69,6 +74,8 @@ class XzapSocksProxy(
     // Too low a cap = DNS starts failing → whole VPN looks broken.
     private val udpAssociateSemaphore = java.util.concurrent.Semaphore(64)
     private val creatingTunnels = java.util.concurrent.atomic.AtomicInteger(0)
+    @Volatile private var startedAt = 0L
+    @Volatile private var lastRetireAt = 0L
 
     // QUIC circuit breaker: after detecting N non-DNS UDP attempts within a window,
     // stop accepting UDP ASSOCIATE entirely for BLOCK_DURATION. This tells tun2socks
@@ -107,10 +114,12 @@ class XzapSocksProxy(
         serverSocket?.bind(InetSocketAddress("127.0.0.1", port))
         Log.i(TAG, "SOCKS5 on :$port → XZAP mux $serverHost:$serverPort (tunnels=$MAX_TUNNELS)")
 
+        startedAt = System.currentTimeMillis()
+
         // Warm mux tunnels in background
         executor?.submit { warmTunnels() }
 
-        // Proactive tunnel rotator — replaces tunnels before DPI kills them
+        // Proactive tunnel rotator (starts work only after warmup window)
         executor?.submit { rotatorLoop() }
 
         executor?.submit {
@@ -171,9 +180,9 @@ class XzapSocksProxy(
         }
     }
 
-    /** Pick least-loaded alive NON-RETIRING tunnel. */
+    /** Pick least-loaded alive NON-RETIRING tunnel. New streams never go to a
+     *  retiring tunnel so they don't get interrupted when it closes. */
     private fun pickTunnel(): XzapMuxTunnel? {
-        // Drop dead ones, count alive
         val iter = tunnels.iterator()
         var dead = 0
         while (iter.hasNext()) {
@@ -182,7 +191,6 @@ class XzapSocksProxy(
         }
         if (dead > 0) Log.w(TAG, "$dead tunnels died, replacing")
 
-        // Eager replacement: kick creation for every missing slot, up to MAX.
         val needed = MAX_TUNNELS - tunnels.size - creatingTunnels.get()
         for (i in 0 until maxOf(0, needed)) {
             val delay = if (i == 0) 0L else 3_000L * i + (Math.random() * 2_000L).toLong()
@@ -192,16 +200,16 @@ class XzapSocksProxy(
             }
         }
 
-        // Prefer non-retiring tunnels for new streams
+        // Prefer fresh (non-retiring) tunnels for new streams
         val fresh = tunnels.filter { it.isAlive && !it.retiring }
         var best: XzapMuxTunnel? = fresh.minByOrNull { it.streamCount }
         if (best != null) return best
 
-        // Everything is retiring? Fall back to any alive
+        // All retiring? Fall back to any alive (better than nothing)
         best = tunnels.firstOrNull { it.isAlive }
         if (best != null) return best
 
-        // Pool fully empty: wait up to 3s for background creation to finish
+        // Pool fully empty: wait up to 3s for background creation
         val deadline = System.currentTimeMillis() + 3_000L
         while (System.currentTimeMillis() < deadline) {
             best = tunnels.firstOrNull { it.isAlive }
@@ -209,7 +217,6 @@ class XzapSocksProxy(
             Thread.sleep(50)
         }
 
-        // Still empty: synchronous create as last resort
         synchronized(tunnelLock) {
             best = tunnels.firstOrNull { it.isAlive }
             if (best != null) return best
@@ -217,32 +224,42 @@ class XzapSocksProxy(
         }
     }
 
-    /** Proactive rotator: periodically retires tunnels that are about to be
-     *  DPI-killed, gives a fresh tunnel time to take over. */
+    /** Proactive rotator — replaces a tunnel before DPI kills it mid-stream.
+     *  Conservative: only retires when enough healthy replacements exist and
+     *  not during warmup. */
     private fun rotatorLoop() {
         while (running.get()) {
             try { Thread.sleep(ROTATOR_CHECK_INTERVAL_MS) } catch (_: InterruptedException) { return }
             try {
                 val now = System.currentTimeMillis()
-                val freshAlive = tunnels.count { it.isAlive && !it.retiring }
-                for (t in tunnels) {
-                    if (t.isAlive && !t.retiring && now - t.createdAt > TUNNEL_MAX_AGE_MS) {
-                        // Only retire if we have enough healthy replacements in flight/up
-                        val totalReplacements = freshAlive - 1 + creatingTunnels.get()
-                        if (totalReplacements >= MAX_TUNNELS - 1) {
-                            t.retiring = true
-                            Log.i(TAG, "retiring tunnel age=${(now - t.createdAt)/1000}s")
-                            // Close it after a short grace so in-flight streams can drain
-                            executor?.submit {
-                                Thread.sleep(3_000L)
-                                t.close()
-                            }
-                        } else {
-                            // Not enough replacements — kick creation
-                            executor?.submit { createTunnel() }
-                        }
-                        break  // retire at most 1 per cycle
+                // Warmup — don't touch anything until pool has stabilised
+                if (now - startedAt < ROTATOR_WARMUP_MS) continue
+                // Rate limit — at most 1 retire per interval
+                if (now - lastRetireAt < ROTATOR_MIN_RETIRE_GAP_MS) continue
+
+                val fresh = tunnels.filter { it.isAlive && !it.retiring }
+                // Need at least MIN_FRESH replacements that are already healthy
+                if (fresh.size < MIN_FRESH_FOR_RETIRE + 1) {
+                    // Not enough healthy tunnels — make sure replacements are in flight
+                    if (tunnels.size + creatingTunnels.get() < MAX_TUNNELS) {
+                        executor?.submit { createTunnel() }
                     }
+                    continue
+                }
+
+                // Find the OLDEST fresh tunnel and retire it if too old
+                val oldest = fresh.maxByOrNull { now - it.createdAt } ?: continue
+                if (now - oldest.createdAt < TUNNEL_MAX_AGE_MS) continue
+
+                oldest.retiring = true
+                lastRetireAt = now
+                Log.i(TAG, "retiring tunnel age=${(now - oldest.createdAt)/1000}s streams=${oldest.streamCount}")
+                // Kick creation of replacement immediately
+                executor?.submit { createTunnel() }
+                // Close retiring tunnel after grace — existing streams get time to drain
+                executor?.submit {
+                    Thread.sleep(TUNNEL_RETIRE_GRACE_MS)
+                    oldest.close()
                 }
             } catch (_: Exception) {}
         }

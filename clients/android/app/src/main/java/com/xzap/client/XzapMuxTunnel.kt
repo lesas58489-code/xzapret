@@ -87,7 +87,7 @@ class XzapMuxTunnel(
     @Volatile private var lastFrameAt = 0L   // any frame from server = tunnel is alive
     @Volatile var createdAt = 0L
         private set
-    @Volatile var retiring = false  // marked for graceful retirement (proactive rotation)
+    @Volatile var retiring = false  // marked for graceful retirement — no new streams
 
     val isAlive: Boolean get() = alive.get()
     val streamCount: Int get() = streams.size
@@ -126,6 +126,7 @@ class XzapMuxTunnel(
         val now = System.currentTimeMillis()
         lastPongAt = now
         lastFrameAt = now
+        createdAt = now
         createdAt = now
         readerThread = Thread({ readerLoop() }, "XzapMux-reader").also { it.start() }
         pingThread = Thread({ pingLoop() }, "XzapMux-ping").also { it.isDaemon = true; it.start() }
