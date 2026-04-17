@@ -188,6 +188,15 @@ class XzapMuxTunnel(
             streams.remove(sid)
             return null
         }
+
+        // Engage flow control on server side with a bootstrap WINDOW(0) frame.
+        // Without this, pure-upload streams deadlock at 256KB (client's initial
+        // send window) because server never learns the client supports FC.
+        try {
+            val zero = ByteArray(4)  // delta=0
+            sendMuxFrame(sid, CMD_WINDOW, zero)
+        } catch (_: Exception) {}
+
         return stream
     }
 

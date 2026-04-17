@@ -152,11 +152,12 @@ class MuxStream:
         await asyncio.gather(target_to_mux(), mux_to_target(), return_exceptions=True)
 
     def on_window_update(self, delta: int):
-        # First WINDOW frame from client = FC opt-in. Reset window to this delta.
+        # First WINDOW frame = FC opt-in. Keep the INITIAL_WINDOW and just
+        # *add* delta. Client sends bootstrap WINDOW(0) right after SYN_ACK
+        # to opt-in without changing the initial window.
         if not self._fc_enabled:
             self._fc_enabled = True
-            self._send_window = delta
-        elif delta > 0:
+        if delta > 0:
             self._send_window += delta
         self._window_event.set()
 
