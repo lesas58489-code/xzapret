@@ -35,6 +35,7 @@ dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
-    implementation(files("libs/tun2socks.aar"))  // VPN packet handling
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")  // MuxConnection WebSocket
+    // Single unified AAR from /core/go (via gomobile bind): contains
+    // forked tun2socks + XZAP core (uTLS, mux, SOCKS5). See build_xzapcore.sh.
+    implementation(files("libs/xzapcore.aar"))
 }

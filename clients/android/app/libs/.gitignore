@@ -1,0 +1,5 @@
+# xzapcore.aar is built locally via ../build_xzapcore.sh from /core/go.
+# It's ~37 MB (Go runtime + uTLS + tun2socks + XZAP core across 4 arches)
+# so we don't keep it in git. First-time checkouts must run the build
+# script before APK compilation.
+xzapcore.aar

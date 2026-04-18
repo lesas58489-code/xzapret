@@ -98,6 +98,7 @@ class MainActivity : AppCompatActivity() {
             putExtra(XzapVpnService.EXTRA_SERVER, etServer.text.toString().trim())
             putExtra(XzapVpnService.EXTRA_PORT, etPort.text.toString().trim().toIntOrNull() ?: 8443)
             putExtra(XzapVpnService.EXTRA_KEY, etKey.text.toString().trim())
+            putExtra(XzapVpnService.EXTRA_TLS_PROFILE, "chrome131")
         }
         startService(intent)
         connected = true
