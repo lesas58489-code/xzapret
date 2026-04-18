@@ -120,12 +120,14 @@ class XzapMuxTunnel(
             throw IOException("mux handshake: bad response $respStr")
         }
 
-        sock.soTimeout = 0  // disable timeout now, data phase
+        if (wsUrl == null) {
+            // Direct TLS: disable read timeout for the data phase
+            try { socket?.soTimeout = 0 } catch (_: Exception) {}
+        }
         alive.set(true)
         val now = System.currentTimeMillis()
         lastPongAt = now
         lastFrameAt = now
-        createdAt = now
         createdAt = now
         readerThread = Thread({ readerLoop() }, "XzapMux-reader").also { it.start() }
         pingThread = Thread({ pingLoop() }, "XzapMux-ping").also { it.isDaemon = true; it.start() }
