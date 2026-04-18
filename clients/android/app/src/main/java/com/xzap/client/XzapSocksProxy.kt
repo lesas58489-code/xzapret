@@ -141,6 +141,21 @@ class XzapSocksProxy(
         executor?.shutdownNow()
     }
 
+    /** Force-close all tunnels. Called by VpnService when network changes
+     *  (wake from Doze, WiFi ↔ LTE, new default route) so stale TCP sockets
+     *  don't stall browser requests. pickTunnel rebuilds the pool on demand. */
+    fun invalidateAllTunnels(reason: String) {
+        val snapshot = tunnels.toList()
+        if (snapshot.isEmpty()) return
+        Log.i(TAG, "invalidating ${snapshot.size} tunnels: $reason")
+        tunnels.clear()
+        for (t in snapshot) {
+            try { t.close() } catch (_: Exception) {}
+        }
+        // Kick fresh pool creation in background
+        executor?.submit { warmTunnels() }
+    }
+
     // ==================== Mux tunnel pool ====================
 
     private fun warmTunnels() {

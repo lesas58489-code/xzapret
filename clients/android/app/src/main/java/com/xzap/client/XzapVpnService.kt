@@ -85,6 +85,8 @@ class XzapVpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
     private var socksProxy: XzapSocksProxy? = null
     private val running = AtomicBoolean(false)
+    private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
+    @Volatile private var lastNetworkId: Long = 0
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -146,6 +148,7 @@ class XzapVpnService : VpnService() {
 
             setupVpn()
             startTun2Socks()
+            registerNetworkCallback()
 
             updateNotification("Connected to $server:$port")
             Log.i(TAG, "VPN ready (tun2socks + XZAP TLS)")
@@ -206,6 +209,7 @@ class XzapVpnService : VpnService() {
 
     private fun disconnect() {
         running.set(false)
+        unregisterNetworkCallback()
         try { engine.Engine.stop() } catch (_: Exception) {}
         socksProxy?.stop()
         vpnInterface?.close()
@@ -214,6 +218,57 @@ class XzapVpnService : VpnService() {
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         Log.i(TAG, "Disconnected")
+    }
+
+    /** Watch underlying network (WiFi/LTE) for changes. On any change —
+     *  wake from Doze, handoff between WiFi and cellular, loss/restore —
+     *  invalidate all mux tunnels. Their TCP state is almost certainly
+     *  stale after a network transition, and new streams would stall
+     *  until ping detected the break. */
+    private fun registerNetworkCallback() {
+        val cm = getSystemService(android.net.ConnectivityManager::class.java) ?: return
+        val request = android.net.NetworkRequest.Builder()
+            .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addTransportType(android.net.NetworkCapabilities.TRANSPORT_WIFI)
+            .addTransportType(android.net.NetworkCapabilities.TRANSPORT_CELLULAR)
+            .addTransportType(android.net.NetworkCapabilities.TRANSPORT_ETHERNET)
+            .build()
+        val cb = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) {
+                val nid = network.networkHandle
+                if (lastNetworkId != 0L && nid != lastNetworkId) {
+                    Log.i(TAG, "network changed (id $lastNetworkId → $nid) — invalidating tunnels")
+                    socksProxy?.invalidateAllTunnels("network changed")
+                    // Also update underlyingNetworks so VPN inherits fresh validated status
+                    try { setUnderlyingNetworks(arrayOf(network)) } catch (_: Exception) {}
+                }
+                lastNetworkId = nid
+            }
+            override fun onLost(network: android.net.Network) {
+                if (network.networkHandle == lastNetworkId) {
+                    Log.i(TAG, "network lost — invalidating tunnels")
+                    socksProxy?.invalidateAllTunnels("network lost")
+                }
+            }
+        }
+        try {
+            cm.registerNetworkCallback(request, cb)
+            networkCallback = cb
+            val active = cm.activeNetwork
+            if (active != null) lastNetworkId = active.networkHandle
+            Log.i(TAG, "network callback registered (active id=$lastNetworkId)")
+        } catch (e: Exception) {
+            Log.w(TAG, "network callback register failed: ${e.message}")
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val cb = networkCallback ?: return
+        try {
+            getSystemService(android.net.ConnectivityManager::class.java)?.unregisterNetworkCallback(cb)
+        } catch (_: Exception) {}
+        networkCallback = null
+        lastNetworkId = 0
     }
 
     override fun onDestroy() { disconnect(); super.onDestroy() }
