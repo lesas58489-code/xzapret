@@ -136,19 +136,27 @@ class XzapVpnService : VpnService() {
         )
 
         Thread {
-            // Detect transport mode: if `server` starts with wss:// it's a WebSocket
-            // URL (usually via Cloudflare) — use WebSocket transport. Otherwise
-            // treat `server` as a plain hostname/IP for direct TLS on `port`.
-            val isWs = server.startsWith("wss://", ignoreCase = true) ||
-                       server.startsWith("ws://", ignoreCase = true)
+            // Detect transport mode. Any URL-like input (contains "://") → WebSocket.
+            // Normalise http:// and https:// to wss:// — Android autocorrect can
+            // stealthily replace 'wss' with 'http' even with inputType=textUri,
+            // and we still want the user's intent to work.
+            val normalised = when {
+                server.startsWith("http://", true)  -> "ws://"  + server.removePrefix("http://")
+                server.startsWith("https://", true) -> "wss://" + server.removePrefix("https://")
+                else -> server
+            }
+            val isWs = normalised.startsWith("wss://", ignoreCase = true) ||
+                       normalised.startsWith("ws://", ignoreCase = true)
+            if (normalised != server) {
+                Log.i(TAG, "server url normalised: '$server' → '$normalised'")
+            }
             val effHost: String
             val effPort: Int
             val effWsUrl: String?
             if (isWs) {
-                // For WS mode, host and port used only for logging / setUnderlyingNetworks.
-                effWsUrl = server
-                effHost = try { java.net.URI(server).host ?: server } catch (_: Exception) { server }
-                effPort = try { java.net.URI(server).port.takeIf { it > 0 } ?: 443 } catch (_: Exception) { 443 }
+                effWsUrl = normalised
+                effHost = try { java.net.URI(normalised).host ?: normalised } catch (_: Exception) { normalised }
+                effPort = try { java.net.URI(normalised).port.takeIf { it > 0 } ?: 443 } catch (_: Exception) { 443 }
             } else {
                 effWsUrl = null
                 effHost = server

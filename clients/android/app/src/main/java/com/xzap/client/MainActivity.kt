@@ -45,7 +45,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requestVpn() {
-        val server = etServer.text.toString().trim()
+        var server = etServer.text.toString().trim()
+        // Android keyboard autocorrect sometimes replaces 'wss://' with 'http://'.
+        // Detect and undo before passing down.
+        if (server.startsWith("http://", ignoreCase = true)) {
+            server = "ws://" + server.removePrefix("http://")
+        } else if (server.startsWith("https://", ignoreCase = true)) {
+            server = "wss://" + server.removePrefix("https://")
+        }
+        etServer.setText(server)
         // Strip all whitespace from key (users often paste with trailing newline / spaces)
         val key = etKey.text.toString().replace(Regex("\\s"), "")
         if (server.isEmpty() || key.isEmpty()) {
