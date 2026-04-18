@@ -94,7 +94,7 @@ async def run_ws_server(host: str, port: int, key: bytes):
     from xzap.transport.ws import WSTransport
     crypto = XZAPCrypto(key=key)
     tunnel_handler = XZAPTunnelServer(crypto)
-    ws = WSTransport(host=host, port=port, path="/xzap")
+    ws = WSTransport(host=host, port=port, path="/ws")
     await ws.serve(tunnel_handler.handle)
     log.info("XZAP WS server ready on %s:%d/xzap", host, port)
     await ws.serve_forever()
