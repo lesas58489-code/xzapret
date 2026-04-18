@@ -45,13 +45,14 @@ class XzapSocksProxy(
         private const val QUIC_DROP_WINDOW_MS = 2_000L
         private const val QUIC_DROP_THRESHOLD = 3
         private const val QUIC_BLOCK_DURATION_MS = 30_000L
-        // Proactive rotation parameters
-        private const val ROTATOR_WARMUP_MS = 60_000L        // no rotation in first minute
-        private const val ROTATOR_CHECK_INTERVAL_MS = 10_000L
-        private const val ROTATOR_MIN_RETIRE_GAP_MS = 20_000L // at most 1 retire per 20s
-        private const val TUNNEL_MAX_AGE_MS = 45_000L         // proactive retire at this age
-        private const val TUNNEL_RETIRE_GRACE_MS = 15_000L    // let streams drain this long
-        private const val MIN_FRESH_FOR_RETIRE = 2            // need this many non-retiring alive
+        // Proactive rotation parameters — tuned for aggressive DPI networks where
+        // TLS flows get severed in 15-30s. Goal: retire tunnel before DPI kills it.
+        private const val ROTATOR_WARMUP_MS = 25_000L        // no rotation until pool is stable
+        private const val ROTATOR_CHECK_INTERVAL_MS = 3_000L
+        private const val ROTATOR_MIN_RETIRE_GAP_MS = 5_000L  // at most 1 retire per 5s
+        private const val TUNNEL_MAX_AGE_MS = 18_000L         // retire before DPI kills (~20-25s observed)
+        private const val TUNNEL_RETIRE_GRACE_MS = 5_000L     // short grace — drain quick requests
+        private const val MIN_FRESH_FOR_RETIRE = 2
 
         private val WHITE_DOMAINS = listOf(
             "www.cloudflare.com", "cloudflare.com",
@@ -162,12 +163,11 @@ class XzapSocksProxy(
         // First tunnel: synchronous, signals poolReady ASAP for VPN activation.
         createTunnel()
         // Remaining tunnels: staggered so they don't all die at the same DPI-clock
-        // tick. Mobile operator / DPI often RSTs long TLS flows on a timer; if all
-        // started together, all die together → brief service gap. With jitter,
-        // deaths spread → majority always alive.
+        // tick. With aggressive DPI networks killing flows in 15-30s, tighter
+        // stagger (2s gaps) so the pool is fully warm before rotator engages.
         val threads = (1 until MAX_TUNNELS).map { idx ->
             Thread {
-                Thread.sleep(5_000L * idx + (Math.random() * 2_000L).toLong())
+                Thread.sleep(2_000L * idx + (Math.random() * 1_000L).toLong())
                 createTunnel()
             }
         }
