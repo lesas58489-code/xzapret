@@ -38,20 +38,24 @@ class XzapSocksProxy(
     companion object {
         private const val TAG = "XzapSocks"
         private const val BUFFER_SIZE = 131072
-        private const val MAX_TUNNELS = 4               // +1 buffer for proactive rotation
+        private const val MAX_TUNNELS = 3
         private const val MAX_STREAMS_PER_TUNNEL = 100
         private const val TUNNEL_OPEN_TIMEOUT_MS = 10_000L
         private const val STREAM_OPEN_TIMEOUT_MS = 10_000L
         private const val QUIC_DROP_WINDOW_MS = 2_000L
         private const val QUIC_DROP_THRESHOLD = 3
         private const val QUIC_BLOCK_DURATION_MS = 30_000L
-        // Proactive rotation parameters — tuned for aggressive DPI networks where
-        // TLS flows get severed in 15-30s. Goal: retire tunnel before DPI kills it.
-        private const val ROTATOR_WARMUP_MS = 25_000L        // no rotation until pool is stable
-        private const val ROTATOR_CHECK_INTERVAL_MS = 3_000L
-        private const val ROTATOR_MIN_RETIRE_GAP_MS = 5_000L  // at most 1 retire per 5s
-        private const val TUNNEL_MAX_AGE_MS = 18_000L         // retire before DPI kills (~20-25s observed)
-        private const val TUNNEL_RETIRE_GRACE_MS = 5_000L     // short grace — drain quick requests
+        // Proactive rotation — balanced for both home-ISP DPI (kills TLS in 15-30s)
+        // and mobile carrier rate limits (bursts of TCP trigger RST). Too aggressive
+        // either way causes outages. Current sweet spot:
+        //   - tunnel lives 30s (reasonable vs DPI kill @20-30s, margin by fewer retries)
+        //   - retire max 1 per 15s (not bursty, mobile carrier-friendly)
+        //   - warmup slow (8s stagger between tunnels, not burst of 4)
+        private const val ROTATOR_WARMUP_MS = 40_000L
+        private const val ROTATOR_CHECK_INTERVAL_MS = 5_000L
+        private const val ROTATOR_MIN_RETIRE_GAP_MS = 15_000L
+        private const val TUNNEL_MAX_AGE_MS = 30_000L
+        private const val TUNNEL_RETIRE_GRACE_MS = 8_000L
         private const val MIN_FRESH_FOR_RETIRE = 2
 
         private val WHITE_DOMAINS = listOf(
@@ -162,17 +166,18 @@ class XzapSocksProxy(
     private fun warmTunnels() {
         // First tunnel: synchronous, signals poolReady ASAP for VPN activation.
         createTunnel()
-        // Remaining tunnels: staggered so they don't all die at the same DPI-clock
-        // tick. With aggressive DPI networks killing flows in 15-30s, tighter
-        // stagger (2s gaps) so the pool is fully warm before rotator engages.
+        // Remaining tunnels: wide stagger (8s gap + jitter). Mobile carriers
+        // rate-limit bursts of TCP to the same dst — 4 parallel SYNs in one
+        // second get RSTed as "probable attack". Spread over ~25s the
+        // connections look organic.
         val threads = (1 until MAX_TUNNELS).map { idx ->
             Thread {
-                Thread.sleep(2_000L * idx + (Math.random() * 1_000L).toLong())
+                Thread.sleep(8_000L * idx + (Math.random() * 2_000L).toLong())
                 createTunnel()
             }
         }
         threads.forEach { it.start() }
-        Log.i(TAG, "Mux pool: first ready, ${threads.size} more staggered")
+        Log.i(TAG, "Mux pool: first ready, ${threads.size} more staggered over ~${8*threads.size}s")
     }
 
     private fun createTunnel(): XzapMuxTunnel? {
