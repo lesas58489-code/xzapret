@@ -26,6 +26,25 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Install uncaught exception handler so native/unknown crashes leave a trace
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            android.util.Log.e("XZAP-CRASH", "thread=${t.name} unhandled", e)
+            try {
+                android.widget.Toast.makeText(applicationContext,
+                    "Crash: ${e.javaClass.simpleName}: ${e.message}",
+                    android.widget.Toast.LENGTH_LONG).show()
+            } catch (_: Throwable) {}
+        }
+        android.util.Log.i("XZAP-BOOT", "MainActivity onCreate start")
+        try {
+            mobile.Mobile.touch()
+            android.util.Log.i("XZAP-BOOT", "Mobile.touch OK (native lib loaded)")
+        } catch (t: Throwable) {
+            android.util.Log.e("XZAP-BOOT", "Mobile.touch failed", t)
+            android.widget.Toast.makeText(this,
+                "Mobile.touch failed: ${t.javaClass.simpleName}: ${t.message}",
+                android.widget.Toast.LENGTH_LONG).show()
+        }
         setContentView(R.layout.activity_main)
 
         etServer = findViewById(R.id.et_server)
