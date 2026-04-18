@@ -231,20 +231,23 @@ class MuxServerSession:
 
     async def _process_mux_frame(self, data: bytes):
         if len(data) < MUX_HDR_SIZE:
+            log.warning("mux: frame too small (%d bytes)", len(data))
             return
         stream_id, cmd, plen = unpack_header(data[:MUX_HDR_SIZE])
         if plen > MAX_PAYLOAD:
+            log.warning("mux: payload too large (%d bytes)", plen)
             return
         payload = data[MUX_HDR_SIZE:MUX_HDR_SIZE + plen]
+        log.debug("mux rx: sid=%d cmd=0x%02x plen=%d", stream_id, cmd, plen)
 
         # Control stream (id=0): ping/pong — keepalive heartbeat
         if stream_id == CONTROL_STREAM_ID:
             if cmd == CMD_PING:
                 try:
                     await self.send_frame(CONTROL_STREAM_ID, CMD_PONG, b"")
-                except Exception:
-                    pass
-            # PONG ignored on server (client is the pinger in our design)
+                    log.debug("mux tx: PONG sent")
+                except Exception as e:
+                    log.warning("mux: PONG send failed: %s", e)
             return
 
         if cmd == CMD_SYN:

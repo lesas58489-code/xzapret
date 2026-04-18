@@ -70,7 +70,12 @@ func Start(configJSON string) string {
 		cfg.MTU = 1500
 	}
 	if cfg.LogLevel == "" {
-		cfg.LogLevel = "warning"
+		cfg.LogLevel = "warn"
+	}
+	// Normalise tun2socks log level names (it expects warn/info/debug/error, not 'warning')
+	switch cfg.LogLevel {
+	case "warning":
+		cfg.LogLevel = "warn"
 	}
 
 	c, err := xzapcore.NewClient(xzapcore.ClientConfig{

@@ -134,7 +134,7 @@ class XzapVpnService : VpnService() {
                 put("socks_port", SOCKS_PORT)
                 put("tun_fd", fd)
                 put("mtu", 1500)
-                put("log_level", "warning")
+                put("log_level", "warn")
                 if (isWs) {
                     put("transport", "ws")
                     put("ws_url", normalised)
