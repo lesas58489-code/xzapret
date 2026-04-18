@@ -35,7 +35,7 @@ class MainActivity : AppCompatActivity() {
         tvStatus = findViewById(R.id.tv_status)
 
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
-        etServer.setText(prefs.getString("server", "151.244.111.186"))
+        etServer.setText(prefs.getString("server", "wss://solar-cloud.xyz/ws"))
         etPort.setText(prefs.getString("port", "8443"))
         etKey.setText(prefs.getString("key", ""))
 

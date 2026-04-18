@@ -22,8 +22,9 @@
             android:id="@+id/et_server"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:inputType="text"
-            android:text="151.244.111.186"
+            android:inputType="textUri|textNoSuggestions"
+            android:autofillHints="no"
+            android:importantForAutofill="no"
             android:singleLine="true" />
     </com.google.android.material.textfield.TextInputLayout>
 
