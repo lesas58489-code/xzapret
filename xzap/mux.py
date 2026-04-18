@@ -271,14 +271,19 @@ class MuxServerSession:
             await self.send_frame(stream_id, CMD_RST, b"bad syn")
             return
 
+        # Run connect_target as a background task so the mux frame reader loop
+        # is not blocked on slow/hung target connects. Other streams' SYN, DATA,
+        # PING all keep flowing while this one waits for its upstream.
+        asyncio.create_task(self._open_stream_async(stream_id, host, port))
+
+    async def _open_stream_async(self, stream_id: int, host: str, port: int):
         stream = MuxStream(stream_id, self)
         if not await stream.connect_target(host, port):
             await self.send_frame(stream_id, CMD_RST, b"connect failed")
             return
-
         self.streams[stream_id] = stream
         await self.send_frame(stream_id, CMD_SYN_ACK)
-        asyncio.create_task(stream.run())
+        await stream.run()
 
 
 # These need to match tunnel.py's _send_frame/_recv_frame. We import them
