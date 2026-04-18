@@ -56,8 +56,8 @@ class XzapMuxTunnel(
         private const val CMD_PONG = 0x07
         private const val CMD_WINDOW = 0x08  // flow control update
         private const val MUX_HDR = 9
-        private const val PING_INTERVAL_MS = 5_000L
-        private const val PING_TIMEOUT_MS = 10_000L   // loose timeout — any server frame counts as liveness
+        private const val PING_INTERVAL_MS = 10_000L
+        private const val PING_TIMEOUT_MS = 30_000L   // forgiving: CF free plan sometimes batches WS frames with seconds of delay
         private const val CONTROL_STREAM_ID = 0
         private const val STREAM_RECV_WINDOW = 256 * 1024  // per-stream inbound buffer cap
         private const val PREFIX_SIZE = 16
