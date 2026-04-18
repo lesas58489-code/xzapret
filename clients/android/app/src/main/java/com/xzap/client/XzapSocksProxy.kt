@@ -184,12 +184,12 @@ class XzapSocksProxy(
         if (!running.get()) return null
         creatingTunnels.incrementAndGet()
         try {
-            // Retry with backoff. Mobile carriers (Megafon observed) rate-limit
-            // bursts of TCP to the same destination, returning RST / ECONNREFUSED
-            // for some SYNs. Later SYNs usually pass. 3 attempts with randomised
-            // backoff (5-15s) typically gets at least one through.
+            // Retry with short backoff for transient failures. Heavy carrier
+            // blocks (every SYN RSTed) won't be fixed by retries — user needs
+            // a different port/IP. Keep backoff small so WiFi (where first
+            // attempt usually succeeds) doesn't wait excessively.
             var delay = 0L
-            repeat(3) { attempt ->
+            repeat(2) { attempt ->
                 if (!running.get()) return null
                 if (delay > 0) {
                     try { Thread.sleep(delay) } catch (_: InterruptedException) { return null }
@@ -200,12 +200,10 @@ class XzapSocksProxy(
                     t.connect()
                     tunnels.offer(t)
                     if (!poolSignaled.getAndSet(true)) poolReadyLatch.countDown()
-                    return t  // success
+                    return t
                 } catch (e: Exception) {
-                    Log.w(TAG, "tunnel create failed (attempt ${attempt+1}/3): ${e.message}")
-                    // Randomised backoff: 5-10s, 10-15s. Randomisation avoids
-                    // retry storms across multiple tunnels fighting for carrier slots.
-                    delay = (5_000L * (attempt + 1)) + (Math.random() * 5_000L).toLong()
+                    Log.w(TAG, "tunnel create failed (attempt ${attempt+1}/2): ${e.message}")
+                    delay = 2_000L + (Math.random() * 3_000L).toLong()  // 2-5s
                 }
             }
             return null
