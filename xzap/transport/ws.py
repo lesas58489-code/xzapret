@@ -111,17 +111,24 @@ class WSTransport:
 
         async def _ws_handler(websocket):
             peer = websocket.remote_address
-            # Проверяем путь
             if hasattr(websocket, 'path') and websocket.path != self.path:
                 log.warning("Wrong path %s from %s", websocket.path, peer)
                 await websocket.close(1008, "Wrong path")
                 return
             log.info("WS connection from %s", peer)
-            conn = _WSServerConn(websocket)
+            # XZAPTunnelServer.handle expects (reader, writer) with readexactly/write.
+            # Adapt WebSocket message-based API to stream-based API: each WS binary
+            # message contains one complete XZAP frame, which we buffer and serve
+            # byte-wise to readexactly().
+            reader = _WSStreamReader(websocket)
+            writer = _WSStreamWriter(websocket)
             try:
-                await handler(conn)
+                await handler(reader, writer)
             except Exception as e:
-                log.debug("WS handler error from %s: %s", peer, e)
+                log.warning("WS handler error from %s: %s", peer, e)
+            finally:
+                try: await websocket.close()
+                except Exception: pass
 
         self._server = await websockets.server.serve(
             _ws_handler,
@@ -157,6 +164,64 @@ class _WSServerConn:
 
     async def close(self):
         await self._ws.close()
+
+
+class _WSStreamReader:
+    """StreamReader-like adapter over WebSocket for tunnel.handle() compat.
+    Each WS binary message is one complete XZAP frame; we buffer bytes and
+    serve readexactly() requests byte-by-byte from the buffer."""
+    def __init__(self, ws):
+        self._ws = ws
+        self._buf = bytearray()
+
+    async def readexactly(self, n: int) -> bytes:
+        while len(self._buf) < n:
+            try:
+                msg = await self._ws.recv()
+            except Exception:
+                raise asyncio.IncompleteReadError(bytes(self._buf), n)
+            if isinstance(msg, str):
+                msg = msg.encode()
+            self._buf.extend(msg)
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
+
+
+class _WSStreamWriter:
+    """StreamWriter-like adapter over WebSocket. Each write() is sent as one
+    WS binary message (matching the client's frame boundary)."""
+    def __init__(self, ws):
+        self._ws = ws
+        self._pending: bytes = b""
+
+    def write(self, data: bytes):
+        # tunnel._send_frame prepends 4B length header then payload; it does
+        # two writes or a single write of the complete frame. Accumulate and
+        # flush on drain(). In practice _send_frame writes the full frame in
+        # one call via struct.pack+bytes, so this usually sends immediately.
+        self._pending += data
+
+    async def drain(self):
+        if self._pending:
+            p = self._pending
+            self._pending = b""
+            await self._ws.send(p)
+
+    def close(self):
+        # Closed by finally block in _ws_handler
+        pass
+
+    async def wait_closed(self):
+        pass
+
+    def get_extra_info(self, name, default=None):
+        if name == "peername":
+            try: return self._ws.remote_address
+            except Exception: return default
+        if name == "socket":
+            return None
+        return default
 
 
 def build_ws_urls(server_host: str, server_port: int,

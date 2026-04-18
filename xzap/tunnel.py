@@ -184,7 +184,13 @@ class XZAPTunnelServer:
             import socket as _socket
             sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
 
-        reader, writer = wrap_connection(raw_reader, raw_writer)
+        # For WS transport the reader/writer already preserve message boundaries;
+        # fragmentation wrapper would corrupt the framing (client sends raw XZAP
+        # frames without fragmentation layer). Detect by duck-typing.
+        if hasattr(raw_reader, '_ws'):
+            reader, writer = raw_reader, raw_writer
+        else:
+            reader, writer = wrap_connection(raw_reader, raw_writer)
         target_w = None
         username = None
 
