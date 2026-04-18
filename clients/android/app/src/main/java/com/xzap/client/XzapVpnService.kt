@@ -136,7 +136,25 @@ class XzapVpnService : VpnService() {
         )
 
         Thread {
-            socksProxy = XzapSocksProxy(server, port, key, running, bypass)
+            // Detect transport mode: if `server` starts with wss:// it's a WebSocket
+            // URL (usually via Cloudflare) — use WebSocket transport. Otherwise
+            // treat `server` as a plain hostname/IP for direct TLS on `port`.
+            val isWs = server.startsWith("wss://", ignoreCase = true) ||
+                       server.startsWith("ws://", ignoreCase = true)
+            val effHost: String
+            val effPort: Int
+            val effWsUrl: String?
+            if (isWs) {
+                // For WS mode, host and port used only for logging / setUnderlyingNetworks.
+                effWsUrl = server
+                effHost = try { java.net.URI(server).host ?: server } catch (_: Exception) { server }
+                effPort = try { java.net.URI(server).port.takeIf { it > 0 } ?: 443 } catch (_: Exception) { 443 }
+            } else {
+                effWsUrl = null
+                effHost = server
+                effPort = port
+            }
+            socksProxy = XzapSocksProxy(effHost, effPort, key, running, bypass, effWsUrl)
             socksProxy!!.start(SOCKS_PORT)
 
             // Wait until at least one pool connection is ready (up to 8s).

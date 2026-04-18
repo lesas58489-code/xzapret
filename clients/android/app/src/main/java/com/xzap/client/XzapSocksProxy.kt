@@ -34,6 +34,7 @@ class XzapSocksProxy(
     private val key: ByteArray,
     private val running: AtomicBoolean,
     private val bypassDomains: Set<String> = emptySet(),
+    private val wsUrl: String? = null,  // if set, use WebSocket transport (Cloudflare proxy)
 ) {
     companion object {
         private const val TAG = "XzapSocks"
@@ -195,7 +196,7 @@ class XzapSocksProxy(
                     try { Thread.sleep(delay) } catch (_: InterruptedException) { return null }
                 }
                 val sni = WHITE_DOMAINS[random.nextInt(WHITE_DOMAINS.size)]
-                val t = XzapMuxTunnel(serverHost, serverPort, key, sslFactory, sni)
+                val t = XzapMuxTunnel(serverHost, serverPort, key, sslFactory, sni, wsUrl)
                 try {
                     t.connect()
                     tunnels.offer(t)

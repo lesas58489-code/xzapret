@@ -42,6 +42,7 @@ class XzapMuxTunnel(
     private val key: ByteArray,
     private val sslFactory: SSLSocketFactory,
     private val sni: String,
+    private val wsUrl: String? = null,  // if set, use WebSocket transport (Cloudflare proxy); otherwise direct TLS
 ) {
     companion object {
         private const val TAG = "XzapMux"
@@ -77,6 +78,14 @@ class XzapMuxTunnel(
     private var sockIn: InputStream? = null
     private val writeLock = Object()
 
+    // WebSocket transport (Cloudflare proxy mode)
+    private var webSocket: okhttp3.WebSocket? = null
+    private var wsClient: okhttp3.OkHttpClient? = null
+    private val wsIncoming = LinkedBlockingQueue<ByteArray>()
+    private val wsHandshakeLatch = java.util.concurrent.CountDownLatch(1)
+    @Volatile private var wsHandshakeOk = false
+    private val wsClosedSentinel = ByteArray(0)
+
     private val streams = ConcurrentHashMap<Int, MuxStream>()
     private val nextStreamId = AtomicInteger(1)  // 0 reserved for control
     private val alive = AtomicBoolean(false)
@@ -92,30 +101,13 @@ class XzapMuxTunnel(
     val isAlive: Boolean get() = alive.get()
     val streamCount: Int get() = streams.size
 
-    /** Establish TLS + XZAP mux version handshake. Throws on failure. */
+    /** Establish transport + XZAP mux version handshake. Throws on failure. */
     fun connect() {
-        // Force IPv4: on some mobile carriers (e.g. Megafon RU) the Java dual-stack
-        // resolver picks IPv6 for outgoing connections, but the carrier has no IPv6
-        // route to IPv4 destinations like our server → ENETUNREACH from /::. By
-        // resolving to an Inet4Address explicitly and opening a plain Socket first
-        // (then wrapping with SSL), we avoid the dual-stack ambiguity.
-        val ipv4 = resolveIPv4(serverHost) ?: throw java.net.UnknownHostException("no IPv4 for $serverHost")
-        val plain = Socket()
-        plain.tcpNoDelay = true
-        plain.keepAlive = true
-        plain.connect(InetSocketAddress(ipv4, serverPort), 10_000)
-        val sock = sslFactory.createSocket(plain, serverHost, serverPort, true) as SSLSocket
-        sock.sslParameters = sock.sslParameters.apply {
-            serverNames = listOf(javax.net.ssl.SNIHostName(sni))
+        if (wsUrl != null) {
+            connectWebSocket()
+        } else {
+            connectTls()
         }
-        sock.startHandshake()
-        sock.soTimeout = 10_000
-        // Aggressive keepalive for mobile NAT (default linux is 2h idle — useless).
-        trySetKeepAliveParams(sock, idleSec = 30, intervalSec = 10, count = 3)
-
-        socket = sock
-        sockOut = sock.getOutputStream()
-        sockIn = java.io.BufferedInputStream(sock.getInputStream(), 131072)
 
         // Version handshake — send bare {"v":"mux1"} (matches server's detection path)
         val versionPayload = """{"v":"mux1"}""".toByteArray()
@@ -138,6 +130,77 @@ class XzapMuxTunnel(
         readerThread = Thread({ readerLoop() }, "XzapMux-reader").also { it.start() }
         pingThread = Thread({ pingLoop() }, "XzapMux-ping").also { it.isDaemon = true; it.start() }
         Log.i(TAG, "mux tunnel established → $serverHost:$serverPort")
+    }
+
+    private fun connectTls() {
+        // Force IPv4: on some mobile carriers (e.g. Megafon RU) the Java dual-stack
+        // resolver picks IPv6 for outgoing connections, but the carrier has no IPv6
+        // route to IPv4 destinations like our server → ENETUNREACH from /::.
+        val ipv4 = resolveIPv4(serverHost) ?: throw java.net.UnknownHostException("no IPv4 for $serverHost")
+        val plain = Socket()
+        plain.tcpNoDelay = true
+        plain.keepAlive = true
+        plain.connect(InetSocketAddress(ipv4, serverPort), 10_000)
+        val sock = sslFactory.createSocket(plain, serverHost, serverPort, true) as SSLSocket
+        sock.sslParameters = sock.sslParameters.apply {
+            serverNames = listOf(javax.net.ssl.SNIHostName(sni))
+        }
+        sock.startHandshake()
+        sock.soTimeout = 10_000
+        trySetKeepAliveParams(sock, idleSec = 30, intervalSec = 10, count = 3)
+
+        socket = sock
+        sockOut = sock.getOutputStream()
+        sockIn = java.io.BufferedInputStream(sock.getInputStream(), 131072)
+    }
+
+    private fun connectWebSocket() {
+        // Connect to wss://<host>/path through Cloudflare — carrier can't block
+        // because Cloudflare IPs serve half the internet. App layer still does
+        // its own AES-GCM on top of WSS: wire path is {client} →(WSS to CF)→
+        // (CF to origin :2053 with CF-origin TLS)→ nginx → localhost WS server.
+        val url = wsUrl!!
+        val client = okhttp3.OkHttpClient.Builder()
+            .pingInterval(25, java.util.concurrent.TimeUnit.SECONDS)  // CF idle timeout ~100s
+            .readTimeout(0, java.util.concurrent.TimeUnit.SECONDS)    // no read timeout (long-lived)
+            .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+        val request = okhttp3.Request.Builder().url(url).build()
+
+        val listener = object : okhttp3.WebSocketListener() {
+            override fun onOpen(ws: okhttp3.WebSocket, response: okhttp3.Response) {
+                wsHandshakeOk = true
+                wsHandshakeLatch.countDown()
+            }
+            override fun onMessage(ws: okhttp3.WebSocket, bytes: okio.ByteString) {
+                wsIncoming.offer(bytes.toByteArray())
+            }
+            override fun onMessage(ws: okhttp3.WebSocket, text: String) { /* unused */ }
+            override fun onClosing(ws: okhttp3.WebSocket, code: Int, reason: String) {
+                ws.close(code, null)
+                wsIncoming.offer(wsClosedSentinel)
+            }
+            override fun onClosed(ws: okhttp3.WebSocket, code: Int, reason: String) {
+                wsIncoming.offer(wsClosedSentinel)
+            }
+            override fun onFailure(ws: okhttp3.WebSocket, t: Throwable, response: okhttp3.Response?) {
+                Log.w(TAG, "ws failure: ${t.message}")
+                wsIncoming.offer(wsClosedSentinel)
+                wsHandshakeLatch.countDown()  // unblock awaiter even on failure
+            }
+        }
+
+        wsClient = client
+        webSocket = client.newWebSocket(request, listener)
+
+        // Wait for handshake or failure
+        if (!wsHandshakeLatch.await(10, java.util.concurrent.TimeUnit.SECONDS)) {
+            webSocket?.cancel()
+            throw IOException("WS handshake timeout")
+        }
+        if (!wsHandshakeOk) {
+            throw IOException("WS handshake failed")
+        }
     }
 
     private fun resolveIPv4(host: String): java.net.InetAddress? {
@@ -204,6 +267,9 @@ class XzapMuxTunnel(
     private fun forceClose() {
         alive.set(false)
         try { socket?.close() } catch (_: Exception) {}
+        try { webSocket?.cancel() } catch (_: Exception) {}
+        try { wsClient?.dispatcher?.executorService?.shutdown() } catch (_: Exception) {}
+        wsIncoming.offer(wsClosedSentinel)  // unblock any blocking take()
     }
 
     /** Open a new logical stream to host:port. Returns null on failure. */
@@ -242,6 +308,9 @@ class XzapMuxTunnel(
     fun close() {
         alive.set(false)
         try { socket?.close() } catch (_: Exception) {}
+        try { webSocket?.close(1000, null) } catch (_: Exception) {}
+        try { wsClient?.dispatcher?.executorService?.shutdown() } catch (_: Exception) {}
+        wsIncoming.offer(wsClosedSentinel)
         for (s in streams.values) s.onClosed()
         streams.clear()
     }
@@ -321,6 +390,15 @@ class XzapMuxTunnel(
         System.arraycopy(prefix, 0, xzapFrame, 4, PREFIX_SIZE)
         System.arraycopy(encrypted, 0, xzapFrame, 4 + PREFIX_SIZE, encrypted.size)
 
+        if (wsUrl != null) {
+            // WebSocket: send the whole frame as one binary message — no fragmentation
+            // needed (TLS between us/Cloudflare already hides content from DPI).
+            val ws = webSocket ?: throw IOException("ws not connected")
+            val ok = ws.send(okio.ByteString.of(*xzapFrame))
+            if (!ok) throw IOException("ws send failed (queue full or closed)")
+            return
+        }
+
         val out = sockOut ?: throw IOException("no socket")
         synchronized(writeLock) {
             if (xzapFrame.size <= FRAG_THRESHOLD) writeMicroFrag(out, xzapFrame)
@@ -356,6 +434,18 @@ class XzapMuxTunnel(
     private var rxLeftover: ByteArray? = null
 
     private fun recvXzapFrame(): ByteArray? {
+        if (wsUrl != null) {
+            // WebSocket: one binary message = one XZAP frame.
+            val msg = try { wsIncoming.take() } catch (_: InterruptedException) { return null }
+            if (msg === wsClosedSentinel || msg.isEmpty()) return null
+            if (msg.size < 4 + PREFIX_SIZE) return null
+            val xzapLen = getInt(msg, 0)
+            if (xzapLen != msg.size - 4) return null  // malformed
+            val encPart = ByteArray(xzapLen - PREFIX_SIZE)
+            System.arraycopy(msg, 4 + PREFIX_SIZE, encPart, 0, encPart.size)
+            return decrypt(encPart)
+        }
+
         val inp = sockIn ?: return null
         rxLeftover?.let { rxAcc.write(it); rxLeftover = null }
         while (true) {
