@@ -43,6 +43,7 @@ class XzapMuxTunnel(
     private val sslFactory: SSLSocketFactory,
     private val sni: String,
     private val wsUrl: String? = null,  // if set, use WebSocket transport (Cloudflare proxy); otherwise direct TLS
+    private val socketProtector: ((java.net.Socket) -> Boolean)? = null,  // VpnService.protect to keep tunnel sockets off the TUN
 ) {
     companion object {
         private const val TAG = "XzapMux"
@@ -142,6 +143,8 @@ class XzapMuxTunnel(
         val plain = Socket()
         plain.tcpNoDelay = true
         plain.keepAlive = true
+        // Protect tunnel socket — keep it off the VPN's TUN, else we loop.
+        socketProtector?.invoke(plain)
         plain.connect(InetSocketAddress(ipv4, serverPort), 10_000)
         val sock = sslFactory.createSocket(plain, serverHost, serverPort, true) as SSLSocket
         sock.sslParameters = sock.sslParameters.apply {
@@ -162,11 +165,30 @@ class XzapMuxTunnel(
         // its own AES-GCM on top of WSS: wire path is {client} →(WSS to CF)→
         // (CF to origin :2053 with CF-origin TLS)→ nginx → localhost WS server.
         val url = wsUrl!!
-        val client = okhttp3.OkHttpClient.Builder()
-            .pingInterval(25, java.util.concurrent.TimeUnit.SECONDS)  // CF idle timeout ~100s
-            .readTimeout(0, java.util.concurrent.TimeUnit.SECONDS)    // no read timeout (long-lived)
+        val builder = okhttp3.OkHttpClient.Builder()
+            .pingInterval(25, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(0, java.util.concurrent.TimeUnit.SECONDS)
             .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
-            .build()
+        // Protect each socket OkHttp creates — keeps WS traffic off the VPN TUN
+        // (otherwise the VPN routes its own control traffic through itself = loop).
+        socketProtector?.let { protector ->
+            builder.socketFactory(object : javax.net.SocketFactory() {
+                override fun createSocket(): Socket = Socket().also { protector.invoke(it) }
+                override fun createSocket(host: String, port: Int): Socket {
+                    val s = Socket(); protector.invoke(s); s.connect(InetSocketAddress(host, port)); return s
+                }
+                override fun createSocket(host: String, port: Int, localHost: java.net.InetAddress, localPort: Int): Socket {
+                    val s = Socket(); protector.invoke(s); s.bind(InetSocketAddress(localHost, localPort)); s.connect(InetSocketAddress(host, port)); return s
+                }
+                override fun createSocket(host: java.net.InetAddress, port: Int): Socket {
+                    val s = Socket(); protector.invoke(s); s.connect(InetSocketAddress(host, port)); return s
+                }
+                override fun createSocket(address: java.net.InetAddress, port: Int, localAddress: java.net.InetAddress, localPort: Int): Socket {
+                    val s = Socket(); protector.invoke(s); s.bind(InetSocketAddress(localAddress, localPort)); s.connect(InetSocketAddress(address, port)); return s
+                }
+            })
+        }
+        val client = builder.build()
         val request = okhttp3.Request.Builder().url(url).build()
 
         val listener = object : okhttp3.WebSocketListener() {

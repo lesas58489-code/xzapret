@@ -162,7 +162,11 @@ class XzapVpnService : VpnService() {
                 effHost = server
                 effPort = port
             }
-            socksProxy = XzapSocksProxy(effHost, effPort, key, running, bypass, effWsUrl)
+            // Protector: VpnService.protect keeps tunnel sockets off the VPN TUN.
+            // Without this, connections from XZAP → solar-cloud.xyz would recurse
+            // back through our own tun2socks → SOCKS5 → mux → …infinite loop.
+            val protector: (java.net.Socket) -> Boolean = { sock -> protect(sock) }
+            socksProxy = XzapSocksProxy(effHost, effPort, key, running, bypass, effWsUrl, protector)
             socksProxy!!.start(SOCKS_PORT)
 
             // Wait until at least one pool connection is ready (up to 8s).
@@ -262,18 +266,21 @@ class XzapVpnService : VpnService() {
         val cb = object : android.net.ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: android.net.Network) {
                 val nid = network.networkHandle
+                // Only update setUnderlyingNetworks — do NOT invalidate tunnels here.
+                // When VPN comes up Android fires onAvailable/onLost for the physical
+                // network as default-route changes. Invalidating tunnels in those
+                // events kills the pool that just finished warming. Ping-based
+                // liveness detection already handles real network death.
                 if (lastNetworkId != 0L && nid != lastNetworkId) {
-                    Log.i(TAG, "network changed (id $lastNetworkId → $nid) — invalidating tunnels")
-                    socksProxy?.invalidateAllTunnels("network changed")
-                    // Also update underlyingNetworks so VPN inherits fresh validated status
+                    Log.i(TAG, "network changed (id $lastNetworkId → $nid) — updating underlying only")
                     try { setUnderlyingNetworks(arrayOf(network)) } catch (_: Exception) {}
                 }
                 lastNetworkId = nid
             }
             override fun onLost(network: android.net.Network) {
+                // Log only — let ping detection decide if tunnels actually died.
                 if (network.networkHandle == lastNetworkId) {
-                    Log.i(TAG, "network lost — invalidating tunnels")
-                    socksProxy?.invalidateAllTunnels("network lost")
+                    Log.i(TAG, "network lost event — ignoring (ping detection handles real death)")
                 }
             }
         }
