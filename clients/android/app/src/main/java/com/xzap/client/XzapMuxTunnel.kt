@@ -150,13 +150,24 @@ class XzapMuxTunnel(
 
     private fun pingLoop() {
         while (alive.get()) {
+            val beforeSleep = System.currentTimeMillis()
             try { Thread.sleep(PING_INTERVAL_MS) } catch (_: InterruptedException) { break }
             if (!alive.get()) break
             val now = System.currentTimeMillis()
+            val sleptFor = now - beforeSleep
+
+            // Doze/suspend detection: if Thread.sleep was frozen significantly
+            // longer than requested, the device was asleep. TCP connections
+            // have almost certainly been killed by NAT/carrier during doze.
+            // Kill this tunnel proactively — pickTunnel will spawn a fresh one.
+            if (sleptFor > PING_INTERVAL_MS * 3) {
+                Log.w(TAG, "suspend detected (slept ${sleptFor}ms, expected ${PING_INTERVAL_MS}ms) → tunnel invalidated")
+                forceClose()
+                return
+            }
+
             // Dead-peer detection: tunnel is considered dead only if NO frames
-            // of any kind arrived from server within PING_TIMEOUT. This tolerates
-            // CPU spikes / bursty traffic where a PONG gets delayed but data is
-            // still flowing, while still catching true disconnections.
+            // of any kind arrived from server within PING_TIMEOUT.
             if (now - lastFrameAt > PING_TIMEOUT_MS && lastPingAt > lastFrameAt) {
                 Log.w(TAG, "ping timeout → tunnel dead (${now - lastFrameAt}ms silent)")
                 forceClose()
