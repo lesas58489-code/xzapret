@@ -6,6 +6,7 @@ package transport
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -14,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	utls "github.com/refraction-networking/utls"
 	"nhooyr.io/websocket"
 )
 
@@ -49,20 +49,26 @@ func DialWS(ctx context.Context, rawURL string) (net.Conn, error) {
 		return nil, err
 	}
 
+	// Plain TLS (not uTLS) for WS transport: CF already hides our origin IP,
+	// so DPI sees only CF IPs and fingerprinting of our TLS is irrelevant.
+	// Crucially: force ALPN http/1.1 so WebSocket handshake works. With h2
+	// CF responds with HTTP/2 frames and the nhooyr parser fails as
+	// 'malformed HTTP response'.
 	var tlsConn io.ReadWriteCloser = raw
 	if u.Scheme == "wss" {
-		uconn := utls.UClient(raw, &utls.Config{
+		tc := tls.Client(raw, &tls.Config{
 			ServerName:         host,
-			InsecureSkipVerify: true,
+			InsecureSkipVerify: false,
 			NextProtos:         []string{"http/1.1"},
-		}, utls.HelloChrome_131)
-		_ = uconn.SetDeadline(time.Now().Add(10 * time.Second))
-		if err := uconn.Handshake(); err != nil {
+			MinVersion:         tls.VersionTLS12,
+		})
+		_ = tc.SetDeadline(time.Now().Add(10 * time.Second))
+		if err := tc.Handshake(); err != nil {
 			raw.Close()
-			return nil, fmt.Errorf("ws: uTLS handshake: %w", err)
+			return nil, fmt.Errorf("ws: TLS handshake: %w", err)
 		}
-		_ = uconn.SetDeadline(time.Time{})
-		tlsConn = uconn
+		_ = tc.SetDeadline(time.Time{})
+		tlsConn = tc
 	}
 
 	// Now run WebSocket handshake over tlsConn.
