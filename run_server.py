@@ -76,8 +76,12 @@ async def run_tls_server(host: str, port: int, key: bytes,
     mem = MemoryManager(gc_interval=60, cleanup_interval=300, max_rss_mb=200)
     await mem.start()
 
+    # backlog=4096 — default 100 overflows on mux-client bursts (proactive
+    # rotator opens 1 new TCP per tunnel per 15s; several clients at once
+    # easily exceed 100 pending SYNs → kernel RSTs them → clients see
+    # ECONNREFUSED). 4096 matches net.core.somaxconn default on modern Linux.
     server = await asyncio.start_server(
-        tunnel_handler.handle, host, port, ssl=ssl_ctx,
+        tunnel_handler.handle, host, port, ssl=ssl_ctx, backlog=4096,
     )
     addr = server.sockets[0].getsockname()
     log.info("XZAP TLS server ready on %s:%d (SNI masquerade)", *addr)
