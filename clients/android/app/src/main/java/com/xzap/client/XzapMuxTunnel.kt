@@ -94,16 +94,23 @@ class XzapMuxTunnel(
 
     /** Establish TLS + XZAP mux version handshake. Throws on failure. */
     fun connect() {
-        val sock = sslFactory.createSocket() as SSLSocket
+        // Force IPv4: on some mobile carriers (e.g. Megafon RU) the Java dual-stack
+        // resolver picks IPv6 for outgoing connections, but the carrier has no IPv6
+        // route to IPv4 destinations like our server → ENETUNREACH from /::. By
+        // resolving to an Inet4Address explicitly and opening a plain Socket first
+        // (then wrapping with SSL), we avoid the dual-stack ambiguity.
+        val ipv4 = resolveIPv4(serverHost) ?: throw java.net.UnknownHostException("no IPv4 for $serverHost")
+        val plain = Socket()
+        plain.tcpNoDelay = true
+        plain.keepAlive = true
+        plain.connect(InetSocketAddress(ipv4, serverPort), 10_000)
+        val sock = sslFactory.createSocket(plain, serverHost, serverPort, true) as SSLSocket
         sock.sslParameters = sock.sslParameters.apply {
             serverNames = listOf(javax.net.ssl.SNIHostName(sni))
         }
-        sock.connect(InetSocketAddress(serverHost, serverPort), 10_000)
+        sock.startHandshake()
         sock.soTimeout = 10_000
-        sock.tcpNoDelay = true
-        sock.keepAlive = true
         // Aggressive keepalive for mobile NAT (default linux is 2h idle — useless).
-        // Not all Android versions expose these as named options; try reflection.
         trySetKeepAliveParams(sock, idleSec = 30, intervalSec = 10, count = 3)
 
         socket = sock
@@ -131,6 +138,16 @@ class XzapMuxTunnel(
         readerThread = Thread({ readerLoop() }, "XzapMux-reader").also { it.start() }
         pingThread = Thread({ pingLoop() }, "XzapMux-ping").also { it.isDaemon = true; it.start() }
         Log.i(TAG, "mux tunnel established → $serverHost:$serverPort")
+    }
+
+    private fun resolveIPv4(host: String): java.net.InetAddress? {
+        // If host is an IPv4 literal, getByName returns Inet4Address directly.
+        // If hostname, getAllByName may return mix of v4/v6 — pick first v4.
+        return try {
+            java.net.InetAddress.getAllByName(host).firstOrNull { it is java.net.Inet4Address }
+        } catch (e: Exception) {
+            null
+        }
     }
 
     private fun trySetKeepAliveParams(sock: Socket, idleSec: Int, intervalSec: Int, count: Int) {
