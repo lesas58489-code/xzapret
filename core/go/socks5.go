@@ -74,8 +74,9 @@ func (s *socksServer) handleClient(c net.Conn) {
 	atyp := buf[3]
 
 	if cmd == 0x03 {
-		// UDP ASSOCIATE: reject, forcing apps to TCP fallback
-		_, _ = c.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		// UDP ASSOCIATE — accept so DNS queries can relay via TCP tunnel.
+		// Non-DNS UDP (QUIC etc) gets silently dropped, forcing TCP fallback.
+		s.handleUDPAssociate(c, buf)
 		return
 	}
 	if cmd != 0x01 {
@@ -151,6 +152,155 @@ func (s *socksServer) handleClient(c net.Conn) {
 		errCh <- err
 	}()
 	<-errCh
+}
+
+// handleUDPAssociate: accept associate, relay DNS over TCP via mux tunnel.
+// Non-DNS UDP silently dropped → apps fall back to TCP.
+func (s *socksServer) handleUDPAssociate(c net.Conn, buf []byte) {
+	// Skip DST.ADDR + DST.PORT (4 bytes atyp already read, buf[3] = atyp)
+	atyp := buf[3]
+	switch atyp {
+	case 0x01:
+		_, _ = io.ReadFull(c, buf[:6])
+	case 0x03:
+		_, _ = io.ReadFull(c, buf[:1])
+		dlen := int(buf[0])
+		_, _ = io.ReadFull(c, buf[:dlen+2])
+	case 0x04:
+		_, _ = io.ReadFull(c, buf[:18])
+	}
+
+	// Bind a UDP socket on 127.0.0.1 and reply with its port.
+	udpAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	udp, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		_, _ = c.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	udpPort := udp.LocalAddr().(*net.UDPAddr).Port
+	reply := []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, byte(udpPort >> 8), byte(udpPort & 0xFF)}
+	if _, err := c.Write(reply); err != nil {
+		udp.Close()
+		return
+	}
+
+	// UDP receive loop in a goroutine; session ends when control TCP closes
+	done := make(chan struct{})
+	go s.udpLoop(udp, done)
+
+	// Keep control TCP alive; close when client disconnects
+	_, _ = io.Copy(io.Discard, c)
+	close(done)
+	_ = udp.Close()
+}
+
+func (s *socksServer) udpLoop(udp *net.UDPConn, done chan struct{}) {
+	buf := make([]byte, 65536)
+	_ = udp.SetReadDeadline(time.Now().Add(30 * time.Second))
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		_ = udp.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		n, src, err := udp.ReadFromUDP(buf)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			return
+		}
+		if n < 4 {
+			continue
+		}
+		// SOCKS5 UDP header: [2B RSV][1B FRAG][1B ATYP][addr][port][data]
+		atyp := buf[3]
+		var dstHost string
+		var dstPort int
+		var payloadOff int
+		switch atyp {
+		case 0x01:
+			if n < 10 { continue }
+			dstHost = net.IP(buf[4:8]).String()
+			dstPort = int(buf[8])<<8 | int(buf[9])
+			payloadOff = 10
+		case 0x03:
+			if n < 5 { continue }
+			dlen := int(buf[4])
+			if n < 7+dlen { continue }
+			dstHost = string(buf[5 : 5+dlen])
+			dstPort = int(buf[5+dlen])<<8 | int(buf[5+dlen+1])
+			payloadOff = 7 + dlen
+		case 0x04:
+			if n < 22 { continue }
+			dstHost = net.IP(buf[4:20]).String()
+			dstPort = int(buf[20])<<8 | int(buf[21])
+			payloadOff = 22
+		default:
+			continue
+		}
+		if dstPort != 53 {
+			// Non-DNS UDP — drop silently (app will fall back to TCP)
+			continue
+		}
+		query := make([]byte, n-payloadOff)
+		copy(query, buf[payloadOff:n])
+		udpHdr := make([]byte, payloadOff)
+		copy(udpHdr, buf[:payloadOff])
+		go s.relayDNS(udp, src, dstHost, query, udpHdr)
+	}
+}
+
+// relayDNS opens a mux stream to dstHost:53 and sends the DNS query as
+// DNS-over-TCP ([2B len][query]), then forwards the reply back as SOCKS5 UDP.
+func (s *socksServer) relayDNS(udp *net.UDPConn, src *net.UDPAddr,
+	dstHost string, query, udpHdr []byte) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := s.pool.OpenStream(ctx, dstHost, 53)
+	if err != nil {
+		return
+	}
+	defer stream.Close()
+
+	// DNS-over-TCP: [2B length][query]
+	tcpQ := make([]byte, 2+len(query))
+	tcpQ[0] = byte(len(query) >> 8)
+	tcpQ[1] = byte(len(query))
+	copy(tcpQ[2:], query)
+	if _, err := stream.Write(tcpQ); err != nil {
+		return
+	}
+	// Read response: [2B len][data]
+	resp := make([]byte, 4096)
+	n, err := io.ReadAtLeast(stream, resp, 2)
+	if err != nil {
+		return
+	}
+	respLen := int(resp[0])<<8 | int(resp[1])
+	if respLen > 4000 || n-2 < respLen {
+		// Read remaining if needed
+		need := 2 + respLen - n
+		if need > 0 {
+			more := make([]byte, need)
+			if _, err := io.ReadFull(stream, more); err != nil {
+				return
+			}
+			resp = append(resp[:n], more...)
+			n += need
+		}
+	}
+	if n < 2+respLen {
+		return
+	}
+	dns := resp[2 : 2+respLen]
+
+	// Build SOCKS5 UDP reply = original UDP header + DNS response
+	reply := make([]byte, 0, len(udpHdr)+len(dns))
+	reply = append(reply, udpHdr...)
+	reply = append(reply, dns...)
+	_, _ = udp.WriteToUDP(reply, src)
 }
 
 func (s *socksServer) handleDirect(c net.Conn, host string, port int) {
