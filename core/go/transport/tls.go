@@ -72,5 +72,7 @@ func DialTLS(ctx context.Context, host string, port int, sni string, profile TLS
 		return nil, fmt.Errorf("uTLS handshake: %w", err)
 	}
 	_ = uconn.SetDeadline(time.Time{})
-	return uconn, nil
+	// Wrap with XZAP fragmentation layer (Python server's wrap_connection
+	// expects [4B len][1B flags][data] fragments on the TCP/TLS path).
+	return WrapFragmented(uconn), nil
 }
