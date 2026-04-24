@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -172,17 +173,21 @@ func (t *MuxTunnel) OpenStream(ctx context.Context, host string, port int) (*mux
 
 	req, _ := json.Marshal(map[string]interface{}{"host": host, "port": port})
 	if err := t.sendFrame(sid, cmdSYN, req); err != nil {
+		log.Printf("mux: stream=%d SYN send failed to %s:%d: %v", sid, host, port, err)
 		t.removeStream(sid)
 		return nil, err
 	}
+	log.Printf("mux: stream=%d SYN sent → %s:%d, awaiting ACK", sid, host, port)
 	// Await SYN_ACK
 	select {
 	case ok := <-s.ack:
+		log.Printf("mux: stream=%d ACK received (ok=%v)", sid, ok)
 		if !ok {
 			t.removeStream(sid)
 			return nil, fmt.Errorf("mux: server rejected stream to %s:%d", host, port)
 		}
 	case <-ctx.Done():
+		log.Printf("mux: stream=%d ctx.Done BEFORE ack: %v", sid, ctx.Err())
 		t.removeStream(sid)
 		return nil, ctx.Err()
 	}
@@ -202,23 +207,34 @@ func (t *MuxTunnel) removeStream(sid uint32) {
 }
 
 func (t *MuxTunnel) readerLoop() {
-	defer t.Close()
+	defer func() {
+		log.Printf("mux: readerLoop EXIT (tunnel closing)")
+		t.Close()
+	}()
 	for atomic.LoadInt32(&t.alive) == 1 {
 		frame, err := ReadFrame(t.r, t.c)
 		if err != nil {
+			log.Printf("mux: readerLoop ReadFrame error: %v", err)
 			return
 		}
 		t.lastFrameAt.Store(time.Now().UnixNano())
 		if len(frame) < muxHdrSize {
+			log.Printf("mux: readerLoop got undersized frame %d bytes", len(frame))
 			continue
 		}
 		sid := binary.BigEndian.Uint32(frame[0:4])
 		cmd := frame[4]
 		plen := binary.BigEndian.Uint32(frame[5:9])
 		if plen > maxPayload || int(plen)+muxHdrSize > len(frame) {
+			log.Printf("mux: readerLoop bad frame sid=%d cmd=0x%02x plen=%d framelen=%d", sid, cmd, plen, len(frame))
 			continue
 		}
 		payload := frame[muxHdrSize : muxHdrSize+int(plen)]
+
+		// Skip noisy per-frame log for control PING/PONG; log everything else
+		if !(sid == controlSID && (cmd == cmdPING || cmd == cmdPONG)) {
+			log.Printf("mux: readerLoop RX sid=%d cmd=0x%02x plen=%d", sid, cmd, plen)
+		}
 
 		if sid == controlSID {
 			switch cmd {
@@ -231,6 +247,7 @@ func (t *MuxTunnel) readerLoop() {
 		s := t.streams[sid]
 		t.streamsMu.Unlock()
 		if s == nil {
+			log.Printf("mux: readerLoop no stream for sid=%d cmd=0x%02x — dropping", sid, cmd)
 			continue
 		}
 		switch cmd {

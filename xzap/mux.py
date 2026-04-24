@@ -231,14 +231,16 @@ class MuxServerSession:
 
     async def _process_mux_frame(self, data: bytes):
         if len(data) < MUX_HDR_SIZE:
-            log.warning("mux: frame too small (%d bytes)", len(data))
+            log.warning("mux: frame too small (%d bytes) head=%s", len(data), data[:16].hex())
             return
         stream_id, cmd, plen = unpack_header(data[:MUX_HDR_SIZE])
         if plen > MAX_PAYLOAD:
             log.warning("mux: payload too large (%d bytes)", plen)
             return
         payload = data[MUX_HDR_SIZE:MUX_HDR_SIZE + plen]
-        log.debug("mux rx: sid=%d cmd=0x%02x plen=%d", stream_id, cmd, plen)
+        # DIAG: log every non-control-ping frame to trace why stream opens fail
+        if not (stream_id == CONTROL_STREAM_ID and cmd in (CMD_PING, CMD_PONG)):
+            log.info("mux RX sid=%d cmd=0x%02x plen=%d", stream_id, cmd, plen)
 
         # Control stream (id=0): ping/pong — keepalive heartbeat
         if stream_id == CONTROL_STREAM_ID:
@@ -270,10 +272,12 @@ class MuxServerSession:
         try:
             req = json.loads(payload)
             host = req["host"]; port = int(req["port"])
-        except Exception:
+        except Exception as e:
+            log.warning("mux SYN sid=%d BAD-JSON err=%s payload=%r", stream_id, e, payload[:80])
             await self.send_frame(stream_id, CMD_RST, b"bad syn")
             return
 
+        log.info("mux SYN sid=%d → %s:%d", stream_id, host, port)
         # Run connect_target as a background task so the mux frame reader loop
         # is not blocked on slow/hung target connects. Other streams' SYN, DATA,
         # PING all keep flowing while this one waits for its upstream.
@@ -282,9 +286,11 @@ class MuxServerSession:
     async def _open_stream_async(self, stream_id: int, host: str, port: int):
         stream = MuxStream(stream_id, self)
         if not await stream.connect_target(host, port):
+            log.info("mux SYN sid=%d %s:%d CONNECT_FAILED → RST", stream_id, host, port)
             await self.send_frame(stream_id, CMD_RST, b"connect failed")
             return
         self.streams[stream_id] = stream
+        log.info("mux SYN sid=%d %s:%d OK → SYN_ACK", stream_id, host, port)
         await self.send_frame(stream_id, CMD_SYN_ACK)
         await stream.run()
 
