@@ -149,31 +149,15 @@ func parseProfile(s string) transport.TLSProfile {
 	}
 }
 
-// White SNIs are sourced from lists/bypass.txt — Russian sites that pass
-// Russian DPI inspection regardless of destination IP (DPI doesn't block
-// these domains; foreign CDNs trigger the DPI more aggressively).
-// Server side mirrors this list in /etc/nginx/stream-xzap.conf.
+// SNI matches our own A-record direct.solar-cloud.xyz → 151.244.111.186
+// with a real Let's Encrypt certificate. DPI sees consistent
+// SNI ↔ IP ↔ cert triple — no mismatch flag.
+//
+// (Previously rotated through bypass.txt Russian domains as fake SNI,
+// but server cert was self-signed CN=www.google.com → mismatch with SNI
+// was visible to DPI doing TLS inspection.)
 var whiteSNIs = []string{
-	"vk.com",
-	"ok.ru",
-	"yandex.ru",
-	"yandex.net",
-	"mail.ru",
-	"rambler.ru",
-	"avito.ru",
-	"sberbank.ru",
-	"gosuslugi.ru",
-	"mos.ru",
-	"rbc.ru",
-	"lenta.ru",
-	"ria.ru",
-	"rt.com",
-	"tinkoff.ru",
-	"ozon.ru",
-	"wildberries.ru",
-	"kinopoisk.ru",
-	"2gis.ru",
-	"dzen.ru",
+	"direct.solar-cloud.xyz",
 }
 
 func randomWhiteSNI() string {
