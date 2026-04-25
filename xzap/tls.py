@@ -25,20 +25,29 @@ from pathlib import Path
 
 log = logging.getLogger("xzap.tls")
 
-# Белые домены — популярные сайты, трафик к которым DPI не блокирует.
-# Используем полные домены с www и без — как в реальном браузере.
+# Белые домены — берутся из lists/bypass.txt: российские сайты,
+# которые российский DPI не блокирует независимо от IP назначения.
+# Зеркалится в core/go/client.go и /etc/nginx/stream-xzap.conf на сервере.
 WHITE_DOMAINS = [
-    # Only NON-BLOCKED domains — DPI checks SNI regardless of dest IP
-    "www.cloudflare.com", "cloudflare.com",
-    "www.microsoft.com", "microsoft.com",
-    "www.apple.com", "apple.com",
-    "www.amazon.com", "amazon.com",
-    "cdn.jsdelivr.net",
-    "cdnjs.cloudflare.com",
-    "ajax.aspnetcdn.com",
-    "fonts.gstatic.com",
-    "cdn.shopify.com",
-    "s3.amazonaws.com",
+    "vk.com", "www.vk.com",
+    "ok.ru", "www.ok.ru",
+    "yandex.ru", "www.yandex.ru", "yandex.net",
+    "mail.ru", "www.mail.ru",
+    "rambler.ru",
+    "avito.ru", "www.avito.ru",
+    "sberbank.ru", "www.sberbank.ru",
+    "gosuslugi.ru",
+    "mos.ru",
+    "rbc.ru",
+    "lenta.ru",
+    "ria.ru",
+    "rt.com",
+    "tinkoff.ru",
+    "ozon.ru",
+    "wildberries.ru",
+    "kinopoisk.ru",
+    "2gis.ru",
+    "dzen.ru",
 ]
 
 # Chrome 120+ cipher suite order — DPI проверяет порядок cipher suites

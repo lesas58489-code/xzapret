@@ -149,13 +149,31 @@ func parseProfile(s string) transport.TLSProfile {
 	}
 }
 
+// White SNIs are sourced from lists/bypass.txt — Russian sites that pass
+// Russian DPI inspection regardless of destination IP (DPI doesn't block
+// these domains; foreign CDNs trigger the DPI more aggressively).
+// Server side mirrors this list in /etc/nginx/stream-xzap.conf.
 var whiteSNIs = []string{
-	"www.microsoft.com",
-	"www.apple.com",
-	"www.amazon.com",
-	"cdn.jsdelivr.net",
-	"cdnjs.cloudflare.com",
-	"ajax.aspnetcdn.com",
+	"vk.com",
+	"ok.ru",
+	"yandex.ru",
+	"yandex.net",
+	"mail.ru",
+	"rambler.ru",
+	"avito.ru",
+	"sberbank.ru",
+	"gosuslugi.ru",
+	"mos.ru",
+	"rbc.ru",
+	"lenta.ru",
+	"ria.ru",
+	"rt.com",
+	"tinkoff.ru",
+	"ozon.ru",
+	"wildberries.ru",
+	"kinopoisk.ru",
+	"2gis.ru",
+	"dzen.ru",
 }
 
 func randomWhiteSNI() string {
