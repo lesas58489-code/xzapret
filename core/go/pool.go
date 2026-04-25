@@ -9,6 +9,7 @@ import (
 	"log"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -55,14 +56,15 @@ type pooledTunnel struct {
 }
 
 type Pool struct {
-	cfg    PoolConfig
-	mu     sync.Mutex
-	items  []*pooledTunnel
-	crea   int // tunnels being created
-	ready  chan struct{}
-	once   sync.Once
-	quit   chan struct{}
-	startT time.Time
+	cfg     PoolConfig
+	mu      sync.Mutex
+	items   []*pooledTunnel
+	crea    int // tunnels being created
+	ready   chan struct{}
+	once    sync.Once
+	quit    chan struct{}
+	startT  time.Time
+	hasOne  atomic.Bool // any tunnel ever made it (controls fast-vs-slow dial path)
 }
 
 func NewPool(cfg PoolConfig) *Pool {
@@ -180,14 +182,29 @@ func (p *Pool) pick() *MuxTunnel {
 }
 
 func (p *Pool) warmup() {
-	// First tunnel synchronous (signals readiness fast)
-	p.createOne()
-	// Rest staggered 3-5s
-	for i := 1; i < p.cfg.MaxTunnels; i++ {
+	// Cold start: race 3 dialers in parallel. First success signals ready;
+	// others either become pool members or fail benignly. On flaky mobile
+	// networks (DPI dropping bursts, TLS handshake i/o timeout) the parallel
+	// race cuts time-to-first-tunnel from 30-50s down to ~5-15s.
+	coldStartParallel := 3
+	if p.cfg.MaxTunnels < coldStartParallel {
+		coldStartParallel = p.cfg.MaxTunnels
+	}
+	for i := 0; i < coldStartParallel; i++ {
+		go p.createOne()
+	}
+	// Block until first tunnel ready (or pool stopped)
+	select {
+	case <-p.ready:
+	case <-p.quit:
+		return
+	}
+	// Slow-fill the rest at the original cadence
+	for i := coldStartParallel; i < p.cfg.MaxTunnels; i++ {
 		select {
 		case <-p.quit:
 			return
-		case <-time.After(time.Duration(i)*3*time.Second + jitter(2*time.Second)):
+		case <-time.After(3*time.Second + jitter(2*time.Second)):
 			go p.createOne()
 		}
 	}
@@ -202,17 +219,30 @@ func (p *Pool) createOne() {
 		p.crea--
 		p.mu.Unlock()
 	}()
-	// retry up to 2 times with short backoff (carrier sometimes RSTs bursts)
+	// Cold path: short timeouts, more attempts, fast retry. Once any tunnel
+	// is alive, switch to longer per-attempt budget so we don't churn.
+	var dialTO time.Duration
+	var attempts int
+	var backoff time.Duration
+	if p.hasOne.Load() {
+		dialTO = 15 * time.Second
+		attempts = 2
+		backoff = 2 * time.Second
+	} else {
+		dialTO = 5 * time.Second
+		attempts = 3
+		backoff = 500 * time.Millisecond
+	}
 	var err error
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-p.quit:
 				return
-			case <-time.After(2*time.Second + jitter(3*time.Second)):
+			case <-time.After(backoff + jitter(backoff)):
 			}
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), dialTO)
 		conn, err2 := p.cfg.Dialer(ctx)
 		cancel()
 		if err2 != nil {
@@ -230,6 +260,7 @@ func (p *Pool) createOne() {
 		p.mu.Lock()
 		p.items = append(p.items, &pooledTunnel{t: t})
 		p.mu.Unlock()
+		p.hasOne.Store(true)
 		p.once.Do(func() { close(p.ready) })
 		return
 	}
