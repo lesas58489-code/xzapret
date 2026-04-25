@@ -182,29 +182,18 @@ func (p *Pool) pick() *MuxTunnel {
 }
 
 func (p *Pool) warmup() {
-	// Cold start: race 3 dialers in parallel. First success signals ready;
-	// others either become pool members or fail benignly. On flaky mobile
-	// networks (DPI dropping bursts, TLS handshake i/o timeout) the parallel
-	// race cuts time-to-first-tunnel from 30-50s down to ~5-15s.
-	coldStartParallel := 3
-	if p.cfg.MaxTunnels < coldStartParallel {
-		coldStartParallel = p.cfg.MaxTunnels
-	}
-	for i := 0; i < coldStartParallel; i++ {
-		go p.createOne()
-	}
-	// Block until first tunnel ready (or pool stopped)
-	select {
-	case <-p.ready:
-	case <-p.quit:
-		return
-	}
+	// Cold start: ONE dial at a time. Parallel dial bursts trigger DPI/ISP
+	// stateful filters that blackhole the destination IP for ~30s — net
+	// wall-clock ends up the same as single-dial. The short cold-path
+	// timeouts in createOne (5s × 3 attempts) handle flaky handshakes
+	// without flooding the network.
+	p.createOne()
 	// Slow-fill the rest at the original cadence
-	for i := coldStartParallel; i < p.cfg.MaxTunnels; i++ {
+	for i := 1; i < p.cfg.MaxTunnels; i++ {
 		select {
 		case <-p.quit:
 			return
-		case <-time.After(3*time.Second + jitter(2*time.Second)):
+		case <-time.After(time.Duration(i)*3*time.Second + jitter(2*time.Second)):
 			go p.createOne()
 		}
 	}
