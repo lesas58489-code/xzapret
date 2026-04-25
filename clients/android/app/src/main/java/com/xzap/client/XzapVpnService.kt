@@ -179,11 +179,40 @@ class XzapVpnService : VpnService() {
             .setMtu(1500)
         try { builder.addDisallowedApplication(packageName) } catch (_: Exception) {}
 
+        // Keep RFC1918 private ranges + link-local + multicast out of tunnel.
+        // Without this, apps probing local gateway (192.168.0.1:53) waste mux
+        // streams trying to reach the phone's own LAN from Warsaw.
+        // excludeRoute requires Android 13 (API 33); fall back silently otherwise.
+        if (Build.VERSION.SDK_INT >= 33) {
+            try {
+                builder.excludeRoute(android.net.IpPrefix(java.net.InetAddress.getByName("10.0.0.0"), 8))
+                builder.excludeRoute(android.net.IpPrefix(java.net.InetAddress.getByName("172.16.0.0"), 12))
+                builder.excludeRoute(android.net.IpPrefix(java.net.InetAddress.getByName("192.168.0.0"), 16))
+                builder.excludeRoute(android.net.IpPrefix(java.net.InetAddress.getByName("169.254.0.0"), 16))
+                builder.excludeRoute(android.net.IpPrefix(java.net.InetAddress.getByName("224.0.0.0"), 4))
+                Log.i(TAG, "excludeRoute: RFC1918 + link-local + multicast out of tunnel")
+            } catch (e: Exception) { Log.w(TAG, "excludeRoute failed: $e") }
+        }
+
         var bypassed = 0
         for (pkg in BYPASS_APPS) {
             try { builder.addDisallowedApplication(pkg); bypassed++ } catch (_: Exception) {}
         }
-        Log.i(TAG, "Bypass: $bypassed of ${BYPASS_APPS.size} Russian apps routed direct")
+        // MIUI/system noise that otherwise hammers mux with background probes
+        val miuiBypass = listOf(
+            "com.miui.daemon", "com.miui.analytics", "com.miui.systemAdSolution",
+            "com.miui.msa.global", "com.miui.securitycenter", "com.xiaomi.metoknlp",
+            "com.xiaomi.xmsf", "com.xiaomi.mipicks", "com.miui.weather2",
+            "com.android.vending",             // Google Play (huge chat, reconnects)
+            "com.google.android.gms",           // Google Play Services — massive traffic
+            "com.google.android.gsf",
+            "com.google.android.apps.tachyon",  // Google Meet / Duo
+            "com.google.android.ims",
+        )
+        for (pkg in miuiBypass) {
+            try { builder.addDisallowedApplication(pkg); bypassed++ } catch (_: Exception) {}
+        }
+        Log.i(TAG, "Bypass total: $bypassed apps routed direct")
 
         try {
             val cm = getSystemService(android.net.ConnectivityManager::class.java)

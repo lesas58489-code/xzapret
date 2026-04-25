@@ -36,13 +36,15 @@ type PoolConfig struct {
 
 func DefaultPoolConfig(c *Crypto, d TransportDialer) PoolConfig {
 	return PoolConfig{
-		Crypto:       c,
-		Dialer:       d,
-		MaxTunnels:   3,
-		MaxAge:       30 * time.Second,
-		RetireGrace:  8 * time.Second,
-		RotateEvery:  5 * time.Second,
-		WarmupDelay:  40 * time.Second,
+		Crypto:     c,
+		Dialer:     d,
+		MaxTunnels: 6,                // ← was 3: more parallelism so one rotation doesn't stall everything
+		MaxAge:     10 * time.Minute, // ← was 30s: rotation too aggressive, Chrome reads mid-flight RSTs as "offline"
+		// RetireGrace no longer a fixed timeout — retiring tunnels now wait
+		// for inflight streams to finish. Kept for absolute upper bound.
+		RetireGrace:  60 * time.Second,
+		RotateEvery:  30 * time.Second,
+		WarmupDelay:  2 * time.Minute,
 		StreamDialTO: 10 * time.Second,
 	}
 }
@@ -101,11 +103,26 @@ func (p *Pool) Ready(timeout time.Duration) bool {
 }
 
 // OpenStream picks the least-loaded fresh tunnel and opens a stream.
+// Blocks on first-tunnel readiness so warmup races don't nuke early requests.
 func (p *Pool) OpenStream(ctx context.Context, host string, port int) (*muxStream, error) {
-	for attempt := 0; attempt < 2; attempt++ {
+	// Cold pool: wait for first tunnel before trying to pick. tun2socks
+	// fires requests within ~400ms of VPN up, but first WSS+mux handshake
+	// needs ~600-900ms; without this wait every early request fails and
+	// Chrome marks the network offline.
+	select {
+	case <-p.ready:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("pool: cold (timed out waiting for first tunnel): %w", ctx.Err())
+	}
+	for attempt := 0; attempt < 3; attempt++ {
 		t := p.pick()
 		if t == nil {
-			time.Sleep(200 * time.Millisecond)
+			// pool had a tunnel but it died since ready was signalled; brief wait
+			select {
+			case <-time.After(200 * time.Millisecond):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 			continue
 		}
 		stream, err := t.OpenStream(ctx, host, port)
@@ -263,12 +280,27 @@ func (p *Pool) rotator() {
 		oldest.retiring = true
 		target := oldest.t
 		p.mu.Unlock()
-		log.Printf("pool: retiring tunnel age=%s", oldestAge)
+		log.Printf("pool: retiring tunnel age=%s streams=%d", oldestAge, target.StreamCount())
 		go p.createOne()
 		go func() {
-			select {
-			case <-p.quit:
-			case <-time.After(p.cfg.RetireGrace):
+			// Graceful rotation: don't close while streams are alive. Poll
+			// every 2s, bounded by RetireGrace absolute timeout so a
+			// stuck stream can't leak the tunnel forever.
+			deadline := time.Now().Add(p.cfg.RetireGrace)
+			for {
+				if target.StreamCount() == 0 {
+					break
+				}
+				if time.Now().After(deadline) {
+					log.Printf("pool: RetireGrace expired with streams=%d, force-closing", target.StreamCount())
+					break
+				}
+				select {
+				case <-p.quit:
+					target.Close()
+					return
+				case <-time.After(2 * time.Second):
+				}
 			}
 			target.Close()
 		}()
