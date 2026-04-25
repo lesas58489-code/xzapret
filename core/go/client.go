@@ -149,15 +149,34 @@ func parseProfile(s string) transport.TLSProfile {
 	}
 }
 
-// SNI matches our own A-record direct.solar-cloud.xyz → 151.244.111.186
-// with a real Let's Encrypt certificate. DPI sees consistent
-// SNI ↔ IP ↔ cert triple — no mismatch flag.
-//
-// (Previously rotated through bypass.txt Russian domains as fake SNI,
-// but server cert was self-signed CN=www.google.com → mismatch with SNI
-// was visible to DPI doing TLS inspection.)
+// SNI rotation — Russian sites that pass DPI inspection regardless of
+// destination IP. Server still serves LE cert for direct.solar-cloud.xyz
+// (cert/SNI mismatch is OK because client uses InsecureSkipVerify).
+// Tradeoff vs single direct.solar-cloud.xyz SNI:
+//   - Pro: more variety, harder for DPI to fingerprint single SNI
+//   - Con: cert mismatch visible to TLS-inspecting DPI
+// Reverted from single-SNI 815f3e5 because user reports "тишина" with it.
 var whiteSNIs = []string{
-	"direct.solar-cloud.xyz",
+	"vk.com",
+	"ok.ru",
+	"yandex.ru",
+	"yandex.net",
+	"mail.ru",
+	"rambler.ru",
+	"avito.ru",
+	"sberbank.ru",
+	"gosuslugi.ru",
+	"mos.ru",
+	"rbc.ru",
+	"lenta.ru",
+	"ria.ru",
+	"rt.com",
+	"tinkoff.ru",
+	"ozon.ru",
+	"wildberries.ru",
+	"kinopoisk.ru",
+	"2gis.ru",
+	"dzen.ru",
 }
 
 func randomWhiteSNI() string {
