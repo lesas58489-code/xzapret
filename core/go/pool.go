@@ -146,16 +146,12 @@ func (p *Pool) pick() *MuxTunnel {
 		}
 	}
 	p.items = alive
-	// Missing? Kick background creation
+	// Missing? Kick AT MOST ONE background dial. Multiple parallel dials
+	// trigger DPI burst-detection on Russian carriers; the rotator's slow-
+	// fill cadence handles steady-state replenishment without burst.
 	needed := p.cfg.MaxTunnels - len(p.items) - p.crea
-	for i := 0; i < needed; i++ {
-		delay := time.Duration(i) * 3 * time.Second
-		go func(d time.Duration) {
-			if d > 0 {
-				time.Sleep(d)
-			}
-			p.createOne()
-		}(delay)
+	if needed > 0 {
+		go p.createOne()
 	}
 	// Least-loaded fresh (non-retiring)
 	var best *MuxTunnel
