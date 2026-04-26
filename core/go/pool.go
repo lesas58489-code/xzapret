@@ -40,17 +40,16 @@ func DefaultPoolConfig(c *Crypto, d TransportDialer) PoolConfig {
 		Crypto:     c,
 		Dialer:     d,
 		MaxTunnels: 6,
-		// Phase A — browser-like connection lifetime.
-		// Measurement showed our tunnels live 175-560s; browser conns live 0.5-32s.
-		// MaxAge=60s rotates aggressively. Streams in flight on retiring tunnels
-		// keep going (RetireGrace) so YouTube/WebSocket streams don't stutter.
-		MaxAge: 60 * time.Second,
-		// RetireGrace was 30s, but force-closing long-lived streams (YouTube
-		// chunks, WebSocket, EventSource) caused user-visible "hangs" — browser
-		// retries cost minutes. 120s gives most streams time to drain.
-		RetireGrace:  120 * time.Second,
-		RotateEvery:  20 * time.Second,
-		WarmupDelay:  30 * time.Second,
+		// Reverted Phase A (60s/30s rotation). Aggressive rotation didn't
+		// reduce user-visible hangs and high ctx.Done counts indicated pool
+		// churn (12 dial fails, 12 tunnel EXITs) was actually hurting stability
+		// rather than helping. Connection-lifetime improvement also evaporated
+		// once RetireGrace was raised to 120s to avoid force-closing streams
+		// — TCP flow lifetime ended up the same as pre-rotation.
+		MaxAge:       10 * time.Minute,
+		RetireGrace:  60 * time.Second,
+		RotateEvery:  30 * time.Second,
+		WarmupDelay:  2 * time.Minute,
 		StreamDialTO: 10 * time.Second,
 	}
 }
