@@ -79,9 +79,13 @@ class MuxStream:
         self._consumed = 0  # bytes consumed from client → credit back periodically
 
     async def connect_target(self, host: str, port: int) -> bool:
+        # 3s is enough for any reachable host: real-world TCP handshake to any
+        # functioning server completes in <500ms even from a slow VPS. Keeping
+        # 10s wasted server time on dead DNS servers and unreachable analytics
+        # endpoints (which apps retry incessantly), starving real streams.
         try:
             self.target_reader, self.target_writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=10,
+                asyncio.open_connection(host, port), timeout=3,
             )
             return True
         except Exception as e:
