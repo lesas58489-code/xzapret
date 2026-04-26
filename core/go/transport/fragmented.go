@@ -32,6 +32,13 @@ const (
 	fragMin   = 24
 	fragMax   = 68
 	fragThres = 150
+
+	// Phase D3 mirror — chaff in client→server direction.
+	// Mirrors xzap/transport/fragmented.py D3 settings.
+	chaffChance  = 0.35
+	chaffSizeMin = 800
+	chaffSizeMax = 4000
+	chaffNumMax  = 3
 )
 
 type fragConn struct {
@@ -49,14 +56,39 @@ func WrapFragmented(c net.Conn) net.Conn {
 func (f *fragConn) Write(p []byte) (int, error) {
 	f.wMu.Lock()
 	defer f.wMu.Unlock()
-	// Small data → micro-fragment; large → single real fragment.
+	// Small data → micro-fragment; large → single real fragment + optional chaff.
 	if len(p) <= fragThres {
 		return len(p), f.writeFragmented(p)
 	}
-	if err := f.writeOne(p, flagReal); err != nil {
+
+	// Phase D3 mirror — pack real + optional chaff fragments into ONE Conn.Write
+	// (single TLS record). No drain/flush amplification → no UX latency penalty.
+	buf := make([]byte, 0, fragHdr+len(p)+chaffNumMax*(fragHdr+chaffSizeMax))
+	buf = appendFragment(buf, p, flagReal)
+	if rand.Float64() < chaffChance {
+		n := 1 + rand.Intn(chaffNumMax)
+		for i := 0; i < n; i++ {
+			size := chaffSizeMin + rand.Intn(chaffSizeMax-chaffSizeMin+1)
+			chaff := make([]byte, size)
+			_, _ = rand.Read(chaff)
+			buf = appendFragment(buf, chaff, flagChaff)
+		}
+	}
+	if _, err := f.Conn.Write(buf); err != nil {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+// appendFragment encodes a fragment and appends to buf. Format: [4B total_len][1B flags][data].
+func appendFragment(buf []byte, data []byte, flags byte) []byte {
+	total := uint32(len(data) + 1)
+	hdr := [5]byte{}
+	binary.BigEndian.PutUint32(hdr[:4], total)
+	hdr[4] = flags
+	buf = append(buf, hdr[:]...)
+	buf = append(buf, data...)
+	return buf
 }
 
 func (f *fragConn) writeFragmented(data []byte) error {
