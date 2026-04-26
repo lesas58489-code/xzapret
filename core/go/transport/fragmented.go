@@ -32,6 +32,20 @@ const (
 	fragMin   = 24
 	fragMax   = 68
 	fragThres = 150
+
+	// Phase D3-proportional — chaff size scales with real payload size.
+	// Small uploads (HTTP GET, mux SYN) get tiny chaff that doesn't tax
+	// uplink. Large uploads (POST, file) get proportional chaff that adds
+	// real DPI-visible variability.
+	//
+	// chaff_size = payload_size * (chaffPctMin..chaffPctMax)
+	// With chaffChance fired, this guarantees % overhead invariant to
+	// uplink bandwidth — no measurement loop needed.
+	chaffChance = 0.40 // probability per bulk write
+	chaffPctMin = 0.03 // 3% of payload size minimum
+	chaffPctMax = 0.10 // 10% of payload size maximum
+	chaffMin    = 64   // floor (don't generate <64B chaff — pointless)
+	chaffMax    = 2048 // ceiling (cap on huge uploads, don't overdo)
 )
 
 type fragConn struct {
@@ -49,14 +63,45 @@ func WrapFragmented(c net.Conn) net.Conn {
 func (f *fragConn) Write(p []byte) (int, error) {
 	f.wMu.Lock()
 	defer f.wMu.Unlock()
-	// Small data → micro-fragment; large → single real fragment.
+	// Small data → micro-fragment; large → real + optional proportional chaff.
 	if len(p) <= fragThres {
 		return len(p), f.writeFragmented(p)
 	}
-	if err := f.writeOne(p, flagReal); err != nil {
+
+	// Phase D3-proportional: chaff size scales with payload, single
+	// Conn.Write (no drain amplification), single TLS record on the wire.
+	buf := make([]byte, 0, fragHdr+len(p)+fragHdr+chaffMax)
+	buf = appendFragment(buf, p, flagReal)
+
+	if rand.Float64() < chaffChance {
+		pct := chaffPctMin + rand.Float64()*(chaffPctMax-chaffPctMin)
+		size := int(float64(len(p)) * pct)
+		if size < chaffMin {
+			size = chaffMin
+		}
+		if size > chaffMax {
+			size = chaffMax
+		}
+		chaff := make([]byte, size)
+		_, _ = rand.Read(chaff)
+		buf = appendFragment(buf, chaff, flagChaff)
+	}
+
+	if _, err := f.Conn.Write(buf); err != nil {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+// appendFragment encodes a fragment and appends to buf. Format: [4B total_len][1B flags][data].
+func appendFragment(buf []byte, data []byte, flags byte) []byte {
+	total := uint32(len(data) + 1)
+	hdr := [5]byte{}
+	binary.BigEndian.PutUint32(hdr[:4], total)
+	hdr[4] = flags
+	buf = append(buf, hdr[:]...)
+	buf = append(buf, data...)
+	return buf
 }
 
 func (f *fragConn) writeFragmented(data []byte) error {
