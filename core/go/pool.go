@@ -44,8 +44,11 @@ func DefaultPoolConfig(c *Crypto, d TransportDialer) PoolConfig {
 		// Measurement showed our tunnels live 175-560s; browser conns live 0.5-32s.
 		// MaxAge=60s rotates aggressively. Streams in flight on retiring tunnels
 		// keep going (RetireGrace) so YouTube/WebSocket streams don't stutter.
-		MaxAge:       60 * time.Second,
-		RetireGrace:  30 * time.Second,
+		MaxAge: 60 * time.Second,
+		// RetireGrace was 30s, but force-closing long-lived streams (YouTube
+		// chunks, WebSocket, EventSource) caused user-visible "hangs" — browser
+		// retries cost minutes. 120s gives most streams time to drain.
+		RetireGrace:  120 * time.Second,
 		RotateEvery:  20 * time.Second,
 		WarmupDelay:  30 * time.Second,
 		StreamDialTO: 10 * time.Second,
@@ -264,17 +267,23 @@ func (p *Pool) rotator() {
 		case <-t.C:
 		}
 		if time.Since(p.startT) < p.cfg.WarmupDelay {
+			log.Printf("rotator: in warmup window (%.0fs/%.0fs), skip", time.Since(p.startT).Seconds(), p.cfg.WarmupDelay.Seconds())
 			continue
 		}
 		p.mu.Lock()
 		// Count fresh
-		var freshCount int
+		var freshCount, retiringCount, deadCount int
 		for _, it := range p.items {
-			if it.t.IsAlive() && !it.retiring {
+			if !it.t.IsAlive() {
+				deadCount++
+			} else if it.retiring {
+				retiringCount++
+			} else {
 				freshCount++
 			}
 		}
 		if freshCount < 3 {
+			log.Printf("rotator: fresh=%d retiring=%d dead=%d items=%d, freshCount<3 skip", freshCount, retiringCount, deadCount, len(p.items))
 			p.mu.Unlock()
 			continue
 		}
@@ -292,6 +301,7 @@ func (p *Pool) rotator() {
 			}
 		}
 		if oldest == nil || oldestAge < p.cfg.MaxAge {
+			log.Printf("rotator: fresh=%d oldest=%v MaxAge=%v not-yet skip", freshCount, oldestAge, p.cfg.MaxAge)
 			p.mu.Unlock()
 			continue
 		}

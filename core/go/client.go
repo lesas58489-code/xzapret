@@ -65,6 +65,8 @@ func (c *Client) Start() error {
 
 	dialer := c.makeDialer()
 	poolCfg := DefaultPoolConfig(c.cryp, dialer)
+	log.Printf("pool cfg: maxTunnels=%d maxAge=%v retireGrace=%v rotateEvery=%v warmupDelay=%v",
+		poolCfg.MaxTunnels, poolCfg.MaxAge, poolCfg.RetireGrace, poolCfg.RotateEvery, poolCfg.WarmupDelay)
 	c.pool = NewPool(poolCfg)
 	c.pool.Start()
 
