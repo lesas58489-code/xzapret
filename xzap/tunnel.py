@@ -190,7 +190,14 @@ class XZAPTunnelServer:
         if hasattr(raw_reader, '_ws'):
             reader, writer = raw_reader, raw_writer
         else:
-            reader, writer = wrap_connection(raw_reader, raw_writer)
+            # Phase D2 — light traffic shaping inside ONE TCP write per
+            # bulk frame: 30% chance of 2-way logical split, 12% chance of
+            # chaff fragment appended. No latency amplification (single
+            # drain at end of write — Phase D's bug avoided).
+            reader, writer = wrap_connection(
+                raw_reader, raw_writer,
+                chaff_chance=0.12,
+            )
         target_w = None
         username = None
 
