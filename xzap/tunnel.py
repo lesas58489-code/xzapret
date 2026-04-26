@@ -190,7 +190,13 @@ class XZAPTunnelServer:
         if hasattr(raw_reader, '_ws'):
             reader, writer = raw_reader, raw_writer
         else:
-            reader, writer = wrap_connection(raw_reader, raw_writer)
+            # Phase D3 — substantial chaff for measurable wire-pattern shift:
+            # 35% of bulk writes inject 1-3 chaff fragments of 800-4000B.
+            # ~20% bandwidth overhead — meaningful pcap effect.
+            reader, writer = wrap_connection(
+                raw_reader, raw_writer,
+                chaff_chance=0.35,
+            )
         target_w = None
         username = None
 

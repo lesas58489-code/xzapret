@@ -60,11 +60,24 @@ class FragmentedWriter:
         """Отправляет данные. Мелкие пакеты фрагментируются, крупные — как есть."""
         if len(data) <= self.frag_threshold:
             await self._write_fragmented(data)
-        else:
-            # Bulk data: send as single real fragment (no micro-fragmentation)
-            buf = self._pack_fragment(data, FLAG_REAL)
-            self._writer.write(buf)
-            await self._writer.drain()
+            return
+
+        # Phase D3 — substantial chaff (D2 at 1.2% was below detection):
+        #   chaff_chance% of bulk writes get 1-3 fake fragments of 800-4000B.
+        #   Expected overhead at chaff=0.35: ~20% bandwidth tax — visible
+        #   in pcap analysis but acceptable UX cost (mobile burst tolerated).
+        # Single TCP write + single drain — no UX latency penalty.
+        buf = bytearray()
+        buf.extend(self._pack_fragment(data, FLAG_REAL))
+
+        if self.chaff_chance > 0 and random.random() < self.chaff_chance:
+            n_chaff = random.randint(1, 3)
+            for _ in range(n_chaff):
+                chaff_size = random.randint(800, 4000)
+                buf.extend(self._pack_fragment(os.urandom(chaff_size), FLAG_CHAFF))
+
+        self._writer.write(bytes(buf))
+        await self._writer.drain()
 
     async def _write_fragmented(self, data: bytes):
         """Фрагментирует мелкие данные с overlap и chaff."""
