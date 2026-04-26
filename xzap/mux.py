@@ -284,13 +284,17 @@ class MuxServerSession:
         asyncio.create_task(self._open_stream_async(stream_id, host, port))
 
     async def _open_stream_async(self, stream_id: int, host: str, port: int):
+        import time as _time
+        t0 = _time.monotonic()
         stream = MuxStream(stream_id, self)
         if not await stream.connect_target(host, port):
-            log.info("mux SYN sid=%d %s:%d CONNECT_FAILED → RST", stream_id, host, port)
+            dt = (_time.monotonic() - t0) * 1000
+            log.info("mux SYN sid=%d %s:%d CONNECT_FAILED dt=%.0fms → RST", stream_id, host, port, dt)
             await self.send_frame(stream_id, CMD_RST, b"connect failed")
             return
+        connect_ms = (_time.monotonic() - t0) * 1000
         self.streams[stream_id] = stream
-        log.info("mux SYN sid=%d %s:%d OK → SYN_ACK", stream_id, host, port)
+        log.info("mux SYN sid=%d %s:%d OK connect=%.0fms → SYN_ACK", stream_id, host, port, connect_ms)
         await self.send_frame(stream_id, CMD_SYN_ACK)
         await stream.run()
 

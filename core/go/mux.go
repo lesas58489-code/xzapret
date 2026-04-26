@@ -172,22 +172,28 @@ func (t *MuxTunnel) OpenStream(ctx context.Context, host string, port int) (*mux
 	t.streamsMu.Unlock()
 
 	req, _ := json.Marshal(map[string]interface{}{"host": host, "port": port})
+	synSentAt := time.Now()
 	if err := t.sendFrame(sid, cmdSYN, req); err != nil {
 		log.Printf("mux: stream=%d SYN send failed to %s:%d: %v", sid, host, port, err)
 		t.removeStream(sid)
 		return nil, err
 	}
-	log.Printf("mux: stream=%d SYN sent → %s:%d, awaiting ACK", sid, host, port)
+	// Phase C — timing diagnosis: log destination + RTT for every stream open,
+	// to find which hosts are slow (server target-connect bottleneck) vs fast.
+	tunAge := time.Since(t.createdAt).Round(time.Second)
+	streamsBefore := t.StreamCount()
 	// Await SYN_ACK
 	select {
 	case ok := <-s.ack:
-		log.Printf("mux: stream=%d ACK received (ok=%v)", sid, ok)
+		rtt := time.Since(synSentAt)
+		log.Printf("mux: stream=%d ACK ok=%v dest=%s:%d rtt=%v tunAge=%v streamsBefore=%d", sid, ok, host, port, rtt, tunAge, streamsBefore)
 		if !ok {
 			t.removeStream(sid)
 			return nil, fmt.Errorf("mux: server rejected stream to %s:%d", host, port)
 		}
 	case <-ctx.Done():
-		log.Printf("mux: stream=%d ctx.Done BEFORE ack: %v", sid, ctx.Err())
+		waited := time.Since(synSentAt)
+		log.Printf("mux: stream=%d TIMEOUT dest=%s:%d waited=%v ctx=%v tunAge=%v streamsBefore=%d", sid, host, port, waited, ctx.Err(), tunAge, streamsBefore)
 		t.removeStream(sid)
 		return nil, ctx.Err()
 	}
