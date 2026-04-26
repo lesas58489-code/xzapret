@@ -220,7 +220,26 @@ class XzapVpnService : VpnService() {
             if (active != null) builder.setUnderlyingNetworks(arrayOf(active))
         } catch (_: Exception) {}
 
-        vpnInterface = builder.establish() ?: return null
+        // Retry establish() up to 3 times with 300ms delay. After phone reboot
+        // or fresh consent grant, the first call often returns null due to
+        // a race between MainActivity granting VPN permission and the Service
+        // process seeing it as live. Reproducible on MIUI; affects multiple
+        // Android versions. Tiny delay clears it.
+        var fd: android.os.ParcelFileDescriptor? = null
+        for (attempt in 1..3) {
+            fd = builder.establish()
+            if (fd != null) {
+                if (attempt > 1) Log.i(TAG, "establish() succeeded on attempt $attempt")
+                break
+            }
+            Log.w(TAG, "establish() returned null on attempt $attempt — retrying after 300ms")
+            try { Thread.sleep(300) } catch (_: InterruptedException) {}
+        }
+        if (fd == null) {
+            Log.e(TAG, "establish() failed all 3 attempts — VPN consent missing or denied")
+            return null
+        }
+        vpnInterface = fd
         Log.i(TAG, "VPN established, fd=${vpnInterface?.fd}")
         return vpnInterface?.fd
     }
