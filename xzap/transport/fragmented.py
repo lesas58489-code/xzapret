@@ -60,33 +60,11 @@ class FragmentedWriter:
         """Отправляет данные. Мелкие пакеты фрагментируются, крупные — как есть."""
         if len(data) <= self.frag_threshold:
             await self._write_fragmented(data)
-            return
-
-        # Phase D2 — bulk data: pack 1-3 logical fragments + optional chaff
-        # into ONE TCP write. No drain between sub-writes (drain amplification
-        # was Phase D's fatal flaw, killed download throughput).
-        # All fragments share a single drain at end → no latency penalty.
-        buf = bytearray()
-
-        # 30% chance to split bulk data into 2 logical fragments (smaller cost
-        # than Phase D's 3-way split). Receiver demuxes by [len][flags] header,
-        # so DPI sees varied fragment-header positions in TCP stream even
-        # though TCP segmentation is unchanged.
-        if len(data) > 4096 and random.random() < 0.30:
-            split = random.randint(1024, len(data) - 1024)
-            buf.extend(self._pack_fragment(data[:split], FLAG_REAL))
-            buf.extend(self._pack_fragment(data[split:], FLAG_REAL))
         else:
-            buf.extend(self._pack_fragment(data, FLAG_REAL))
-
-        # 12% chance to append chaff fragment in same buffer.
-        # Receiver drops it by FLAG_CHAFF. ~10% bandwidth tax avg.
-        if self.chaff_chance > 0 and random.random() < self.chaff_chance:
-            chaff_data = os.urandom(random.randint(140, 700))
-            buf.extend(self._pack_fragment(chaff_data, FLAG_CHAFF))
-
-        self._writer.write(bytes(buf))
-        await self._writer.drain()
+            # Bulk data: send as single real fragment (no micro-fragmentation)
+            buf = self._pack_fragment(data, FLAG_REAL)
+            self._writer.write(buf)
+            await self._writer.drain()
 
     async def _write_fragmented(self, data: bytes):
         """Фрагментирует мелкие данные с overlap и chaff."""
