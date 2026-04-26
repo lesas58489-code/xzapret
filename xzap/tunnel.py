@@ -190,7 +190,14 @@ class XZAPTunnelServer:
         if hasattr(raw_reader, '_ws'):
             reader, writer = raw_reader, raw_writer
         else:
-            reader, writer = wrap_connection(raw_reader, raw_writer)
+            # Phase D — light xAdaptive: 12% chance of injecting a chaff TLS
+            # record after each bulk write, plus 40% chance of splitting bulk
+            # data into 2-3 random-sized records. Adds size/timing variety
+            # without significant overhead.
+            reader, writer = wrap_connection(
+                raw_reader, raw_writer,
+                chaff_chance=0.12,
+            )
         target_w = None
         username = None
 

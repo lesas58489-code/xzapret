@@ -60,10 +60,28 @@ class FragmentedWriter:
         """Отправляет данные. Мелкие пакеты фрагментируются, крупные — как есть."""
         if len(data) <= self.frag_threshold:
             await self._write_fragmented(data)
-        else:
-            # Bulk data: send as single real fragment (no micro-fragmentation)
-            buf = self._pack_fragment(data, FLAG_REAL)
-            self._writer.write(buf)
+            return
+
+        # Bulk data path (Phase D — light xAdaptive):
+        # Split into 1-3 random-sized chunks, each a separate TLS record on the
+        # wire (await drain between writes). Browser-like record-size variety.
+        chunks = [data]
+        if len(data) > 4096 and random.random() < 0.4:
+            split1 = random.randint(1024, len(data) - 1024)
+            if random.random() < 0.5 and len(data) - split1 > 2048:
+                split2 = split1 + random.randint(1024, len(data) - split1 - 1024)
+                chunks = [data[:split1], data[split1:split2], data[split2:]]
+            else:
+                chunks = [data[:split1], data[split1:]]
+
+        for ch in chunks:
+            self._writer.write(self._pack_fragment(ch, FLAG_REAL))
+            await self._writer.drain()
+
+        # Optional chaff (separate TLS record). Receiver drops by FLAG_CHAFF.
+        if self.chaff_chance > 0 and random.random() < self.chaff_chance:
+            chaff_data = os.urandom(random.randint(140, 700))
+            self._writer.write(self._pack_fragment(chaff_data, FLAG_CHAFF))
             await self._writer.drain()
 
     async def _write_fragmented(self, data: bytes):
