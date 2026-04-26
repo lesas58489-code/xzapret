@@ -10,7 +10,10 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lesas58489-code/xzapret/core/go/transport"
@@ -113,7 +116,43 @@ func (c *Client) Stop() {
 	log.Print("xzap client stopped")
 }
 
-// makeDialer builds a TransportDialer according to config.
+// hostPort represents a single relay endpoint.
+type hostPort struct {
+	host string
+	port int
+}
+
+// parseServers splits comma-separated "host" or "host:port" entries.
+// Each entry without an explicit port falls back to defaultPort. Whitespace
+// around commas is trimmed. Returns at least one entry (default if empty).
+func parseServers(spec string, defaultPort int) []hostPort {
+	out := []hostPort{}
+	for _, entry := range strings.Split(spec, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		// IPv4 / domain "host" or "host:port"
+		if i := strings.LastIndex(entry, ":"); i > 0 && !strings.Contains(entry, "::") {
+			h := entry[:i]
+			p, err := strconv.Atoi(entry[i+1:])
+			if err == nil && p > 0 && p < 65536 {
+				out = append(out, hostPort{host: h, port: p})
+				continue
+			}
+		}
+		out = append(out, hostPort{host: entry, port: defaultPort})
+	}
+	if len(out) == 0 {
+		out = append(out, hostPort{host: spec, port: defaultPort})
+	}
+	return out
+}
+
+// makeDialer builds a TransportDialer according to config. Multi-server:
+// ServerHost may be comma-separated. Each call round-robins through the
+// list. Pool warmup creates 6 tunnels staggered, so each server gets
+// roughly equal share without parallel cold-start burst.
 func (c *Client) makeDialer() TransportDialer {
 	switch c.cfg.Transport {
 	case "ws":
@@ -122,12 +161,15 @@ func (c *Client) makeDialer() TransportDialer {
 			return transport.DialWS(ctx, wsUrl)
 		}
 	default: // "tls"
-		host := c.cfg.ServerHost
-		port := c.cfg.ServerPort
+		servers := parseServers(c.cfg.ServerHost, c.cfg.ServerPort)
 		profile := parseProfile(c.cfg.TLSProfile)
+		log.Printf("makeDialer: %d server(s) configured: %v", len(servers), servers)
+		var counter atomic.Uint64
 		return func(ctx context.Context) (ReaderWriterCloser, error) {
+			i := counter.Add(1) - 1
+			s := servers[i%uint64(len(servers))]
 			sni := randomWhiteSNI()
-			conn, err := transport.DialTLS(ctx, host, port, sni, profile)
+			conn, err := transport.DialTLS(ctx, s.host, s.port, sni, profile)
 			if err != nil {
 				return nil, err
 			}
