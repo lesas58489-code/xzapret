@@ -39,13 +39,15 @@ func DefaultPoolConfig(c *Crypto, d TransportDialer) PoolConfig {
 	return PoolConfig{
 		Crypto:     c,
 		Dialer:     d,
-		MaxTunnels: 6,                // ← was 3: more parallelism so one rotation doesn't stall everything
-		MaxAge:     10 * time.Minute, // ← was 30s: rotation too aggressive, Chrome reads mid-flight RSTs as "offline"
-		// RetireGrace no longer a fixed timeout — retiring tunnels now wait
-		// for inflight streams to finish. Kept for absolute upper bound.
-		RetireGrace:  60 * time.Second,
-		RotateEvery:  30 * time.Second,
-		WarmupDelay:  2 * time.Minute,
+		MaxTunnels: 6,
+		// Phase A — browser-like connection lifetime.
+		// Measurement showed our tunnels live 175-560s; browser conns live 0.5-32s.
+		// MaxAge=60s rotates aggressively. Streams in flight on retiring tunnels
+		// keep going (RetireGrace) so YouTube/WebSocket streams don't stutter.
+		MaxAge:       60 * time.Second,
+		RetireGrace:  30 * time.Second,
+		RotateEvery:  20 * time.Second,
+		WarmupDelay:  30 * time.Second,
 		StreamDialTO: 10 * time.Second,
 	}
 }
