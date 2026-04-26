@@ -8,3 +8,8 @@ build/
 .env
 *.key
 *.pem
+
+# gomobile bind debug-symbol archive (not source, just JAR with .so symbols)
+clients/android/app/libs/xzapcore-sources.jar
+core/go/xzapcore-sources.jar
+core/go/xzapcore.aar
