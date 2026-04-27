@@ -146,15 +146,21 @@ func (p *Pool) OpenStream(ctx context.Context, host string, port int) (*muxStrea
 			}
 			continue
 		}
-		// Per-attempt timeout: split remaining ctx budget across remaining
-		// attempts. So if caller gave 10s and attempt 1 hangs on a "sick"
-		// tunnel, we cut it at ~3s and still have time for attempts 2-3 on
-		// other (hopefully healthier) tunnels. Bounded at 5s max.
+		// Per-attempt timeout. First attempt gets half the remaining budget
+		// (so a healthy-slow handshake of 2-4s isn't killed prematurely),
+		// retries split the rest. Bounded [500ms, 6s].
+		// Earlier "remaining/attemptsLeft" was too aggressive on first try
+		// — 10s caller / 3 attempts = 3.33s killed legitimate slow handshakes
+		// instead of just sick ones.
 		remaining := time.Until(deadlineOrFar(ctx))
-		attemptsLeft := time.Duration(maxAttempts - attempt)
-		perAttempt := remaining / attemptsLeft
-		if perAttempt > 5*time.Second {
-			perAttempt = 5 * time.Second
+		var perAttempt time.Duration
+		if attempt == 0 {
+			perAttempt = remaining / 2
+		} else {
+			perAttempt = remaining / time.Duration(maxAttempts-attempt)
+		}
+		if perAttempt > 6*time.Second {
+			perAttempt = 6 * time.Second
 		}
 		if perAttempt < 500*time.Millisecond {
 			perAttempt = 500 * time.Millisecond
