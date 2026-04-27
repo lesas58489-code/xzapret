@@ -29,6 +29,8 @@ type PoolConfig struct {
 	Dialer       TransportDialer
 	MaxTunnels   int           // steady-state pool size
 	MaxAge       time.Duration // proactively retire tunnels older than this
+	MaxBytes     int64         // retire after this many payload bytes (jittered ±50%)
+	MaxStreams   uint32        // retire after this many streams opened (jittered ±50%)
 	RetireGrace  time.Duration // grace period before closing a retired tunnel
 	RotateEvery  time.Duration // rotator check interval
 	WarmupDelay  time.Duration // ignore rotation during this initial window
@@ -47,6 +49,8 @@ func DefaultPoolConfig(c *Crypto, d TransportDialer) PoolConfig {
 		// once RetireGrace was raised to 120s to avoid force-closing streams
 		// — TCP flow lifetime ended up the same as pre-rotation.
 		MaxAge:       10 * time.Minute,
+		MaxBytes:     50 * 1024 * 1024, // 50 MB base, jittered → 25-75 MB per tunnel
+		MaxStreams:   120,              // 120 base, jittered → 60-180 per tunnel
 		RetireGrace:  60 * time.Second,
 		RotateEvery:  30 * time.Second,
 		WarmupDelay:  2 * time.Minute,
@@ -55,8 +59,11 @@ func DefaultPoolConfig(c *Crypto, d TransportDialer) PoolConfig {
 }
 
 type pooledTunnel struct {
-	t        *MuxTunnel
-	retiring bool
+	t          *MuxTunnel
+	maxAge     time.Duration // per-tunnel jittered lifetime
+	maxBytes   int64         // per-tunnel jittered byte budget
+	maxStreams uint32        // per-tunnel jittered stream budget
+	retiring   bool
 }
 
 type Pool struct {
@@ -246,9 +253,25 @@ func (p *Pool) createOne() {
 			log.Printf("pool: mux handshake failed (attempt %d): %v", attempt+1, err2)
 			continue
 		}
+		// Jitter all three rotation budgets per tunnel: ~[0.5×, 1.5×] of base.
+		// Spreads rotations across time/bytes/streams so DPI can't fingerprint
+		// any one regular cycle. Each tunnel hits whichever threshold first.
+		jAge := 0.5 + rand.Float64()
+		jBytes := 0.5 + rand.Float64()
+		jStreams := 0.5 + rand.Float64()
+		jMaxAge := time.Duration(float64(p.cfg.MaxAge) * jAge)
+		jMaxBytes := int64(float64(p.cfg.MaxBytes) * jBytes)
+		jMaxStreams := uint32(float64(p.cfg.MaxStreams) * jStreams)
 		p.mu.Lock()
-		p.items = append(p.items, &pooledTunnel{t: t})
+		p.items = append(p.items, &pooledTunnel{
+			t:          t,
+			maxAge:     jMaxAge,
+			maxBytes:   jMaxBytes,
+			maxStreams: jMaxStreams,
+		})
 		p.mu.Unlock()
+		log.Printf("pool: tunnel created, budgets: age=%v bytes=%dMB streams=%d",
+			jMaxAge, jMaxBytes>>20, jMaxStreams)
 		p.hasOne.Store(true)
 		p.once.Do(func() { close(p.ready) })
 		return
@@ -286,28 +309,47 @@ func (p *Pool) rotator() {
 			p.mu.Unlock()
 			continue
 		}
-		// Find oldest fresh
-		var oldest *pooledTunnel
-		var oldestAge time.Duration
+		// Find a fresh tunnel that has exceeded ANY of its (jittered) per-tunnel
+		// budgets: age, lifetime bytes, or lifetime streams. Whichever first.
+		// Prefer the one most over the highest-priority budget (age first, then
+		// just the first match — all are equally valid retirement reasons).
+		var victim *pooledTunnel
+		var reason string
+		var victimAge time.Duration
+		var victimBytes int64
+		var victimStreams uint32
 		for _, it := range p.items {
 			if !it.t.IsAlive() || it.retiring {
 				continue
 			}
 			age := time.Since(it.t.createdAt)
-			if age > oldestAge {
-				oldestAge = age
-				oldest = it
+			bytes := it.t.BytesOut()
+			streams := it.t.StreamsCreated()
+			switch {
+			case age >= it.maxAge:
+				if victim == nil || (reason == "age" && age > victimAge) {
+					victim, reason = it, "age"
+					victimAge, victimBytes, victimStreams = age, bytes, streams
+				}
+			case bytes >= it.maxBytes && victim == nil:
+				victim, reason = it, "bytes"
+				victimAge, victimBytes, victimStreams = age, bytes, streams
+			case streams >= it.maxStreams && victim == nil:
+				victim, reason = it, "streams"
+				victimAge, victimBytes, victimStreams = age, bytes, streams
 			}
 		}
-		if oldest == nil || oldestAge < p.cfg.MaxAge {
-			log.Printf("rotator: fresh=%d oldest=%v MaxAge=%v not-yet skip", freshCount, oldestAge, p.cfg.MaxAge)
+		if victim == nil {
+			log.Printf("rotator: fresh=%d no tunnel over budget — skip", freshCount)
 			p.mu.Unlock()
 			continue
 		}
-		oldest.retiring = true
-		target := oldest.t
+		victim.retiring = true
+		target := victim.t
+		budgets := fmt.Sprintf("maxAge=%v maxBytes=%dMB maxStreams=%d", victim.maxAge, victim.maxBytes>>20, victim.maxStreams)
 		p.mu.Unlock()
-		log.Printf("pool: retiring tunnel age=%s streams=%d", oldestAge, target.StreamCount())
+		log.Printf("pool: retiring tunnel reason=%s age=%v bytes=%dMB streams-created=%d active=%d (%s)",
+			reason, victimAge.Round(time.Second), victimBytes>>20, victimStreams, target.StreamCount(), budgets)
 		go p.createOne()
 		go func() {
 			// Graceful rotation: don't close while streams are alive. Poll

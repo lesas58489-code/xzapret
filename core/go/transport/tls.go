@@ -32,11 +32,17 @@ var clientHelloByProfile = map[TLSProfile]utls.ClientHelloID{
 	ProfileRandomized: utls.HelloRandomizedALPN,
 }
 
-// DialTLS opens a TCP connection to (host, port) and wraps it in a uTLS
-// handshake mimicking the given browser. sni controls the SNI sent to
-// the server — typically a legitimate-looking host like microsoft.com.
-// The server certificate is NOT validated (we rely on XZAP key auth).
+// DialTLS calls DialTLSWithChaff with default chaff params (browsing-style).
 func DialTLS(ctx context.Context, host string, port int, sni string, profile TLSProfile) (net.Conn, error) {
+	return DialTLSWithChaff(ctx, host, port, sni, profile, DefaultChaffParams())
+}
+
+// DialTLSWithChaff opens a TCP connection to (host, port) and wraps it in a
+// uTLS handshake mimicking the given browser, then wraps the TLS conn in the
+// XZAP fragmentation layer using the given chaff parameters. Allows callers
+// (Pool) to assign a different chaff "personality" to each tunnel so DPI
+// sees a mix of traffic shapes rather than identical flows.
+func DialTLSWithChaff(ctx context.Context, host string, port int, sni string, profile TLSProfile, chaff ChaffParams) (net.Conn, error) {
 	// Force IPv4 resolution. Some carriers (Megafon RU) give only IPv6
 	// to the client but have no IPv6 route to IPv4 origins → ENETUNREACH.
 	addrs, err := (&net.Resolver{}).LookupIP(ctx, "ip4", host)
@@ -74,5 +80,5 @@ func DialTLS(ctx context.Context, host string, port int, sni string, profile TLS
 	_ = uconn.SetDeadline(time.Time{})
 	// Wrap with XZAP fragmentation layer (Python server's wrap_connection
 	// expects [4B len][1B flags][data] fragments on the TCP/TLS path).
-	return WrapFragmented(uconn), nil
+	return WrapFragmentedWithChaff(uconn, chaff), nil
 }

@@ -88,6 +88,11 @@ type MuxTunnel struct {
 	createdAt time.Time
 	closeOnce sync.Once
 	closedCh  chan struct{}
+
+	// Lifetime traffic counters — rotator uses these to retire heavily-used
+	// tunnels earlier, mimicking browser conn lifecycle (heavy page view → close).
+	bytesOut       atomic.Int64
+	streamsCreated atomic.Uint32
 }
 
 // NewMuxTunnel wraps an established XZAP transport and performs the
@@ -126,6 +131,12 @@ func NewMuxTunnel(r io.Reader, w io.Writer, c *Crypto) (*MuxTunnel, error) {
 // IsAlive reports whether the tunnel has not been torn down.
 func (t *MuxTunnel) IsAlive() bool { return atomic.LoadInt32(&t.alive) == 1 }
 
+// BytesOut returns total payload bytes written through this tunnel (lifetime).
+func (t *MuxTunnel) BytesOut() int64 { return t.bytesOut.Load() }
+
+// StreamsCreated returns total number of streams opened on this tunnel (lifetime).
+func (t *MuxTunnel) StreamsCreated() uint32 { return t.streamsCreated.Load() }
+
 // StreamCount returns active streams on this tunnel.
 func (t *MuxTunnel) StreamCount() int {
 	t.streamsMu.Lock()
@@ -158,7 +169,11 @@ func (t *MuxTunnel) sendFrame(sid uint32, cmd byte, payload []byte) error {
 	frame := packMuxFrame(sid, cmd, payload)
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
-	return WriteFrame(t.w, t.c, frame)
+	if err := WriteFrame(t.w, t.c, frame); err != nil {
+		return err
+	}
+	t.bytesOut.Add(int64(len(payload)))
+	return nil
 }
 
 // OpenStream dials host:port through the tunnel and returns a duplex
@@ -170,6 +185,7 @@ func (t *MuxTunnel) OpenStream(ctx context.Context, host string, port int) (*mux
 	s := newMuxStream(sid, t)
 	t.streams[sid] = s
 	t.streamsMu.Unlock()
+	t.streamsCreated.Add(1)
 
 	req, _ := json.Marshal(map[string]interface{}{"host": host, "port": port})
 	synSentAt := time.Now()

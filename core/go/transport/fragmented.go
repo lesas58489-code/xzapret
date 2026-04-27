@@ -33,31 +33,41 @@ const (
 	fragMax   = 68
 	fragThres = 150
 
-	// Phase D3-proportional — chaff size scales with real payload size.
-	// Small uploads (HTTP GET, mux SYN) get tiny chaff that doesn't tax
-	// uplink. Large uploads (POST, file) get proportional chaff that adds
-	// real DPI-visible variability.
-	//
-	// chaff_size = payload_size * (chaffPctMin..chaffPctMax)
-	// With chaffChance fired, this guarantees % overhead invariant to
-	// uplink bandwidth — no measurement loop needed.
-	chaffChance = 0.40 // probability per bulk write
-	chaffPctMin = 0.03 // 3% of payload size minimum
-	chaffPctMax = 0.10 // 10% of payload size maximum
-	chaffMin    = 64   // floor (don't generate <64B chaff — pointless)
-	chaffMax    = 2048 // ceiling (cap on huge uploads, don't overdo)
+	chaffMin = 64   // floor (don't generate <64B chaff — pointless)
+	chaffMax = 2048 // ceiling (cap on huge uploads, don't overdo)
 )
+
+// ChaffParams controls per-tunnel chaff behavior. Different "personalities"
+// (browsing / video / download) get different params so each tunnel produces
+// a different traffic shape on the wire — DPI sees variety, not 6 identical
+// flows.
+type ChaffParams struct {
+	Chance float64 // probability per bulk write (0..1)
+	PctMin float64 // chaff size floor as fraction of payload
+	PctMax float64 // chaff size ceiling as fraction of payload
+}
+
+// DefaultChaffParams returns the Phase D3-proportional defaults — what
+// "browsing" personality uses, suitable for general-purpose mixed traffic.
+func DefaultChaffParams() ChaffParams {
+	return ChaffParams{Chance: 0.40, PctMin: 0.03, PctMax: 0.10}
+}
 
 type fragConn struct {
 	net.Conn
+	chaff ChaffParams
 	rxBuf []byte // reassembled payload bytes not yet consumed by Read
 	wMu   sync.Mutex
 }
 
-// WrapFragmented wraps c so that Write() segments outgoing data into
-// fragments and Read() reassembles incoming fragments.
+// WrapFragmented wraps c with default chaff parameters.
 func WrapFragmented(c net.Conn) net.Conn {
-	return &fragConn{Conn: c}
+	return WrapFragmentedWithChaff(c, DefaultChaffParams())
+}
+
+// WrapFragmentedWithChaff wraps c with caller-provided chaff parameters.
+func WrapFragmentedWithChaff(c net.Conn, params ChaffParams) net.Conn {
+	return &fragConn{Conn: c, chaff: params}
 }
 
 func (f *fragConn) Write(p []byte) (int, error) {
@@ -73,8 +83,8 @@ func (f *fragConn) Write(p []byte) (int, error) {
 	buf := make([]byte, 0, fragHdr+len(p)+fragHdr+chaffMax)
 	buf = appendFragment(buf, p, flagReal)
 
-	if rand.Float64() < chaffChance {
-		pct := chaffPctMin + rand.Float64()*(chaffPctMax-chaffPctMin)
+	if rand.Float64() < f.chaff.Chance {
+		pct := f.chaff.PctMin + rand.Float64()*(f.chaff.PctMax-f.chaff.PctMin)
 		size := int(float64(len(p)) * pct)
 		if size < chaffMin {
 			size = chaffMin

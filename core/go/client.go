@@ -36,6 +36,7 @@ type Client struct {
 	cryp  *Crypto
 	pool  *Pool
 	socks *socksServer
+	decoy *DecoyManager
 	mu    sync.Mutex
 	up    bool
 }
@@ -81,6 +82,13 @@ func (c *Client) Start() error {
 	}
 	c.socks = newSocksServer(ln, c.pool)
 	go c.socks.Run()
+
+	// Start decoy traffic generator. Sites = whiteSNIs (bypass.txt).
+	// Our process is excluded from VpnService (addDisallowedApplication),
+	// so these requests bypass the tunnel and look like real browsing to DPI.
+	c.decoy = NewDecoyManager(append([]string(nil), whiteSNIs...))
+	c.decoy.Start()
+
 	c.up = true
 	log.Printf("xzap client started, SOCKS5 on %s, transport=%s", c.cfg.LocalSocks, c.cfg.Transport)
 	return nil
@@ -103,6 +111,10 @@ func (c *Client) Stop() {
 	defer c.mu.Unlock()
 	if !c.up {
 		return
+	}
+	if c.decoy != nil {
+		c.decoy.Stop()
+		c.decoy = nil
 	}
 	if c.socks != nil {
 		c.socks.Stop()
@@ -169,7 +181,9 @@ func (c *Client) makeDialer() TransportDialer {
 			i := counter.Add(1) - 1
 			s := servers[i%uint64(len(servers))]
 			sni := randomWhiteSNI()
-			conn, err := transport.DialTLS(ctx, s.host, s.port, sni, profile)
+			persona, personaName := pickPersonality()
+			log.Printf("makeDialer: dial server=%s sni=%s persona=%s", s.host, sni, personaName)
+			conn, err := transport.DialTLSWithChaff(ctx, s.host, s.port, sni, profile, persona)
 			if err != nil {
 				return nil, err
 			}
@@ -225,5 +239,27 @@ var whiteSNIs = []string{
 
 func randomWhiteSNI() string {
 	return whiteSNIs[rand.Intn(len(whiteSNIs))]
+}
+
+// Personality presets for chaff-shaping per tunnel. Each tunnel gets a
+// random one at dial time so DPI sees a mix of "browsing" / "video" /
+// "download" traffic shapes across the pool, rather than 6 identical flows.
+//   - browsing: 40% chaff chance, 3-10% size — bursty mixed pattern (default)
+//   - video:    20% chaff chance, 5-15% size — steady streaming, larger chunks
+//   - download: 10% chaff chance, 1-3% size — minimal overhead, mostly bulk
+var personalityPresets = []struct {
+	name   string
+	params transport.ChaffParams
+}{
+	{"browsing", transport.ChaffParams{Chance: 0.40, PctMin: 0.03, PctMax: 0.10}},
+	{"video", transport.ChaffParams{Chance: 0.20, PctMin: 0.05, PctMax: 0.15}},
+	{"download", transport.ChaffParams{Chance: 0.10, PctMin: 0.01, PctMax: 0.03}},
+}
+
+// pickPersonality returns a random (params, name) pair. Equal-weight choice
+// across the three presets — keep it simple, can tune the distribution later.
+func pickPersonality() (transport.ChaffParams, string) {
+	p := personalityPresets[rand.Intn(len(personalityPresets))]
+	return p.params, p.name
 }
 
