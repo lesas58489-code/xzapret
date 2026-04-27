@@ -14,19 +14,33 @@ XZAP — кастомный anti-DPI протокол для обхода бло
 
 | Сервер | IP | Роль | SSH |
 |--------|----|------|-----|
-| **Warsaw** | `151.244.111.186` | **Основной production** (xzap, nginx-stream, LE cert) | `ssh -i ~/.ssh/warsaw root@151.244.111.186` (с Tokyo) |
-| **Tokyo** | `151.245.104.38` | Dev машина (компилирует AAR), xzap-сервер dormant | текущий sshd для Claude |
+| **Warsaw** | `151.244.111.186` | Production XZAP (nginx-stream, LE cert `direct.solar-cloud.xyz`) | `ssh -i ~/.ssh/warsaw root@151.244.111.186` |
+| **Sweden** | `202.155.11.110` | Production XZAP (nginx-stream) | `ssh -i ~/.ssh/sweden root@202.155.11.110` |
+| **Tokyo** | `151.245.104.38` | Production XZAP (xzap.service на :443 напрямую) + dev/AAR-build | `ssh root@151.245.104.38 -p 2222` (текущий sshd для Claude) |
 
-**Текущее на Warsaw** (`apr 26 2026`):
-- nginx-stream `:443` — SNI router → 127.0.0.1:9443 (xzap) или 4443 (CF-WS, реликт)
-- nginx :80 — раздаёт `/var/www/html/xzap.apk` (свежий APK для скачивания на телефон)
-- nginx :8888 — `python3 -m http.server` для приёма APK от Windows билдера
-- xzap.service на 127.0.0.1:9443 с **Let's Encrypt cert** для `direct.solar-cloud.xyz`
-- xzap-ws.service на 127.0.0.1:8080 — WS вариант (CF-fronted, не используется в основном пути)
-- BBR отключён (cubic), TFO=0 (Russian middleboxes ломают TFO)
+**Pool в Android UI** — три IP через запятую: `151.244.111.186,202.155.11.110,151.245.104.38`. Клиент round-robin'ит.
 
-**Tokyo** сейчас идле — xzap.service / xzap-ws.service inactive. Запущен только
-xray на :443 (decoy/тест). Если понадобится — есть git, gomobile, NDK для сборки AAR.
+**Warsaw:**
+- nginx-stream `:443` — SNI router → `127.0.0.1:9443` (xzap) или `:4443` (CF-WS реликт)
+- nginx `:80` — раздаёт `/var/www/html/xzap.apk` (скачивание на телефон) + ACME challenge
+- nginx `:8888` — `python3 -m http.server` для приёма APK от Windows билдера
+- `xzap.service` на `127.0.0.1:9443` с **LE cert** `direct.solar-cloud.xyz`
+- `xzap-ws.service` на `127.0.0.1:8080` (CF WS, не используется)
+- sysctl: `tcp_congestion_control=bbr`, `default_qdisc=fq`, `tcp_fastopen=0`
+
+**Sweden:**
+- nginx-stream `:443` — SNI router → `127.0.0.1:9443` (xzap)
+- `xzap.service` на `127.0.0.1:9443`
+- xray 26.4.25 на диске (stopped+disabled, REALITY-эксперимент)
+- sysctl: те же что Warsaw
+
+**Tokyo:**
+- `xzap.service` слушает `0.0.0.0:443` напрямую (без nginx-stream)
+- **LE cert** для `relay-jp.solar-cloud.xyz` (webroot ACME через nginx :80, auto-renewal через `certbot.timer` + deploy-hook `/etc/letsencrypt/renewal-hooks/deploy/xzap-restart.sh`)
+- sshd на `:2222`, ufw разрешает `:443/tcp` + `:80/tcp` Anywhere, `:2222/tcp` + `:5432` от Tolyatti
+- fail2ban с whitelist (Warsaw, Sweden, Tolyatti, localhost)
+- sysctl: те же что Warsaw
+- Также — git, gomobile, NDK для сборки AAR
 
 ---
 
