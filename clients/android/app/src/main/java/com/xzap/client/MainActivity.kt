@@ -57,7 +57,7 @@ class MainActivity : AppCompatActivity() {
 
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         etServer.setText(prefs.getString("server", "wss://solar-cloud.xyz/ws"))
-        etPort.setText(prefs.getString("port", "8443"))
+        etPort.setText(prefs.getString("port", "443"))
         etKey.setText(prefs.getString("key", ""))
 
         btnConnect.setOnClickListener {
