@@ -299,7 +299,15 @@ class MuxServerSession:
         connect_ms = (_time.monotonic() - t0) * 1000
         self.streams[stream_id] = stream
         log.info("mux SYN sid=%d %s:%d OK connect=%.0fms → SYN_ACK", stream_id, host, port, connect_ms)
+        send_t0 = _time.monotonic()
         await self.send_frame(stream_id, CMD_SYN_ACK)
+        send_ms = (_time.monotonic() - send_t0) * 1000
+        # Track total mux→client SYN_ACK send latency. If this is >50ms regularly
+        # we know the issue is server-side write path (TLS/fragment/socket buffer)
+        # rather than upstream. If it's <5ms but client sees TIMEOUT — middlebox
+        # ate the response on the way back.
+        if send_ms > 20:
+            log.info("mux SYN sid=%d SYN_ACK send took %.1fms (slow write path)", stream_id, send_ms)
         await stream.run()
 
 

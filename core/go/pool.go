@@ -134,7 +134,8 @@ func (p *Pool) OpenStream(ctx context.Context, host string, port int) (*muxStrea
 	case <-ctx.Done():
 		return nil, fmt.Errorf("pool: cold (timed out waiting for first tunnel): %w", ctx.Err())
 	}
-	for attempt := 0; attempt < 3; attempt++ {
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		t := p.pick()
 		if t == nil {
 			// pool had a tunnel but it died since ready was signalled; brief wait
@@ -145,13 +146,38 @@ func (p *Pool) OpenStream(ctx context.Context, host string, port int) (*muxStrea
 			}
 			continue
 		}
-		stream, err := t.OpenStream(ctx, host, port)
+		// Per-attempt timeout: split remaining ctx budget across remaining
+		// attempts. So if caller gave 10s and attempt 1 hangs on a "sick"
+		// tunnel, we cut it at ~3s and still have time for attempts 2-3 on
+		// other (hopefully healthier) tunnels. Bounded at 5s max.
+		remaining := time.Until(deadlineOrFar(ctx))
+		attemptsLeft := time.Duration(maxAttempts - attempt)
+		perAttempt := remaining / attemptsLeft
+		if perAttempt > 5*time.Second {
+			perAttempt = 5 * time.Second
+		}
+		if perAttempt < 500*time.Millisecond {
+			perAttempt = 500 * time.Millisecond
+		}
+		subCtx, cancel := context.WithTimeout(ctx, perAttempt)
+		stream, err := t.OpenStream(subCtx, host, port)
+		cancel()
 		if err == nil {
 			return stream, nil
 		}
-		// retry with fresh tunnel — current one likely died
+		// retry with fresh tunnel — current one likely sick or dead.
+		// pick() will already deprioritize the one that just timed out
+		// (its health window now has a fresh outcomeTimeout entry).
 	}
 	return nil, fmt.Errorf("pool: could not open stream to %s:%d", host, port)
+}
+
+// deadlineOrFar returns ctx's deadline, or a far-future time if no deadline.
+func deadlineOrFar(ctx context.Context) time.Time {
+	if d, ok := ctx.Deadline(); ok {
+		return d
+	}
+	return time.Now().Add(30 * time.Second)
 }
 
 func (p *Pool) pick() *MuxTunnel {
@@ -171,17 +197,34 @@ func (p *Pool) pick() *MuxTunnel {
 	if needed > 0 {
 		go p.createOne()
 	}
-	// Least-loaded fresh (non-retiring)
+	// Pick: prefer healthy non-retiring tunnels first. Within that set, pick
+	// least-loaded. If all healthy are retiring or no healthy exist, fall
+	// back to any non-retiring alive (even if sick — better than nothing).
+	// "Sick" = mostly timeouts/failures recently → DPI is shaping this tunnel,
+	// keep streams off it so user gets quick failover to healthier siblings.
 	var best *MuxTunnel
 	bestLoad := 1 << 30
 	for _, it := range p.items {
-		if it.retiring {
+		if it.retiring || it.t.IsSick() {
 			continue
 		}
 		load := it.t.StreamCount()
 		if load < bestLoad {
 			bestLoad = load
 			best = it.t
+		}
+	}
+	if best == nil {
+		// No healthy non-retiring; try any non-retiring (sick included).
+		for _, it := range p.items {
+			if it.retiring {
+				continue
+			}
+			load := it.t.StreamCount()
+			if load < bestLoad {
+				bestLoad = load
+				best = it.t
+			}
 		}
 	}
 	if best == nil {
@@ -349,6 +392,8 @@ func (p *Pool) rotator() {
 			active := it.t.StreamCount()
 			var r string
 			switch {
+			case it.t.IsSick():
+				r = "sick" // DPI throttle / SYN_ACKs not arriving
 			case age >= it.maxAge:
 				r = "age"
 			case bytes >= it.maxBytes:
@@ -356,7 +401,7 @@ func (p *Pool) rotator() {
 			case streams >= it.maxStreams:
 				r = "streams"
 			default:
-				continue // not over any budget
+				continue // not over any budget and not sick
 			}
 			// Hard-ceiling: tunnel is way past its budget — keep as fallback
 			// in case we can't find a low-active-streams candidate this tick.

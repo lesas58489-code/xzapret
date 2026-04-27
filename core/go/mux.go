@@ -93,7 +93,24 @@ type MuxTunnel struct {
 	// tunnels earlier, mimicking browser conn lifecycle (heavy page view → close).
 	bytesOut       atomic.Int64
 	streamsCreated atomic.Uint32
+
+	// Recent stream outcomes (last 20) for health tracking. Used by Pool.pick()
+	// to deprioritize "sick" tunnels — handshake is alive but SYN_ACKs aren't
+	// arriving (DPI throttle pattern). See healthRecord / IsSick / RecentSuccessRate.
+	healthMu     sync.Mutex
+	healthRing   [20]streamOutcome
+	healthIdx    int
+	healthFilled int
 }
+
+// streamOutcome describes the result of a stream-open attempt for health tracking.
+type streamOutcome uint8
+
+const (
+	outcomeOK streamOutcome = iota
+	outcomeFailed              // server replied with ACK ok=false (target unreachable)
+	outcomeTimeout             // no SYN_ACK received within ctx
+)
 
 // NewMuxTunnel wraps an established XZAP transport. The version handshake
 // is no longer sent — server detects implicit v1 by parsing the first frame
@@ -127,6 +144,47 @@ func (t *MuxTunnel) BytesOut() int64 { return t.bytesOut.Load() }
 
 // StreamsCreated returns total number of streams opened on this tunnel (lifetime).
 func (t *MuxTunnel) StreamsCreated() uint32 { return t.streamsCreated.Load() }
+
+// healthRecord stores an outcome in the ring buffer.
+func (t *MuxTunnel) healthRecord(o streamOutcome) {
+	t.healthMu.Lock()
+	defer t.healthMu.Unlock()
+	t.healthRing[t.healthIdx] = o
+	t.healthIdx = (t.healthIdx + 1) % len(t.healthRing)
+	if t.healthFilled < len(t.healthRing) {
+		t.healthFilled++
+	}
+}
+
+// RecentSuccessRate returns ratio of OK outcomes in the last N samples (0..1).
+// Returns 1.0 if no samples yet (assume healthy).
+func (t *MuxTunnel) RecentSuccessRate() float64 {
+	t.healthMu.Lock()
+	defer t.healthMu.Unlock()
+	if t.healthFilled == 0 {
+		return 1.0
+	}
+	ok := 0
+	for i := 0; i < t.healthFilled; i++ {
+		if t.healthRing[i] == outcomeOK {
+			ok++
+		}
+	}
+	return float64(ok) / float64(t.healthFilled)
+}
+
+// IsSick returns true if recent stream attempts have been mostly timeouts
+// or failures — indicates the tunnel is alive but DPI is shaping traffic
+// (heartbeat works, real streams don't). Requires ≥5 samples to declare.
+func (t *MuxTunnel) IsSick() bool {
+	t.healthMu.Lock()
+	filled := t.healthFilled
+	t.healthMu.Unlock()
+	if filled < 5 {
+		return false
+	}
+	return t.RecentSuccessRate() < 0.3
+}
 
 // StreamCount returns active streams on this tunnel.
 func (t *MuxTunnel) StreamCount() int {
@@ -195,12 +253,15 @@ func (t *MuxTunnel) OpenStream(ctx context.Context, host string, port int) (*mux
 		rtt := time.Since(synSentAt)
 		log.Printf("mux: stream=%d ACK ok=%v dest=%s:%d rtt=%v tunAge=%v streamsBefore=%d", sid, ok, host, port, rtt, tunAge, streamsBefore)
 		if !ok {
+			t.healthRecord(outcomeFailed)
 			t.removeStream(sid)
 			return nil, fmt.Errorf("mux: server rejected stream to %s:%d", host, port)
 		}
+		t.healthRecord(outcomeOK)
 	case <-ctx.Done():
 		waited := time.Since(synSentAt)
 		log.Printf("mux: stream=%d TIMEOUT dest=%s:%d waited=%v ctx=%v tunAge=%v streamsBefore=%d", sid, host, port, waited, ctx.Err(), tunAge, streamsBefore)
+		t.healthRecord(outcomeTimeout)
 		t.removeStream(sid)
 		return nil, ctx.Err()
 	}
