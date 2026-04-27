@@ -1,213 +1,287 @@
-# xzapret Protocol (XZAP) — Specification v1.0 (Draft, March 2026)
+# XZAP Protocol — Specification v2.0
 
-## 1. Overview
+**Status:** Active. Reflects implementation as of 2026-04-27.
+**Replaces:** SPEC v1.0 draft (March 2026, was aspirational, not implemented).
 
-XZAP — самостоятельный открытый протокол анти-DPI нового поколения.
-Цель: сделать цензуру вычислительно невозможной даже при 900+ Тбит/с DPI + ML.
+This document specifies the XZAP wire protocol formally enough that an external implementer can write a compatible client or server. For diagrams, examples, and rationale see [docs/architecture.md](docs/architecture.md). For exact byte-level details and hexdumps see [docs/wire-protocol.md](docs/wire-protocol.md).
 
-Не является форком Xray, VLESS, MTProto или zapret.
+## 1. Goals
 
-## 2. Architecture Layers
+XZAP is a TLS-tunneled VPN-like protocol for circumventing internet censorship in adversarial network environments (specifically Russian DPI as of 2025-2026).
 
-```
-┌─────────────────────────────────────────────┐
-│            Application Layer                │
-│         (SOCKS5 / HTTP Proxy / TUN)         │
-├─────────────────────────────────────────────┤
-│         Crypto & Authorization Layer        │
-│  Auth key (256-bit) / DH 2048 + Reality     │
-│  UUID + server publicKey                    │
-│  AES-256-GCM | ChaCha20-Poly1305            │
-│  msg_key + salt (anti-replay)               │
-├─────────────────────────────────────────────┤
-│     Obfuscation & Fragmentation Layer       │
-│  Micro-fragmentation: 8–64 bytes/chunk      │
-│  Multi-SNI: 4–16 parallel connections       │
-│  Adaptive strategy (retransmit-based)       │
-│  Fake ClientHello rotation                  │
-│  Disorder + overlap + autottl + badseq      │
-├─────────────────────────────────────────────┤
-│            Transport Layer                  │
-│  Primary: TCP + Reality + uTLS              │
-│  Fallback: QUIC (TUIC-like)                 │
-│  64-byte random prefix + CTR obfuscation    │
-└─────────────────────────────────────────────┘
-```
+Design priorities (in order):
 
-## 3. Message Format
+1. **Resistance to passive DPI fingerprinting** at the TCP/TLS layer.
+2. **Multi-user authentication** without per-connection key exchange overhead.
+3. **Stream multiplexing** to avoid one-TCP-per-stream cost.
+4. **Bandwidth efficiency** — no significant overhead beyond ~5% baseline + optional shaping.
+5. **Operational simplicity** — Python server, Go client, no exotic cryptography.
 
-Every message carries an MTProto-style header:
+Non-goals:
+
+- Forward secrecy beyond the underlying TLS layer.
+- Resistance to active probes that hold a connection open and try the protocol.
+- Anonymity or unlinkability — server logs identify users by AES key fingerprint.
+
+## 2. Overview
 
 ```
-Offset  Size    Field
-0       8       msg_id      (uint64, monotonic timestamp-based)
-8       4       seqno       (uint32, sequential)
-12      2       length      (uint16, payload length)
-14      16      msg_key     (HMAC-SHA256 truncated, integrity check)
-30      N       payload     (encrypted)
+[Client]  ── TCP+TLS+XZAP frames ──→  [Server]  ── TCP ──→  [Target]
 ```
 
-Total header size: **30 bytes**.
+Client opens a TCP connection to the server on port 443, performs a TLS 1.3 handshake (ideally with a browser-like fingerprint), then sends XZAP-encrypted frames inside the TLS stream. The first frame establishes a multiplex session; subsequent frames carry stream commands.
 
-### 3.1 msg_id Generation
+## 3. Layered structure
 
-```
-msg_id = (unix_time_ms << 20) | (random & 0xFFFFF)
-```
-
-Must be monotonically increasing per session. Server rejects out-of-order msg_id
-(anti-replay).
-
-### 3.2 msg_key Derivation
+A single TLS payload byte stream, going up:
 
 ```
-msg_key = HMAC-SHA256(auth_key[88:120], plaintext)[0:16]
+[mux frame] ⊂ [XZAP frame (encrypted)] ⊂ [fragmentation envelope] ⊂ [TLS]
 ```
 
-Used for integrity verification before decryption.
+Each layer adds a header. Going down (sender side):
 
-## 4. Crypto & Authorization Layer
+1. Application bytes are split into mux frames with per-stream sid.
+2. Mux frames are encrypted into XZAP frames with per-frame nonce.
+3. XZAP frame bytes go through fragmentation layer (small frames split, optional chaff added).
+4. Fragment bytes are written to the TLS stream.
 
-### 4.1 Key Exchange
+## 4. Authentication
 
-1. Client generates ephemeral X25519 keypair.
-2. Server has static X25519 keypair (publicKey distributed out-of-band).
-3. Shared secret = X25519(client_private, server_public).
-4. Auth key = HKDF-SHA256(shared_secret, salt=UUID, info="xzap-auth", len=256).
+### 4.1 Key model
 
-### 4.2 Encryption
+Each client has a **pre-shared 256-bit symmetric key** (AES-256). Key is base64-encoded in client config and `keys.json` on server. Out-of-band distribution; XZAP does **not** define key exchange.
 
-Two algorithms supported (client choice in handshake):
+Server stores keys in `keys.json`:
 
-| Algorithm         | Key    | Nonce  | Tag    |
-|-------------------|--------|--------|--------|
-| AES-256-GCM       | 32 B   | 12 B   | 16 B   |
-| ChaCha20-Poly1305 | 32 B   | 12 B   | 16 B   |
-
-Encrypted payload format:
-```
-[12 bytes nonce][N bytes ciphertext + 16 bytes tag]
-```
-
-AAD (Additional Authenticated Data) = msg_id || seqno || length.
-
-### 4.3 Anti-Replay
-
-- msg_id must be unique and monotonically increasing.
-- Server maintains sliding window of last 1024 msg_ids.
-- salt rotated every 60 seconds.
-
-## 5. Obfuscation & Fragmentation Layer
-
-### 5.1 Micro-Fragmentation
-
-Each encrypted message is split into fragments of **8–64 bytes** (random size per fragment).
-
-Fragment wire format:
-```
-Offset  Size    Field
-0       8       msg_id      (parent message)
-8       2       frag_index  (uint16)
-10      2       frag_total  (uint16)
-12      N       frag_data   (8–64 bytes)
+```json
+{
+  "users": {
+    "alice": "BASE64_32_BYTES_KEY=",
+    "bob":   "BASE64_32_BYTES_KEY="
+  }
+}
 ```
 
-Fragment header: **12 bytes**.
+### 4.2 Identification on connect
 
-### 5.2 Fragment Delivery Techniques
+Server has no a-priori knowledge of which user is connecting. Identification works via try-decryption:
 
-- **disorder**: fragments sent out of order (random shuffle)
-- **overlap**: `overlap=1` — each fragment overlaps by 1 byte with the next
-- **autottl**: random TTL per fragment to evade stateful DPI
-- **badseq/badsum**: decoy packets with invalid TCP seq/checksum (dropped by receiver, confuse DPI)
+1. Server reads first XZAP frame on the new TLS connection.
+2. For each `(username, key)` in keystore, server attempts AES-GCM decryption.
+3. If decryption succeeds AND plaintext is valid JSON containing `"v":"mux1"`, that key is selected for the rest of the connection.
+4. If no key works, server closes the connection silently.
 
-### 5.3 Multi-SNI / Multi-Path
+This enables per-user logging (`User 'alice' connected`), per-user routing decisions, and key revocation (delete from keys.json + restart, all sessions for that user die on next connection).
 
-Client maintains **4–16 parallel TCP/QUIC connections**, each with a different
-SNI from the whitelist (e.g., youtube.com, google.com, cloudflare.com).
+## 5. Frame formats
 
-Fragment routing:
-```
-path_index = (msg_id + frag_index) % num_paths
-```
+All multi-byte integers are **big-endian (network order)**.
 
-### 5.4 Fake ClientHello Rotation
+### 5.1 Fragmentation envelope
 
-During handshake and periodically during data phase, client injects fake TLS
-ClientHello records from a built-in pool of captured dumps (yandex.ru, vk.com,
-avito.ru, etc.).
-
-Rotation interval: every 30–120 seconds (random).
-
-## 6. Adaptive Strategy
-
-Client and server monitor connection quality and automatically escalate
-obfuscation:
+Outermost layer (on top of TLS payload). Every byte the receiver sees from TLS is part of one or more fragments.
 
 ```
-if retransmits > 3:
-    repeats = min(repeats + 1, 3)
-    fragment_count *= 2
-    tls_mod = "rnd,rndsni,padencap"
-
-if retransmits == 0 for 60s:
-    de-escalate one level
+struct Fragment {
+    uint32_t total_len;     // length of (flags + data)
+    uint8_t  flags;         // see below
+    uint8_t  data[total_len - 1];
+}
 ```
 
-### 6.1 Escalation Levels
+Flags bitfield:
 
-| Level | Repeats | Fragment Size | Extra                |
-|-------|---------|---------------|----------------------|
-| 0     | 1       | 32–64 B       | none                 |
-| 1     | 2       | 16–48 B       | disorder             |
-| 2     | 3       | 8–32 B        | disorder + overlap   |
-| 3     | 3       | 8–16 B        | full (+ badseq/sum)  |
+| Bit 0 | Meaning |
+|---|---|
+| 0 | REAL — append `data` to receiver's accumulator |
+| 1 | CHAFF — drop this fragment entirely |
 
-## 7. Transport Layer
+| Bit 1 | Meaning |
+|---|---|
+| 0 | NORMAL |
+| 1 | OVERLAP — strip `overlap_size` (negotiated) bytes from start of `data` (legacy, currently `overlap_size=0`) |
 
-### 7.1 TCP + Reality + uTLS
+Receiver reads `total_len`, then `total_len` bytes (including flags), splits into flags + data, processes per flags.
 
-- uTLS fingerprint: chrome / edge / firefox / random (rotation per connection).
-- Reality: server validates real TLS handshake against target domain.
-- 64-byte random prefix prepended to every connection.
+### 5.2 XZAP encrypted frame
 
-### 7.2 QUIC Fallback
-
-- QUIC with same fragmentation and obfuscation.
-- Used when TCP is throttled or blocked.
-
-### 7.3 Proxy Modes
-
-- SOCKS5 proxy (default)
-- HTTP CONNECT proxy
-- TUN device (full traffic capture, requires root on some platforms)
-
-## 8. Handshake Flow
+The reassembled output of fragmentation layer is a stream of XZAP frames.
 
 ```
-Client                                          Server
-  │                                               │
-  │── [1] 4-8 parallel ClientHello ──────────────>│
-  │   (uTLS fingerprint, SNI=white domain)        │
-  │   (+ fake ClientHello interleaved)            │
-  │   (+ micro-fragmented)                        │
-  │                                               │
-  │<── [2] Reality ServerHello ──────────────────│
-  │   (only on 1 connection, matched by UUID)     │
-  │                                               │
-  │── [3] X25519 key exchange ──────────────────>│
-  │   (encrypted with Reality session key)        │
-  │                                               │
-  │<── [4] Auth OK + algo confirmation ─────────│
-  │                                               │
-  │══ [5] Data phase (all paths active) ════════│
-  │   (fragments routed round-robin)              │
+struct XzapFrame {
+    uint32_t payload_len;        // length of (random_prefix + nonce + ciphertext + tag)
+    uint8_t  random_prefix[16];  // ignored on receive, anti-fingerprinting
+    uint8_t  aead_nonce[12];     // AES-GCM nonce
+    uint8_t  ciphertext[N];      // = AES-256-GCM(key, nonce, mux_frame_bytes, aad=NULL)
+    uint8_t  aead_tag[16];       // GCM authentication tag
+}
+
+// where:  N + 16 + 12 + 16 = payload_len, so N = payload_len - 44
 ```
 
-## 9. Security Considerations
+`random_prefix` is generated by sender via cryptographically secure random per frame. It is NOT included in AEAD computation. Its purpose is purely to perturb the visible byte pattern at the start of each TLS-encrypted block.
 
-- Forward secrecy via ephemeral X25519 per session.
-- No distinguishable patterns: random sizes, random timing, random paths.
-- Active probing resistance: server responds only to valid UUID + Reality.
-- Replay protection: msg_id monotonicity + sliding window.
-- Censorship cost: O(n * paths * fragments) per message to analyze.
+`aead_nonce` MUST be unique per `(key, frame)` tuple. Implementations SHOULD use a 12-byte CSPRNG output. Nonce reuse breaks AES-GCM security catastrophically.
+
+AEAD AAD = empty (NULL). No authenticated metadata beyond the ciphertext+tag itself.
+
+### 5.3 Mux frame
+
+The decrypted plaintext of an XZAP frame is one mux frame.
+
+```
+struct MuxFrame {
+    uint32_t stream_id;     // 0 reserved for control
+    uint8_t  cmd;
+    uint32_t payload_len;
+    uint8_t  payload[payload_len];
+}
+```
+
+Command set:
+
+| Hex | Name | Direction | Payload |
+|---|---|---|---|
+| 0x01 | SYN | client→server | UTF-8 JSON `{"host":"...","port":N}` |
+| 0x02 | SYN_ACK | server→client | empty |
+| 0x03 | DATA | bidirectional | raw bytes |
+| 0x04 | FIN | bidirectional | empty |
+| 0x05 | RST | bidirectional | optional ASCII reason |
+| 0x06 | PING | bidirectional, sid=0 only | empty |
+| 0x07 | PONG | bidirectional, sid=0 only | empty |
+| 0x08 | WINDOW | bidirectional | 4-byte BE uint32, additional credit |
+
+Stream ID 0 is reserved for control. The first byte sent on a new TLS connection is a control-stream SYN with payload `{"v":"mux1"}` — this serves as both the version handshake and the keystore identification probe.
+
+## 6. Connection lifecycle
+
+### 6.1 Handshake
+
+1. **TCP**: client opens TCP to `server:443`.
+2. **TLS**: client performs TLS 1.3 handshake. Server cert is presented for whatever subdomain the SNI requests; client does NOT verify the cert chain (auth is via AES key, not cert).
+3. **Mux version handshake**: client sends one XZAP frame whose plaintext is mux frame `{stream_id=0, cmd=SYN, payload={"v":"mux1"}}`. Server identifies the user via try-decryption (Section 4.2), confirms version `mux1`, and replies with the same plaintext: `{stream_id=0, cmd=SYN_ACK, payload={"v":"mux1"}}`.
+
+After step 3, both sides are in mux mode.
+
+### 6.2 Stream open
+
+Client wishing to connect to a target host:port:
+
+1. Allocate next available `stream_id` (uint32, monotonic per connection, skip 0).
+2. Send mux frame: `{sid=N, cmd=SYN, payload=JSON({host, port})}`.
+3. Wait up to `STREAM_DIAL_TO` (default 10s) for either:
+   - `{sid=N, cmd=SYN_ACK}` → stream is open.
+   - `{sid=N, cmd=RST, payload=reason}` → stream rejected.
+   - Timeout → client closes the stream locally (server will RST or eventually FIN).
+
+Server upon receiving SYN:
+
+1. Look up stream by sid. If exists, ignore (or RST).
+2. Open TCP to `(host, port)` with timeout `TARGET_CONNECT_TO` (default 3s).
+3. On success: register stream object, send SYN_ACK.
+4. On failure: send RST with reason "connect failed".
+
+### 6.3 Stream data
+
+Both sides MAY send DATA frames. The receiver of a DATA frame:
+
+1. Look up stream by sid. If unknown, drop frame.
+2. Decrease send window (peer's credit) by len(payload).
+3. Deliver bytes to upper layer.
+
+Periodically (e.g., every 64 KB consumed), receiver sends a WINDOW frame with delta = bytes consumed:
+
+```
+{sid=N, cmd=WINDOW, payload=uint32_be(delta)}
+```
+
+Sender increases its send window for that stream by delta. Initial window = `INITIAL_WINDOW` (default 256 KB).
+
+### 6.4 Stream close
+
+Either side MAY initiate FIN. The receiver:
+
+1. Mark stream half-closed.
+2. Continue forwarding any DATA already in flight from peer.
+3. When local app closes, send FIN back.
+
+After both FINs exchanged (or one RST), both sides remove the stream.
+
+### 6.5 Connection liveness
+
+Either side MAY send PING on stream 0 with empty payload. Receiver MUST reply with PONG.
+
+Recommended: client sends PING every 10s, considers connection dead if no frame received for 30s. On dead detection: close the TCP connection, drop all streams.
+
+### 6.6 Connection close
+
+To close cleanly: client closes TLS / TCP. Server detects and removes session. No mux-level disconnect message.
+
+## 7. Reliability
+
+XZAP relies on TCP+TLS underneath for reliable delivery. The protocol does not implement retransmits or acknowledgments above what TCP provides.
+
+If the TCP connection breaks, all streams on it are lost. Clients SHOULD maintain multiple TLS connections (a pool) to survive single-connection failures.
+
+## 8. Constants and defaults
+
+| Constant | Default | Description |
+|---|---|---|
+| `INITIAL_WINDOW` | 262144 (256 KB) | Initial flow-control credit per stream |
+| `WINDOW_GRANT_THRESHOLD` | 65536 (64 KB) | Receiver grants WINDOW after N bytes consumed |
+| `MAX_PAYLOAD` | 262144 (256 KB) | Maximum mux frame payload |
+| `STREAM_DIAL_TO` | 10s | Client timeout on SYN→ACK |
+| `TARGET_CONNECT_TO` | 3s | Server timeout on TCP to target |
+| `PING_INTERVAL` | 10s | Recommended PING cadence |
+| `PING_TIMEOUT` | 30s | Recommended dead-detection threshold |
+| `MUX_HDR_SIZE` | 9 | Bytes of mux frame header |
+| `XZAP_OVERHEAD` | 44 | Bytes of XZAP frame overhead (4+16+12+16-4 internal: payload_len excludes itself; total wire overhead is 4+16+12+16=48) |
+
+## 9. Wire-level shaping (optional)
+
+Implementations MAY add traffic-shaping techniques to defeat statistical fingerprinting:
+
+- **Micro-fragmentation**: small payloads (≤150 bytes) are split into 24-68 byte fragments at the fragmentation layer. Each fragment is its own `[len][flags][data]` record. This obscures the natural payload sizes from DPI.
+- **Chaff fragments** (FLAG_CHAFF=0x01): sender can interleave fragments with random data and chaff flag set; receiver drops them. Adds noise to bytes-per-second profile.
+
+XZAP defines the wire format for these (see Section 5.1) but does not mandate when or how aggressively to use them. See [docs/architecture.md §Phase D3](docs/architecture.md) for the current production tuning.
+
+## 10. Security considerations
+
+### What XZAP defends against
+
+- **Passive byte-pattern DPI** — encrypted payload looks random; chaff and fragmentation can obscure size patterns.
+- **Per-user accountability** — each user has unique key; logs identify them.
+- **Replay within a session** — random_prefix makes each frame visible-byte-unique.
+
+### What XZAP does NOT defend against
+
+- **Active TLS probe + tunnel detection** — sender's TLS handshake fingerprint may give away that this is a non-browser client. uTLS browser-mimicry helps but is not perfect.
+- **Cross-frame replay** — if an attacker captures a frame and re-sends it on a different connection, server will likely accept it once (same nonce/key combo). Mitigation: per-frame replay tracking is NOT implemented; relies on transport-level guarantees from TLS.
+- **Key compromise** — anyone with a user's AES key can connect as them. Rotate via `manage_keys.py remove` + add new + restart server.
+- **Server compromise** — server can decrypt all traffic. No end-to-end privacy of target traffic from server operator.
+
+### Recommendations for implementers
+
+- Use uTLS or equivalent to mimic a current browser's ClientHello.
+- Use a fresh CSPRNG nonce per AES-GCM frame; never reuse.
+- Enforce a maximum frame size (256 KB plaintext) to bound memory.
+- Rotate keys periodically out-of-band; do not embed in code/repo.
+
+## 11. Reference implementation
+
+- **Server**: Python 3.10+ asyncio, `xzap/` directory. Entry: `run_server.py`.
+- **Client (Android)**: Go 1.22+ compiled to AAR via `gomobile bind`. Source: `core/go/`.
+- **Client (Windows desktop)**: Python tkinter app, `clients/windows/`. Legacy.
+
+See repo: `https://github.com/lesas58489-code/xzapret`
+
+## 12. Versioning
+
+The mux version handshake `{"v":"mux1"}` declares protocol version `mux1`. Future incompatible changes will use `mux2`, `mux3`, etc. Server SHOULD reject unknown version with RST on the control stream.
+
+## 13. Changelog
+
+- **v2.0 (2026-04-27)**: Replaces aspirational v1.0 draft. Document reflects actual implementation: simple pre-shared AES key (no DH/Reality), single-key-per-user keystore, mux1 protocol, fragmentation+chaff at outermost layer.
+- **v1.0 (2026-03)**: Aspirational draft with X25519, Reality, MTProto-style headers — never implemented.
