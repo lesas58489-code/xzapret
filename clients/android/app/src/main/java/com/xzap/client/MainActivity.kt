@@ -21,6 +21,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etPort: EditText
     private lateinit var etKey: EditText
     private lateinit var btnConnect: Button
+    private lateinit var btnShareLogs: Button
     private lateinit var tvStatus: TextView
     private var connected = false
 
@@ -51,6 +52,7 @@ class MainActivity : AppCompatActivity() {
         etPort = findViewById(R.id.et_port)
         etKey = findViewById(R.id.et_key)
         btnConnect = findViewById(R.id.btn_connect)
+        btnShareLogs = findViewById(R.id.btn_share_logs)
         tvStatus = findViewById(R.id.tv_status)
 
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
@@ -61,6 +63,73 @@ class MainActivity : AppCompatActivity() {
         btnConnect.setOnClickListener {
             if (connected) disconnect() else requestVpn()
         }
+        btnShareLogs.setOnClickListener { shareLogs() }
+    }
+
+    /**
+     * Grab last few thousand lines of our process's logcat for the relevant
+     * tags, redact the secret key if present, write to cache, and pop a
+     * Share intent so the user can send the file via Telegram / email / etc.
+     * Apps can read their own process's logs without special permission since
+     * Android 4.1.
+     */
+    private fun shareLogs() {
+        Toast.makeText(this, "Collecting logs…", Toast.LENGTH_SHORT).show()
+        Thread {
+            try {
+                val logsDir = java.io.File(cacheDir, "logs")
+                logsDir.mkdirs()
+                val logFile = java.io.File(logsDir, "xzap_log.txt")
+
+                // Filter: keep our tags at Verbose, mute everything else.
+                val proc = Runtime.getRuntime().exec(arrayOf(
+                    "logcat", "-d", "-t", "5000",
+                    "XZAP-BOOT:V", "XZAP-CRASH:V", "XZAP-LOG:V",
+                    "XzapVpnService:V", "MainActivity:V",
+                    "GoLog:V",
+                    "*:S"
+                ))
+
+                val secretKey = etKey.text.toString().trim()
+                logFile.bufferedWriter().use { writer ->
+                    writer.write("=== XZAP debug log ===\n")
+                    writer.write("Captured: ${java.util.Date()}\n")
+                    writer.write("Android: ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT})\n")
+                    writer.write("Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}\n")
+                    writer.write("App: ${packageName} v${packageManager.getPackageInfo(packageName, 0).versionName}\n")
+                    writer.write("Server: ${etServer.text}\n")
+                    writer.write("Port: ${etPort.text}\n")
+                    writer.write("Connected: $connected\n")
+                    writer.write("=====================\n\n")
+                    proc.inputStream.bufferedReader().forEachLine { line ->
+                        val sanitized = if (secretKey.length >= 16) {
+                            line.replace(secretKey, "<KEY-REDACTED>")
+                        } else line
+                        writer.write(sanitized)
+                        writer.write("\n")
+                    }
+                }
+                proc.waitFor()
+
+                val uri = androidx.core.content.FileProvider.getUriForFile(
+                    this, "$packageName.fileprovider", logFile
+                )
+                val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    putExtra(Intent.EXTRA_SUBJECT, "XZAP debug log")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                runOnUiThread {
+                    startActivity(Intent.createChooser(sendIntent, "Send XZAP log"))
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("XZAP-LOG", "shareLogs failed", e)
+                runOnUiThread {
+                    Toast.makeText(this, "Log export failed: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }.start()
     }
 
     private fun requestVpn() {

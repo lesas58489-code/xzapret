@@ -71,4 +71,11 @@
         android:textSize="16sp"
         android:layout_marginTop="16dp" />
 
+    <Button
+        android:id="@+id/btn_share_logs"
+        android:layout_width="200dp"
+        android:layout_height="wrap_content"
+        android:text="Share Logs"
+        android:layout_marginTop="16dp" />
+
 </LinearLayout>
