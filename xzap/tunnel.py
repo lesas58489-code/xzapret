@@ -228,15 +228,37 @@ class XZAPTunnelServer:
             encrypted = payload[PREFIX_SIZE:]
             ctrl = crypto.decrypt(encrypted)
 
-            req = json.loads(ctrl)
+            # Three protocol paths, distinguished by what the decrypted ctrl looks like:
+            #   1. Legacy single-stream:  JSON {"cmd":"connect", "host":..., "port":...}
+            #   2. Mux v1 explicit hs:    JSON {"v":"mux1"}
+            #   3. Mux v1 implicit hs:    raw binary mux frame [4B sid][1B cmd][4B plen][...]
+            #                              (new fast-start clients skip the version JSON
+            #                              and send the first mux SYN immediately —
+            #                              saves ~RTT on cold start)
+            try:
+                req = json.loads(ctrl)
+            except (ValueError, TypeError):
+                req = None
 
-            # Mux protocol detection: first mux frame is [4B sid=0][1B cmd=SYN][4B len][{"v":"mux1"}]
-            # which after JSON-decode attempt above fails (it's not JSON at top level).
-            # But the client actually wraps the version JSON *as the payload* of a mux frame,
-            # so the decrypted bytes are the mux frame itself. We detect that path by
-            # trying to parse as a mux SYN on control stream.
-            #
-            # Legacy path: req = {"cmd": "connect", "host":..., "port":...}
+            if req is None:
+                # Path 3: implicit-v1 mux. ctrl IS the first mux frame; process it directly.
+                from .mux import MuxServerSession
+                session = MuxServerSession(reader, writer, crypto, _send_frame, username=username)
+                log.info("Mux session (implicit v1, fast-start) user=%s", username)
+                try:
+                    await session._process_mux_frame(ctrl)
+                    while True:
+                        try:
+                            frame_bytes = await _recv_frame(reader, crypto)
+                        except Exception:
+                            break
+                        await session._process_mux_frame(frame_bytes)
+                finally:
+                    for s in list(session.streams.values()):
+                        await s.close(notify=False)
+                return
+
+            # Path 2: explicit mux version handshake (old clients).
             if req.get("v") == "mux1":
                 # Client sent a raw version JSON — enter mux mode
                 from .mux import MuxServerSession, CMD_SYN_ACK, MUX_VERSION, CONTROL_STREAM_ID, pack_frame

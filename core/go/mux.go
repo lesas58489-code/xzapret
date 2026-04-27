@@ -95,21 +95,12 @@ type MuxTunnel struct {
 	streamsCreated atomic.Uint32
 }
 
-// NewMuxTunnel wraps an established XZAP transport and performs the
-// version handshake. Returns a running MuxTunnel ready to open streams.
+// NewMuxTunnel wraps an established XZAP transport. The version handshake
+// is no longer sent — server detects implicit v1 by parsing the first frame
+// as a binary mux frame (vs JSON for legacy paths). This saves ~1 RTT on
+// cold start. Backward-compat: server tunnel.py still accepts old explicit
+// {"v":"mux1"} JSON for any client that hasn't been updated yet.
 func NewMuxTunnel(r io.Reader, w io.Writer, c *Crypto) (*MuxTunnel, error) {
-	// Client-side version handshake
-	if err := WriteFrame(w, c, []byte(`{"v":"`+muxVersion+`"}`)); err != nil {
-		return nil, fmt.Errorf("mux: send version: %w", err)
-	}
-	resp, err := ReadFrame(r, c)
-	if err != nil {
-		return nil, fmt.Errorf("mux: recv version: %w", err)
-	}
-	var versionAck struct{ V string `json:"v"` }
-	if err := json.Unmarshal(resp, &versionAck); err != nil || versionAck.V != muxVersion {
-		return nil, fmt.Errorf("mux: unexpected version handshake: %q", resp)
-	}
 	t := &MuxTunnel{
 		r:            r,
 		w:            w,

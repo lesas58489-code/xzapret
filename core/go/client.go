@@ -39,6 +39,49 @@ type Client struct {
 	decoy *DecoyManager
 	mu    sync.Mutex
 	up    bool
+
+	// warmupDone flips to true once the pool's warmup goroutine has finished
+	// kicking off all initial tunnels. The dialer uses this to switch from
+	// the "warmup-only" server subset (non-deferred) to the full set.
+	// Pointer-shared with PoolConfig.WarmupDone so Pool can flip it.
+	warmupDone *atomic.Bool
+
+	// rttMu protects rtts. rtts[host:port] = most-recent successful dial duration.
+	// Used for smart-priority: prefer fastest server first on cold-start.
+	rttMu sync.Mutex
+	rtts  map[string]time.Duration
+}
+
+func (c *Client) recordRTT(s hostPort, dt time.Duration) {
+	c.rttMu.Lock()
+	defer c.rttMu.Unlock()
+	if c.rtts == nil {
+		c.rtts = make(map[string]time.Duration)
+	}
+	c.rtts[fmt.Sprintf("%s:%d", s.host, s.port)] = dt
+}
+
+// ServerRTTs returns a JSON object {host:port → milliseconds} of the most
+// recent successful dial duration per server. Caller (Kotlin) persists this
+// across app restarts via SharedPreferences and uses it to order the servers
+// list passed to Start() so cold-start dials hit the fastest server first.
+func (c *Client) ServerRTTs() string {
+	c.rttMu.Lock()
+	defer c.rttMu.Unlock()
+	if len(c.rtts) == 0 {
+		return "{}"
+	}
+	out := "{"
+	first := true
+	for k, v := range c.rtts {
+		if !first {
+			out += ","
+		}
+		first = false
+		out += fmt.Sprintf("%q:%d", k, v.Milliseconds())
+	}
+	out += "}"
+	return out
 }
 
 // NewClient validates config and sets up internal components (does not start them).
@@ -54,7 +97,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.LocalSocks == "" {
 		cfg.LocalSocks = "127.0.0.1:10808"
 	}
-	return &Client{cfg: cfg, cryp: cryp}, nil
+	return &Client{cfg: cfg, cryp: cryp, warmupDone: &atomic.Bool{}}, nil
 }
 
 // Start warms the tunnel pool and opens the local SOCKS5 listener.
@@ -69,6 +112,7 @@ func (c *Client) Start() error {
 
 	dialer := c.makeDialer()
 	poolCfg := DefaultPoolConfig(c.cryp, dialer)
+	poolCfg.WarmupDone = c.warmupDone
 	log.Printf("pool cfg: maxTunnels=%d maxAge=%v retireGrace=%v rotateEvery=%v warmupDelay=%v",
 		poolCfg.MaxTunnels, poolCfg.MaxAge, poolCfg.RetireGrace, poolCfg.RotateEvery, poolCfg.WarmupDelay)
 	c.pool = NewPool(poolCfg)
@@ -129,14 +173,20 @@ func (c *Client) Stop() {
 }
 
 // hostPort represents a single relay endpoint.
+//   deferred=true means "not part of warmup pool; only joins steady-state
+//   rotation after warmup completes" — useful for slow/distant servers
+//   (e.g. Tokyo from Russia) so cold-start hits the fast ones first.
 type hostPort struct {
-	host string
-	port int
+	host     string
+	port     int
+	deferred bool
 }
 
 // parseServers splits comma-separated "host" or "host:port" entries.
 // Each entry without an explicit port falls back to defaultPort. Whitespace
-// around commas is trimmed. Returns at least one entry (default if empty).
+// around commas is trimmed. A "!" prefix marks the server as deferred — it
+// is excluded from warmup and only used in steady-state rotation.
+// Returns at least one entry (default if empty).
 func parseServers(spec string, defaultPort int) []hostPort {
 	out := []hostPort{}
 	for _, entry := range strings.Split(spec, ",") {
@@ -144,16 +194,24 @@ func parseServers(spec string, defaultPort int) []hostPort {
 		if entry == "" {
 			continue
 		}
+		deferred := false
+		if strings.HasPrefix(entry, "!") {
+			deferred = true
+			entry = strings.TrimSpace(strings.TrimPrefix(entry, "!"))
+			if entry == "" {
+				continue
+			}
+		}
 		// IPv4 / domain "host" or "host:port"
 		if i := strings.LastIndex(entry, ":"); i > 0 && !strings.Contains(entry, "::") {
 			h := entry[:i]
 			p, err := strconv.Atoi(entry[i+1:])
 			if err == nil && p > 0 && p < 65536 {
-				out = append(out, hostPort{host: h, port: p})
+				out = append(out, hostPort{host: h, port: p, deferred: deferred})
 				continue
 			}
 		}
-		out = append(out, hostPort{host: entry, port: defaultPort})
+		out = append(out, hostPort{host: entry, port: defaultPort, deferred: deferred})
 	}
 	if len(out) == 0 {
 		out = append(out, hostPort{host: spec, port: defaultPort})
@@ -175,18 +233,44 @@ func (c *Client) makeDialer() TransportDialer {
 	default: // "tls"
 		servers := parseServers(c.cfg.ServerHost, c.cfg.ServerPort)
 		profile := parseProfile(c.cfg.TLSProfile)
-		log.Printf("makeDialer: %d server(s) configured: %v", len(servers), servers)
+		// Split into warmup-eligible (non-deferred) and full lists. During
+		// warmup we only dial non-deferred servers. After warmup completes
+		// (Pool sets warmupDone=true) we use the full list for replacements.
+		// Caller can mark a server with "!" prefix in ServerHost to defer it.
+		warmupServers := []hostPort{}
+		for _, s := range servers {
+			if !s.deferred {
+				warmupServers = append(warmupServers, s)
+			}
+		}
+		if len(warmupServers) == 0 {
+			// All deferred? Fall back to using all — better than no servers.
+			warmupServers = servers
+			log.Printf("makeDialer: all servers marked deferred — fallback to full set for warmup too")
+		}
+		log.Printf("makeDialer: warmup-set=%v full-set=%v", warmupServers, servers)
 		var counter atomic.Uint64
+		warmupDone := c.warmupDone
 		return func(ctx context.Context) (ReaderWriterCloser, error) {
+			pool := warmupServers
+			if warmupDone.Load() {
+				pool = servers
+			}
 			i := counter.Add(1) - 1
-			s := servers[i%uint64(len(servers))]
+			s := pool[i%uint64(len(pool))]
 			sni := randomWhiteSNI()
 			persona, personaName := pickPersonality()
-			log.Printf("makeDialer: dial server=%s sni=%s persona=%s", s.host, sni, personaName)
+			phase := "warmup"
+			if warmupDone.Load() {
+				phase = "steady"
+			}
+			log.Printf("makeDialer: dial phase=%s server=%s sni=%s persona=%s", phase, s.host, sni, personaName)
+			start := time.Now()
 			conn, err := transport.DialTLSWithChaff(ctx, s.host, s.port, sni, profile, persona)
 			if err != nil {
 				return nil, err
 			}
+			c.recordRTT(s, time.Since(start))
 			return conn, nil
 		}
 	}

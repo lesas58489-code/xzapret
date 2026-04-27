@@ -25,16 +25,22 @@ type ReaderWriterCloser interface {
 }
 
 type PoolConfig struct {
-	Crypto       *Crypto
-	Dialer       TransportDialer
-	MaxTunnels   int           // steady-state pool size
-	MaxAge       time.Duration // proactively retire tunnels older than this
-	MaxBytes     int64         // retire after this many payload bytes (jittered ±50%)
-	MaxStreams   uint32        // retire after this many streams opened (jittered ±50%)
-	RetireGrace  time.Duration // grace period before closing a retired tunnel
-	RotateEvery  time.Duration // rotator check interval
-	WarmupDelay  time.Duration // ignore rotation during this initial window
-	StreamDialTO time.Duration // timeout for each stream open
+	Crypto           *Crypto
+	Dialer           TransportDialer
+	MaxTunnels       int           // steady-state pool size
+	MaxAge           time.Duration // proactively retire tunnels older than this
+	MaxBytes         int64         // retire after this many payload bytes (jittered ±50%)
+	MaxStreams       uint32        // retire after this many streams opened (jittered ±50%)
+	RetireMaxActive  int           // smart-retire: skip tunnel if active streams > this (avoid force-close mid-video)
+	RetireGrace      time.Duration // grace period before closing a retired tunnel
+	RotateEvery      time.Duration // rotator check interval
+	WarmupDelay      time.Duration // ignore rotation during this initial window
+	StreamDialTO     time.Duration // timeout for each stream open
+	// WarmupDone is flipped to true once warmup() finishes scheduling all
+	// initial dials. Shared with Client so makeDialer() can switch from
+	// warmup-set (non-deferred servers) to full set. Optional — if nil,
+	// no phase distinction is made.
+	WarmupDone       *atomic.Bool
 }
 
 func DefaultPoolConfig(c *Crypto, d TransportDialer) PoolConfig {
@@ -48,13 +54,14 @@ func DefaultPoolConfig(c *Crypto, d TransportDialer) PoolConfig {
 		// rather than helping. Connection-lifetime improvement also evaporated
 		// once RetireGrace was raised to 120s to avoid force-closing streams
 		// — TCP flow lifetime ended up the same as pre-rotation.
-		MaxAge:       10 * time.Minute,
-		MaxBytes:     50 * 1024 * 1024, // 50 MB base, jittered → 25-75 MB per tunnel
-		MaxStreams:   120,              // 120 base, jittered → 60-180 per tunnel
-		RetireGrace:  60 * time.Second,
-		RotateEvery:  30 * time.Second,
-		WarmupDelay:  2 * time.Minute,
-		StreamDialTO: 10 * time.Second,
+		MaxAge:          10 * time.Minute,
+		MaxBytes:        50 * 1024 * 1024, // 50 MB base, jittered → 25-75 MB per tunnel
+		MaxStreams:      120,              // 120 base, jittered → 60-180 per tunnel
+		RetireMaxActive: 5,                // skip retire if more than 5 active streams (avoid mid-video kills)
+		RetireGrace:     60 * time.Second,
+		RotateEvery:     30 * time.Second,
+		WarmupDelay:     2 * time.Minute,
+		StreamDialTO:    10 * time.Second,
 	}
 }
 
@@ -192,7 +199,7 @@ func (p *Pool) warmup() {
 	// Cold start: ONE dial at a time. Parallel dial bursts trigger DPI/ISP
 	// stateful filters that blackhole the destination IP for ~30s — net
 	// wall-clock ends up the same as single-dial. The short cold-path
-	// timeouts in createOne (5s × 3 attempts) handle flaky handshakes
+	// timeouts in createOne (3s × 3 attempts) handle flaky handshakes
 	// without flooding the network.
 	p.createOne()
 	// Slow-fill the rest at the original cadence
@@ -203,6 +210,11 @@ func (p *Pool) warmup() {
 		case <-time.After(time.Duration(i)*3*time.Second + jitter(2*time.Second)):
 			go p.createOne()
 		}
+	}
+	// Warmup is done — flip the flag so dialer starts using deferred servers.
+	if p.cfg.WarmupDone != nil {
+		p.cfg.WarmupDone.Store(true)
+		log.Printf("pool: warmup complete, deferred servers now eligible for dial")
 	}
 }
 
@@ -225,9 +237,12 @@ func (p *Pool) createOne() {
 		attempts = 2
 		backoff = 2 * time.Second
 	} else {
-		dialTO = 5 * time.Second
+		// Cold start: fail-fast on the first server attempt, retry rotates
+		// to the next server (Dialer counter increments). 3s × 3 = ~10s
+		// worst-case to touch all 3 servers, vs 15s with 5s timeout.
+		dialTO = 3 * time.Second
 		attempts = 3
-		backoff = 500 * time.Millisecond
+		backoff = 300 * time.Millisecond
 	}
 	var err error
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -309,15 +324,21 @@ func (p *Pool) rotator() {
 			p.mu.Unlock()
 			continue
 		}
-		// Find a fresh tunnel that has exceeded ANY of its (jittered) per-tunnel
-		// budgets: age, lifetime bytes, or lifetime streams. Whichever first.
-		// Prefer the one most over the highest-priority budget (age first, then
-		// just the first match — all are equally valid retirement reasons).
-		var victim *pooledTunnel
+		// Smart-retire algorithm:
+		//   1. Find tunnels that have exceeded ANY budget (age/bytes/streams).
+		//   2. Among those, prefer the one with the FEWEST active streams
+		//      so we don't force-close 10 active streams mid-video.
+		//   3. If even the best candidate has too many active streams (>RetireMaxActive),
+		//      skip this tick entirely UNLESS some tunnel is "far overdue"
+		//      (age > 2× its budget) — then force-retire the most-overdue one
+		//      to bound how long a busy tunnel can resist retirement.
+		var victim, fallback *pooledTunnel
 		var reason string
 		var victimAge time.Duration
 		var victimBytes int64
 		var victimStreams uint32
+		var victimActive int
+		var fallbackAge time.Duration
 		for _, it := range p.items {
 			if !it.t.IsAlive() || it.retiring {
 				continue
@@ -325,22 +346,44 @@ func (p *Pool) rotator() {
 			age := time.Since(it.t.createdAt)
 			bytes := it.t.BytesOut()
 			streams := it.t.StreamsCreated()
+			active := it.t.StreamCount()
+			var r string
 			switch {
 			case age >= it.maxAge:
-				if victim == nil || (reason == "age" && age > victimAge) {
-					victim, reason = it, "age"
-					victimAge, victimBytes, victimStreams = age, bytes, streams
+				r = "age"
+			case bytes >= it.maxBytes:
+				r = "bytes"
+			case streams >= it.maxStreams:
+				r = "streams"
+			default:
+				continue // not over any budget
+			}
+			// Hard-ceiling: tunnel is way past its budget — keep as fallback
+			// in case we can't find a low-active-streams candidate this tick.
+			if age > 2*it.maxAge && (fallback == nil || age > fallbackAge) {
+				fallback = it
+				fallbackAge = age
+			}
+			// Smart pick: only consider candidates with low active stream count.
+			if active <= p.cfg.RetireMaxActive {
+				if victim == nil || active < victimActive {
+					victim, reason = it, r
+					victimAge, victimBytes, victimStreams, victimActive = age, bytes, streams, active
 				}
-			case bytes >= it.maxBytes && victim == nil:
-				victim, reason = it, "bytes"
-				victimAge, victimBytes, victimStreams = age, bytes, streams
-			case streams >= it.maxStreams && victim == nil:
-				victim, reason = it, "streams"
-				victimAge, victimBytes, victimStreams = age, bytes, streams
 			}
 		}
+		if victim == nil && fallback != nil {
+			// All over-budget tunnels are heavily used. Force-retire the most
+			// overdue one (age > 2× budget) to keep rotation moving.
+			victim = fallback
+			reason = "force-overdue"
+			victimAge = time.Since(fallback.t.createdAt)
+			victimBytes = fallback.t.BytesOut()
+			victimStreams = fallback.t.StreamsCreated()
+			victimActive = fallback.t.StreamCount()
+		}
 		if victim == nil {
-			log.Printf("rotator: fresh=%d no tunnel over budget — skip", freshCount)
+			log.Printf("rotator: fresh=%d no eligible victim (over-budget tunnels too busy, none far-overdue) — skip", freshCount)
 			p.mu.Unlock()
 			continue
 		}
@@ -349,7 +392,7 @@ func (p *Pool) rotator() {
 		budgets := fmt.Sprintf("maxAge=%v maxBytes=%dMB maxStreams=%d", victim.maxAge, victim.maxBytes>>20, victim.maxStreams)
 		p.mu.Unlock()
 		log.Printf("pool: retiring tunnel reason=%s age=%v bytes=%dMB streams-created=%d active=%d (%s)",
-			reason, victimAge.Round(time.Second), victimBytes>>20, victimStreams, target.StreamCount(), budgets)
+			reason, victimAge.Round(time.Second), victimBytes>>20, victimStreams, victimActive, budgets)
 		go p.createOne()
 		go func() {
 			// Graceful rotation: don't close while streams are alive. Poll

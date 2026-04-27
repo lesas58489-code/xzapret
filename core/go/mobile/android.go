@@ -149,3 +149,18 @@ func IsRunning() bool {
 	defer mu.Unlock()
 	return running
 }
+
+// ServerRTTs returns a JSON map {host:port → milliseconds} of the most-recent
+// successful dial duration per server. Caller (Kotlin) should call this on
+// Stop(), persist to SharedPreferences, and on next Start() pre-sort the
+// comma-separated server list (fastest first) before passing to Start().
+// Returns "{}" if no data yet.
+func ServerRTTs() string {
+	mu.Lock()
+	c := client
+	mu.Unlock()
+	if c == nil {
+		return "{}"
+	}
+	return c.ServerRTTs()
+}
