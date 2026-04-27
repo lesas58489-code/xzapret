@@ -21,8 +21,9 @@ const socksBufSize = 64 * 1024
 type socksServer struct {
 	ln       net.Listener
 	pool     *Pool
+	router   *Router            // domain/IP-aware split routing; nil → tunnel everything
 	running  atomic.Bool
-	bypassIP func(net.IP) bool // optional: return true for IPs that should go direct
+	bypassIP func(net.IP) bool // optional: return true for IPs that should go direct (legacy hook)
 }
 
 func newSocksServer(ln net.Listener, pool *Pool) *socksServer {
@@ -117,7 +118,17 @@ func (s *socksServer) handleClient(c net.Conn) {
 	// Remove deadline for the data phase
 	_ = c.SetDeadline(time.Time{})
 
-	// Bypass direct? (e.g. private LAN, or carrier-specific whitelist)
+	// Router decides: bypass (direct dial from our process, mimo VpnService)
+	// vs tunnel (mux through relay server). Lists+cache short-circuit; unknown
+	// destinations get an async TCP-probe and default to tunnel meanwhile.
+	if s.router != nil {
+		if v := s.router.Decide(host, port); v == VerdictBypass {
+			log.Printf("socks5: bypass %s:%d → direct", host, port)
+			s.handleDirect(c, host, port)
+			return
+		}
+	}
+	// Legacy hook (kept for tests).
 	if s.bypassIP != nil {
 		if ip := net.ParseIP(host); ip != nil && s.bypassIP(ip) {
 			s.handleDirect(c, host, port)

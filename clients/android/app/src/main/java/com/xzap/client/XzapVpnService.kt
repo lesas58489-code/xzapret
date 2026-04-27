@@ -135,6 +135,7 @@ class XzapVpnService : VpnService() {
                 put("tun_fd", fd)
                 put("mtu", 1500)
                 put("log_level", "warn")
+                put("cache_dir", cacheDir.absolutePath)
                 if (isWs) {
                     put("transport", "ws")
                     put("ws_url", normalised)

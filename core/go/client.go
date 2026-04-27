@@ -10,6 +10,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,17 +29,19 @@ type ClientConfig struct {
 	WSUrl      string // required when Transport=="ws", e.g. "wss://solar-cloud.xyz/ws"
 	TLSProfile string // "chrome131" (default), "chrome120", "firefox120", "safari16", "random"
 	LocalSocks string // "127.0.0.1:10808"
+	CacheDir   string // app private cache dir for router cache, RTT history, etc.
 }
 
 // Client is the stateful XZAP client singleton.
 type Client struct {
-	cfg   ClientConfig
-	cryp  *Crypto
-	pool  *Pool
-	socks *socksServer
-	decoy *DecoyManager
-	mu    sync.Mutex
-	up    bool
+	cfg    ClientConfig
+	cryp   *Crypto
+	pool   *Pool
+	socks  *socksServer
+	decoy  *DecoyManager
+	router *Router
+	mu     sync.Mutex
+	up     bool
 
 	// warmupDone flips to true once the pool's warmup goroutine has finished
 	// kicking off all initial tunnels. The dialer uses this to switch from
@@ -124,7 +127,16 @@ func (c *Client) Start() error {
 		c.pool = nil
 		return fmt.Errorf("SOCKS5 listen %s: %w", c.cfg.LocalSocks, err)
 	}
+	// Router decides per-connection: bypass tunnel (direct dial from our
+	// process, mimo VpnService) or route through mux. Cache file lives in
+	// app cache dir (passed by Kotlin via CacheDir).
+	cachePath := ""
+	if c.cfg.CacheDir != "" {
+		cachePath = filepath.Join(c.cfg.CacheDir, "router_cache.json")
+	}
+	c.router = NewRouter(cachePath)
 	c.socks = newSocksServer(ln, c.pool)
+	c.socks.router = c.router
 	go c.socks.Run()
 
 	// Start decoy traffic generator. Sites = whiteSNIs (bypass.txt).
@@ -159,6 +171,10 @@ func (c *Client) Stop() {
 	if c.decoy != nil {
 		c.decoy.Stop()
 		c.decoy = nil
+	}
+	if c.router != nil {
+		c.router.Stop()
+		c.router = nil
 	}
 	if c.socks != nil {
 		c.socks.Stop()

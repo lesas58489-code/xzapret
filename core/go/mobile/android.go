@@ -48,6 +48,7 @@ type startConfig struct {
 	TunFD      int    `json:"tun_fd"`
 	MTU        int    `json:"mtu"`
 	LogLevel   string `json:"log_level"`
+	CacheDir   string `json:"cache_dir"`
 }
 
 // Start launches the XZAP client and, if TunFD>0, hooks up tun2socks
@@ -86,6 +87,7 @@ func Start(configJSON string) string {
 		WSUrl:      cfg.WSUrl,
 		TLSProfile: cfg.TLSProfile,
 		LocalSocks: fmt.Sprintf("127.0.0.1:%d", cfg.SocksPort),
+		CacheDir:   cfg.CacheDir,
 	})
 	if err != nil {
 		return fmt.Sprintf("client init: %v", err)
