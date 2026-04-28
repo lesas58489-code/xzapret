@@ -168,10 +168,15 @@ func (r *Router) proberLoop() {
 	}
 }
 
-// probeOne attempts a direct TCP connect with short timeout. Caches result.
-// Direct-OK → BYPASS for 24h. Fail/RST/timeout → TUNNEL for 7d.
+// probeOne attempts a direct TCP connect with short timeout. Outcomes:
+//   - probe SUCCESS only caches BYPASS if host is a hostname (not IP literal).
+//     IPs are unsafe to bypass-by-probe because Google/CF/Akamai shared CDN
+//     IPs serve both blocked and non-blocked services (TCP-OK ≠ "safe to use
+//     direct" — DPI shapes at TLS-SNI layer, not TCP). Phase 2 DNS hijack
+//     ensures we always see hostname here, so bypass-learning is safe.
+//   - probe FAILURE always caches TUNNEL (TCP-unreachable from RU = certainly
+//     not bypass-able; route via tunnel).
 func (r *Router) probeOne(req probeRequest) {
-	// Don't reprobe if we got a recent verdict while waiting in the queue.
 	r.mu.RLock()
 	if e, ok := r.cache[req.host]; ok && time.Now().Before(e.Expires) {
 		r.mu.RUnlock()
@@ -184,10 +189,17 @@ func (r *Router) probeOne(req probeRequest) {
 	addr := net.JoinHostPort(req.host, fmt.Sprintf("%d", req.port))
 	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 
+	isIPLiteral := net.ParseIP(req.host) != nil
 	var v Verdict
 	var ttl time.Duration
 	if err == nil {
 		conn.Close()
+		if isIPLiteral {
+			// TCP-OK to a raw IP doesn't prove the service behind it is safe
+			// to bypass — skip caching, route via tunnel.
+			log.Printf("router: probe %s:%d → tcp-ok but IP-literal (no bypass-learn) — tunnel default", req.host, req.port)
+			return
+		}
 		v, ttl = VerdictBypass, bypassCacheTTL
 	} else {
 		v, ttl = VerdictTunnel, tunnelCacheTTL

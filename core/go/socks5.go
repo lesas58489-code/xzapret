@@ -21,7 +21,8 @@ const socksBufSize = 64 * 1024
 type socksServer struct {
 	ln       net.Listener
 	pool     *Pool
-	router   *Router            // domain/IP-aware split routing; nil → tunnel everything
+	router   *Router    // domain/IP-aware split routing; nil → tunnel everything
+	dns      *DNSServer // DNS hijack — resolves fake IPs back to original hostnames
 	running  atomic.Bool
 	bypassIP func(net.IP) bool // optional: return true for IPs that should go direct (legacy hook)
 }
@@ -118,6 +119,15 @@ func (s *socksServer) handleClient(c net.Conn) {
 	// Remove deadline for the data phase
 	_ = c.SetDeadline(time.Time{})
 
+	// DNS hijack: if host is a fake IP we allocated for an earlier DNS query,
+	// recover the original hostname so Router decisions are domain-based
+	// (not IP-based — Google CDN IPs serve both blocked and non-blocked).
+	if s.dns != nil {
+		if domain := s.dns.LookupFakeIP(host); domain != "" {
+			log.Printf("socks5: fake-ip %s → %s", host, domain)
+			host = domain
+		}
+	}
 	// Router decides: bypass (direct dial from our process, mimo VpnService)
 	// vs tunnel (mux through relay server). Lists+cache short-circuit; unknown
 	// destinations get an async TCP-probe and default to tunnel meanwhile.
@@ -259,7 +269,14 @@ func (s *socksServer) udpLoop(udp *net.UDPConn, done chan struct{}) {
 		copy(query, buf[payloadOff:n])
 		udpHdr := make([]byte, payloadOff)
 		copy(udpHdr, buf[:payloadOff])
-		go s.relayDNS(udp, src, dstHost, query, udpHdr)
+		// DNS hijack: synthesize reply locally with fake IPs so all routing
+		// decisions can be hostname-based at SOCKS5 CONNECT time. Falls back
+		// to mux-relay only if hijack server is not configured.
+		if s.dns != nil {
+			go s.hijackDNS(udp, src, query, udpHdr)
+		} else {
+			go s.relayDNS(udp, src, dstHost, query, udpHdr)
+		}
 	}
 }
 
@@ -311,6 +328,22 @@ func (s *socksServer) relayDNS(udp *net.UDPConn, src *net.UDPAddr,
 	reply := make([]byte, 0, len(udpHdr)+len(dns))
 	reply = append(reply, udpHdr...)
 	reply = append(reply, dns...)
+	_, _ = udp.WriteToUDP(reply, src)
+}
+
+// hijackDNS synthesizes a DNS reply locally (fake IPs from the DNSServer)
+// and sends it back through the SOCKS5 UDP-associate channel. Each fake IP
+// is registered to the queried domain; SOCKS5 CONNECT recovers the domain
+// when the app later connects to the fake IP.
+func (s *socksServer) hijackDNS(udp *net.UDPConn, src *net.UDPAddr,
+	query, udpHdr []byte) {
+	resp, err := s.dns.HandleQuery(query)
+	if err != nil || len(resp) == 0 {
+		return
+	}
+	reply := make([]byte, 0, len(udpHdr)+len(resp))
+	reply = append(reply, udpHdr...)
+	reply = append(reply, resp...)
 	_, _ = udp.WriteToUDP(reply, src)
 }
 

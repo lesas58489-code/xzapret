@@ -137,6 +137,9 @@ func (c *Client) Start() error {
 	c.router = NewRouter(cachePath)
 	c.socks = newSocksServer(ln, c.pool)
 	c.socks.router = c.router
+	// DNS hijack: fake-IP responses → SOCKS5 CONNECT recovers hostname →
+	// router decides per-domain (Phase 2). All-domain routing safety.
+	c.socks.dns = NewDNSServer()
 	go c.socks.Run()
 
 	// Start decoy traffic generator. Sites = whiteSNIs (bypass.txt).

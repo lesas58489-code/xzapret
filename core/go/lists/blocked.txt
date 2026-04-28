@@ -1,26 +1,58 @@
-# Заблокированные сайты — идут через XZAP
+# Заблокированные сайты — всегда идут через XZAP туннель.
 # Один домен на строку. Субдомены подхватываются автоматически.
+# Список консервативный — только те сервисы, что точно не работают
+# напрямую из РФ. Всё остальное (foreign но возможно-доступное) проходит
+# через probe-learn (Phase 2 router) и кэшируется.
 
+# YouTube
 youtube.com
 googlevideo.com
-google.com
-googleapis.com
+ytimg.com
+youtu.be
+
+# Meta family
 instagram.com
+cdninstagram.com
 facebook.com
+fbcdn.net
+fb.com
+meta.com
+whatsapp.com
+whatsapp.net
+
+# Twitter / X
 twitter.com
 x.com
-tiktok.com
-reddit.com
+twimg.com
+
+# Discord
 discord.com
 discordapp.com
-spotify.com
-netflix.com
-twitch.tv
-wikipedia.org
-wikimedia.org
-medium.com
-github.com
-notion.so
-figma.com
+discord.media
+discord.gg
+
+# Telegram (часто блокируется)
 telegram.org
 t.me
+telegra.ph
+
+# Other
+linkedin.com
+tiktok.com
+pornhub.com
+
+# AI / blocked westerners
+chatgpt.com
+chat.openai.com
+openai.com
+oaiusercontent.com
+midjourney.com
+huggingface.co
+
+# VPN providers (anti-VPN block)
+proton.me
+protonmail.com
+protonvpn.com
+expressvpn.com
+nordvpn.com
+surfshark.com
