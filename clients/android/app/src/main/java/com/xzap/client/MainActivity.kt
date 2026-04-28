@@ -4,37 +4,36 @@ import android.app.Activity
 import android.content.Intent
 import android.net.VpnService
 import android.os.Bundle
-import android.widget.Button
-import android.widget.EditText
-import android.widget.TextView
-import android.widget.Toast
-import androidx.appcompat.app.AppCompatActivity
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import com.xzap.client.ui.TunnelStats
+import com.xzap.client.ui.VpnState
+import com.xzap.client.ui.XzapApp
+import com.xzap.client.ui.XzapTheme
 
-class MainActivity : AppCompatActivity() {
+/**
+ * Compose-based main activity. Phase 1 of the redesign per
+ * design_handoff_xzapret_vpn_button/README.md — wires the new screen
+ * skeleton with simulated state. Server/Port/Key are no longer in the UI;
+ * they come from BuildConfig (populated from local.properties at build time).
+ *
+ * Tap-to-connect logic, real VpnState wiring, and the Canvas-rendered
+ * wordmark with animated slash come in Phase 2.
+ */
+class MainActivity : ComponentActivity() {
 
     companion object {
         private const val VPN_REQUEST_CODE = 100
-        private const val PREFS = "xzap_prefs"
     }
-
-    private lateinit var etServer: EditText
-    private lateinit var etPort: EditText
-    private lateinit var etKey: EditText
-    private lateinit var btnConnect: Button
-    private lateinit var btnShareLogs: Button
-    private lateinit var tvStatus: TextView
-    private var connected = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Install uncaught exception handler so native/unknown crashes leave a trace
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
             android.util.Log.e("XZAP-CRASH", "thread=${t.name} unhandled", e)
-            try {
-                android.widget.Toast.makeText(applicationContext,
-                    "Crash: ${e.javaClass.simpleName}: ${e.message}",
-                    android.widget.Toast.LENGTH_LONG).show()
-            } catch (_: Throwable) {}
         }
         android.util.Log.i("XZAP-BOOT", "MainActivity onCreate start")
         try {
@@ -42,85 +41,77 @@ class MainActivity : AppCompatActivity() {
             android.util.Log.i("XZAP-BOOT", "Mobile.touch OK (native lib loaded)")
         } catch (t: Throwable) {
             android.util.Log.e("XZAP-BOOT", "Mobile.touch failed", t)
-            android.widget.Toast.makeText(this,
-                "Mobile.touch failed: ${t.javaClass.simpleName}: ${t.message}",
-                android.widget.Toast.LENGTH_LONG).show()
         }
-        setContentView(R.layout.activity_main)
-
-        etServer = findViewById(R.id.et_server)
-        etPort = findViewById(R.id.et_port)
-        etKey = findViewById(R.id.et_key)
-        btnConnect = findViewById(R.id.btn_connect)
-        btnShareLogs = findViewById(R.id.btn_share_logs)
-        tvStatus = findViewById(R.id.tv_status)
-
-        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
-        etServer.setText(prefs.getString("server", "wss://solar-cloud.xyz/ws"))
-        etPort.setText(prefs.getString("port", "443"))
-        etKey.setText(prefs.getString("key", ""))
-
-        btnConnect.setOnClickListener {
-            if (connected) disconnect() else requestVpn()
+        setContent {
+            XzapTheme {
+                var state by remember { mutableStateOf(VpnState.IDLE) }
+                var killOn by remember { mutableStateOf(true) }
+                var autoOn by remember { mutableStateOf(false) }
+                XzapApp(
+                    state = state,
+                    stats = TunnelStats(),
+                    killSwitchOn = killOn,
+                    autoConnectOn = autoOn,
+                    onTapButton = {
+                        when (state) {
+                            VpnState.IDLE          -> { state = VpnState.CONNECTING; requestVpn { state = VpnState.CONNECTED } }
+                            VpnState.CONNECTED, VpnState.ERROR -> { state = VpnState.DISCONNECTING; disconnect(); state = VpnState.IDLE }
+                            else                   -> { /* ignore taps mid-transition */ }
+                        }
+                    },
+                    onKillSwitchToggle = { killOn = it },
+                    onAutoConnectToggle = { autoOn = it },
+                    onShareLogs = { shareLogs() },
+                )
+            }
         }
-        btnShareLogs.setOnClickListener { shareLogs() }
-
-        maybeWarnPrivateDNS()
     }
 
-    /**
-     * Phase 2 router (DNS hijack) only catches plain UDP/53 traffic. If Android
-     * Private DNS is set to "hostname" (user pinned a specific DoT provider),
-     * DNS goes via TCP/853 and bypasses our hijack — we can't auto-fix this
-     * because hostname-mode does NOT fall back when DoT is blocked. So warn
-     * the user once and offer a tap to system settings.
-     *
-     * Mode = "opportunistic" is fine: Go core blocks :853 and Android falls
-     * back to UDP/53 → hijack works. We don't bother the user about it.
-     */
-    private fun maybeWarnPrivateDNS() {
-        val mode = try {
-            android.provider.Settings.Global.getString(contentResolver, "private_dns_mode") ?: "off"
-        } catch (_: Throwable) { "off" }
-        if (mode != "hostname") return
-        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
-        if (prefs.getBoolean("dismissed_private_dns_warning", false)) return
-        androidx.appcompat.app.AlertDialog.Builder(this)
-            .setTitle("Private DNS detected")
-            .setMessage("В настройках Android выбран постоянный DNS-провайдер (Private DNS = hostname). " +
-                    "Это мешает XZAP интеллектуально маршрутизировать трафик: все домены идут через тоннель, " +
-                    "включая российские сайты (потеря оптимизации, повышенная задержка).\n\n" +
-                    "Рекомендуется: «Off» или «Автоматически».")
-            .setPositiveButton("Открыть настройки") { _, _ ->
-                try {
-                    startActivity(Intent("android.settings.WIRELESS_SETTINGS"))
-                } catch (_: Throwable) {
-                    startActivity(Intent(android.provider.Settings.ACTION_SETTINGS))
-                }
-            }
-            .setNegativeButton("Не показывать") { _, _ ->
-                prefs.edit().putBoolean("dismissed_private_dns_warning", true).apply()
-            }
-            .setNeutralButton("Позже", null)
-            .show()
+    private var pendingStart: (() -> Unit)? = null
+
+    private fun requestVpn(onStarted: () -> Unit) {
+        pendingStart = onStarted
+        val intent = VpnService.prepare(this)
+        if (intent != null) startActivityForResult(intent, VPN_REQUEST_CODE) else startVpn()
+    }
+
+    @Deprecated("Compat shim")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == VPN_REQUEST_CODE && resultCode == Activity.RESULT_OK) startVpn()
+    }
+
+    private fun startVpn() {
+        val intent = Intent(this, XzapVpnService::class.java).apply {
+            action = XzapVpnService.ACTION_CONNECT
+            putExtra(XzapVpnService.EXTRA_SERVER, BuildConfig.XZAP_SERVERS)
+            putExtra(XzapVpnService.EXTRA_PORT, BuildConfig.XZAP_PORT)
+            putExtra(XzapVpnService.EXTRA_KEY, BuildConfig.XZAP_KEY)
+            putExtra(XzapVpnService.EXTRA_TLS_PROFILE, "chrome131")
+        }
+        startService(intent)
+        pendingStart?.invoke()
+        pendingStart = null
+    }
+
+    private fun disconnect() {
+        startService(Intent(this, XzapVpnService::class.java).apply {
+            action = XzapVpnService.ACTION_DISCONNECT
+        })
     }
 
     /**
      * Grab last few thousand lines of our process's logcat for the relevant
-     * tags, redact the secret key if present, write to cache, and pop a
-     * Share intent so the user can send the file via Telegram / email / etc.
-     * Apps can read their own process's logs without special permission since
-     * Android 4.1.
+     * tags, write to cache, pop a Share intent so user can send the file.
      */
     private fun shareLogs() {
-        Toast.makeText(this, "Collecting logs…", Toast.LENGTH_SHORT).show()
+        android.widget.Toast.makeText(this, "Collecting logs…", android.widget.Toast.LENGTH_SHORT).show()
         Thread {
             try {
                 val logsDir = java.io.File(cacheDir, "logs")
                 logsDir.mkdirs()
                 val logFile = java.io.File(logsDir, "xzap_log.txt")
 
-                // Filter: keep our tags at Verbose, mute everything else.
                 val proc = Runtime.getRuntime().exec(arrayOf(
                     "logcat", "-d", "-t", "5000",
                     "XZAP-BOOT:V", "XZAP-CRASH:V", "XZAP-LOG:V",
@@ -129,16 +120,13 @@ class MainActivity : AppCompatActivity() {
                     "*:S"
                 ))
 
-                val secretKey = etKey.text.toString().trim()
+                val secretKey = BuildConfig.XZAP_KEY
                 logFile.bufferedWriter().use { writer ->
                     writer.write("=== XZAP debug log ===\n")
                     writer.write("Captured: ${java.util.Date()}\n")
                     writer.write("Android: ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT})\n")
                     writer.write("Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}\n")
                     writer.write("App: ${packageName} v${packageManager.getPackageInfo(packageName, 0).versionName}\n")
-                    writer.write("Server: ${etServer.text}\n")
-                    writer.write("Port: ${etPort.text}\n")
-                    writer.write("Connected: $connected\n")
                     writer.write("=====================\n\n")
                     proc.inputStream.bufferedReader().forEachLine { line ->
                         val sanitized = if (secretKey.length >= 16) {
@@ -165,82 +153,9 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 android.util.Log.e("XZAP-LOG", "shareLogs failed", e)
                 runOnUiThread {
-                    Toast.makeText(this, "Log export failed: ${e.message}", Toast.LENGTH_LONG).show()
+                    android.widget.Toast.makeText(this, "Log export failed: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
                 }
             }
         }.start()
-    }
-
-    private fun requestVpn() {
-        var server = etServer.text.toString().trim()
-        // Android keyboard autocorrect sometimes replaces 'wss://' with 'http://'.
-        // Detect and undo before passing down.
-        if (server.startsWith("http://", ignoreCase = true)) {
-            server = "ws://" + server.removePrefix("http://")
-        } else if (server.startsWith("https://", ignoreCase = true)) {
-            server = "wss://" + server.removePrefix("https://")
-        }
-        etServer.setText(server)
-        // Strip all whitespace from key (users often paste with trailing newline / spaces)
-        val key = etKey.text.toString().replace(Regex("\\s"), "")
-        if (server.isEmpty() || key.isEmpty()) {
-            Toast.makeText(this, "Server and Key required", Toast.LENGTH_SHORT).show()
-            return
-        }
-        try {
-            val decoded = android.util.Base64.decode(key, android.util.Base64.DEFAULT)
-            if (decoded.size != 32) {
-                Toast.makeText(this, "Key must decode to 32 bytes, got ${decoded.size}", Toast.LENGTH_LONG).show()
-                return
-            }
-        } catch (e: IllegalArgumentException) {
-            Toast.makeText(this, "Invalid key (not valid base64)", Toast.LENGTH_LONG).show()
-            return
-        }
-        etKey.setText(key)
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-            .putString("server", server)
-            .putString("port", etPort.text.toString())
-            .putString("key", key)
-            .apply()
-
-        val intent = VpnService.prepare(this)
-        if (intent != null) {
-            startActivityForResult(intent, VPN_REQUEST_CODE)
-        } else {
-            startVpn()
-        }
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == VPN_REQUEST_CODE && resultCode == Activity.RESULT_OK) {
-            startVpn()
-        }
-    }
-
-    private fun startVpn() {
-        val intent = Intent(this, XzapVpnService::class.java).apply {
-            action = XzapVpnService.ACTION_CONNECT
-            putExtra(XzapVpnService.EXTRA_SERVER, etServer.text.toString().trim())
-            putExtra(XzapVpnService.EXTRA_PORT, etPort.text.toString().trim().toIntOrNull() ?: 8443)
-            putExtra(XzapVpnService.EXTRA_KEY, etKey.text.toString().trim())
-            putExtra(XzapVpnService.EXTRA_TLS_PROFILE, "chrome131")
-        }
-        startService(intent)
-        connected = true
-        btnConnect.text = "Disconnect"
-        tvStatus.text = "Status: Connected"
-        tvStatus.setTextColor(0xFF00CC00.toInt())
-    }
-
-    private fun disconnect() {
-        startService(Intent(this, XzapVpnService::class.java).apply {
-            action = XzapVpnService.ACTION_DISCONNECT
-        })
-        connected = false
-        btnConnect.text = "Connect"
-        tvStatus.text = "Status: Disconnected"
-        tvStatus.setTextColor(0xFFCC0000.toInt())
     }
 }
