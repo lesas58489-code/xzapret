@@ -276,10 +276,23 @@ func (r *Router) loadCache() {
 		return
 	}
 	now := time.Now()
+	dropped := 0
 	for k, v := range loaded {
-		if now.Before(v.Expires) {
-			r.cache[k] = v
+		if now.After(v.Expires) {
+			continue
 		}
+		// Phase 1-era unsafe entries: IP-literal cached as bypass via TCP probe.
+		// Google CDN / Cloudflare share IPs across blocked and non-blocked
+		// services (TCP-OK ≠ DPI-safe). Drop these on load — they cause
+		// false-positive direct routes for blocked content.
+		if v.V == VerdictBypass && net.ParseIP(k) != nil {
+			dropped++
+			continue
+		}
+		r.cache[k] = v
+	}
+	if dropped > 0 {
+		log.Printf("router: dropped %d stale IP-literal bypass cache entries (Phase 1 leftovers)", dropped)
 	}
 }
 
