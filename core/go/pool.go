@@ -57,8 +57,8 @@ func DefaultPoolConfig(c *Crypto, d TransportDialer) PoolConfig {
 		MaxAge:          10 * time.Minute,
 		MaxBytes:        50 * 1024 * 1024, // 50 MB base, jittered → 25-75 MB per tunnel
 		MaxStreams:      120,              // 120 base, jittered → 60-180 per tunnel
-		RetireMaxActive: 5,                // skip retire if more than 5 active streams (avoid mid-video kills)
-		RetireGrace:     60 * time.Second,
+		RetireMaxActive: 5,                 // skip retire if more than 5 active streams (avoid mid-video kills)
+		RetireGrace:     180 * time.Second, // graceful drain — long-lived TCP (Telegram MTProto, WebSocket, video) needs minutes to migrate cleanly
 		RotateEvery:     30 * time.Second,
 		WarmupDelay:     2 * time.Minute,
 		StreamDialTO:    10 * time.Second,

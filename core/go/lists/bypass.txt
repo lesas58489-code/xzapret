@@ -8,6 +8,7 @@ yandex.net
 mail.ru
 rambler.ru
 avito.ru
+avito.st
 sberbank.ru
 gosuslugi.ru
 mos.ru
@@ -21,3 +22,5 @@ wildberries.ru
 kinopoisk.ru
 2gis.ru
 dzen.ru
+wink.ru
+max.ru

@@ -44,6 +44,10 @@ linkedin.com
 tiktok.com
 pornhub.com
 
+# Gaming (RKN-shaped)
+roblox.com
+rbxcdn.com
+
 # AI / blocked westerners
 chatgpt.com
 chat.openai.com
