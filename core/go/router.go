@@ -22,6 +22,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -31,6 +32,25 @@ import (
 
 	utls "github.com/refraction-networking/utls"
 )
+
+// blockResponseMarkers are substrings that strongly indicate a server is
+// returning a country-unavailable / VPN-detected / RKN-blocked response.
+// If the probe HTTP response contains any of these (case-insensitive), the
+// hostname is cached as TUNNEL even though TLS+TCP succeeded.
+var blockResponseMarkers = []string{
+	"country unavailable",
+	"unavailable for legal reasons",
+	"not available in your region",
+	"not available in your country",
+	"region is not supported",
+	"country, region, or territory unsupported",
+	"this service is not available",
+	"страна недоступна",
+	"доступ ограничен",
+	"доступ заблокирован",
+	"vpn detected",
+	"vpn or proxy",
+}
 
 //go:embed lists/bypass.txt
 var embeddedBypassList string
@@ -214,27 +234,30 @@ func (r *Router) probeOne(req probeRequest) {
 
 	isIPLiteral := net.ParseIP(req.host) != nil
 
-	// HTTPS hostname → do TLS-level probe. This catches the case where TCP
-	// connects but DPI shapes at the TLS-SNI layer (youtubei.googleapis.com
-	// from RU: TCP-OK to Google CDN IP, then RST when ClientHello SNI is seen).
+	// HTTPS hostname — three-stage probe: TCP (already done), TLS, HTTP.
+	//   - TLS RST/timeout → DPI shapes at SNI layer (youtubei.googleapis.com).
+	//   - HTTP 403/451 or known block phrase in response → geo-blocked
+	//     (claude.ai, Netflix, hulu) — TLS works but content denied.
 	if req.port == 443 && !isIPLiteral {
 		cfg := &utls.Config{
 			ServerName:         req.host,
-			InsecureSkipVerify: true, // we only care if handshake completes
+			InsecureSkipVerify: true,
 		}
 		u := utls.UClient(conn, cfg, utls.HelloChrome_131)
 		_ = u.SetDeadline(time.Now().Add(probeTimeout))
 		if err := u.Handshake(); err != nil {
-			r.mu.Lock()
-			r.cache[req.host] = cacheEntry{V: VerdictTunnel, Expires: time.Now().Add(tunnelCacheTTL)}
-			r.mu.Unlock()
+			r.cacheVerdict(req.host, VerdictTunnel, tunnelCacheTTL)
 			log.Printf("router: probe %s:443 → tunnel (tls err=%v)", req.host, err)
 			return
 		}
-		r.mu.Lock()
-		r.cache[req.host] = cacheEntry{V: VerdictBypass, Expires: time.Now().Add(bypassCacheTTL)}
-		r.mu.Unlock()
-		log.Printf("router: probe %s:443 → bypass (tls ok)", req.host)
+		// HTTP probe — minimal GET / and check for geo-block markers.
+		v, reason := r.httpProbe(u, req.host)
+		ttl := bypassCacheTTL
+		if v == VerdictTunnel {
+			ttl = tunnelCacheTTL
+		}
+		r.cacheVerdict(req.host, v, ttl)
+		log.Printf("router: probe %s:443 → %s (%s)", req.host, v, reason)
 		return
 	}
 
@@ -243,10 +266,55 @@ func (r *Router) probeOne(req probeRequest) {
 		log.Printf("router: probe %s:%d → tcp-ok but IP-literal (no bypass-learn) — tunnel default", req.host, req.port)
 		return
 	}
-	r.mu.Lock()
-	r.cache[req.host] = cacheEntry{V: VerdictBypass, Expires: time.Now().Add(bypassCacheTTL)}
-	r.mu.Unlock()
+	r.cacheVerdict(req.host, VerdictBypass, bypassCacheTTL)
 	log.Printf("router: probe %s:%d → bypass (tcp ok, non-https)", req.host, req.port)
+}
+
+func (r *Router) cacheVerdict(host string, v Verdict, ttl time.Duration) {
+	r.mu.Lock()
+	r.cache[host] = cacheEntry{V: v, Expires: time.Now().Add(ttl)}
+	r.mu.Unlock()
+}
+
+// httpProbe sends a minimal GET / over an established TLS connection and
+// inspects the response for geo-block / VPN-detected markers. Returns the
+// verdict and a short reason string for logging.
+func (r *Router) httpProbe(conn *utls.UConn, host string) (Verdict, string) {
+	req := "GET / HTTP/1.1\r\n" +
+		"Host: " + host + "\r\n" +
+		"User-Agent: Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36\r\n" +
+		"Accept: text/html,*/*;q=0.8\r\n" +
+		"Accept-Language: en-US,en;q=0.9\r\n" +
+		"Connection: close\r\n\r\n"
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write([]byte(req)); err != nil {
+		// Can't even write — TLS up but server unhappy. Default tunnel (safer).
+		return VerdictTunnel, "http-write-fail: " + err.Error()
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 8192)
+	n, _ := io.ReadFull(conn, buf)
+	if n == 0 {
+		// Server accepted TLS but returned nothing — Cloudflare-style WAF
+		// or anti-bot. We can't tell if the real fetch will succeed. Default
+		// bypass (TLS handshake worked, give it a chance — user can complain).
+		return VerdictBypass, "http-empty: assume ok"
+	}
+	resp := strings.ToLower(string(buf[:n]))
+
+	// Status line: "HTTP/1.1 NNN ..."
+	if i := strings.Index(resp, "\r\n"); i > 0 {
+		statusLine := resp[:i]
+		if strings.Contains(statusLine, " 403 ") || strings.Contains(statusLine, " 451 ") {
+			return VerdictTunnel, "http-status: " + statusLine
+		}
+	}
+	for _, m := range blockResponseMarkers {
+		if strings.Contains(resp, m) {
+			return VerdictTunnel, "http-marker: " + m
+		}
+	}
+	return VerdictBypass, "http-ok"
 }
 
 func (r *Router) refreshLoop() {
