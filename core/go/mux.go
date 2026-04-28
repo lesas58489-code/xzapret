@@ -175,15 +175,18 @@ func (t *MuxTunnel) RecentSuccessRate() float64 {
 
 // IsSick returns true if recent stream attempts have been mostly timeouts
 // or failures — indicates the tunnel is alive but DPI is shaping traffic
-// (heartbeat works, real streams don't). Requires ≥5 samples to declare.
+// (heartbeat works, real streams don't). Requires ≥10 samples + success
+// rate <20% to declare. Earlier 5/30% threshold caused premature retire on
+// cellular networks where many ephemeral failures happen but tunnel still
+// usable for some streams.
 func (t *MuxTunnel) IsSick() bool {
 	t.healthMu.Lock()
 	filled := t.healthFilled
 	t.healthMu.Unlock()
-	if filled < 5 {
+	if filled < 10 {
 		return false
 	}
-	return t.RecentSuccessRate() < 0.3
+	return t.RecentSuccessRate() < 0.2
 }
 
 // StreamCount returns active streams on this tunnel.

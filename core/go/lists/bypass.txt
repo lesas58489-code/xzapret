@@ -24,6 +24,11 @@ kinopoisk.ru
 dzen.ru
 wink.ru
 max.ru
+s7.ru
+s7.aero
+aeroflot.ru
+rzd.ru
+pochta.ru
 
 # Crypto exchanges — RU IP is allowed, EU IP blocked.
 # Force direct so server-side exit doesn't trigger "restricted from EU".
