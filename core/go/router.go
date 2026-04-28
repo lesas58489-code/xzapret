@@ -36,6 +36,9 @@ var embeddedBypassList string
 //go:embed lists/blocked.txt
 var embeddedBlockedList string
 
+//go:embed lists/bypass_cidr.txt
+var embeddedBypassCIDR string
+
 type Verdict uint8
 
 const (
@@ -60,6 +63,7 @@ type Router struct {
 
 	bypassDomains  map[string]bool
 	blockedDomains map[string]bool
+	bypassNets     []*net.IPNet // CIDR ranges of major RU providers (static list)
 
 	mu        sync.RWMutex
 	bypassIPs map[string]bool       // refreshed periodically from bypassDomains
@@ -88,14 +92,15 @@ func NewRouter(cacheFile string) *Router {
 		cacheFile:      cacheFile,
 		bypassDomains:  parseDomainList(embeddedBypassList),
 		blockedDomains: parseDomainList(embeddedBlockedList),
+		bypassNets:     parseCIDRList(embeddedBypassCIDR),
 		bypassIPs:      make(map[string]bool),
 		cache:          make(map[string]cacheEntry),
 		probeCh:        make(chan probeRequest, probeQueueSize),
 		quit:           make(chan struct{}),
 	}
 	r.loadCache()
-	log.Printf("router: %d bypass domains, %d blocked domains, %d cached entries",
-		len(r.bypassDomains), len(r.blockedDomains), len(r.cache))
+	log.Printf("router: %d bypass domains, %d blocked domains, %d bypass CIDRs, %d cached entries",
+		len(r.bypassDomains), len(r.blockedDomains), len(r.bypassNets), len(r.cache))
 	go r.proberLoop()
 	go r.refreshLoop()
 	return r
@@ -119,13 +124,21 @@ func (r *Router) Decide(host string, port int) Verdict {
 	if r.matchDomain(h, r.blockedDomains) {
 		return VerdictTunnel
 	}
-	// 3. pre-resolved bypass IPs (for when host is an IP literal)
-	if net.ParseIP(h) != nil {
+	// 3a. pre-resolved bypass IPs (for when host is an IP literal)
+	if ip := net.ParseIP(h); ip != nil {
 		r.mu.RLock()
 		hit := r.bypassIPs[h]
 		r.mu.RUnlock()
 		if hit {
 			return VerdictBypass
+		}
+		// 3b. static CIDR ranges of RU providers — covers Yandex Market /
+		// VK CDN / Sber subdomains that resolve to IPs outside the
+		// bypassIPs set (which is built only from exact bypass.txt domains).
+		for _, n := range r.bypassNets {
+			if n.Contains(ip) {
+				return VerdictBypass
+			}
 		}
 	}
 	// 4. learned cache
@@ -335,6 +348,23 @@ func parseDomainList(text string) map[string]bool {
 			continue
 		}
 		out[strings.ToLower(line)] = true
+	}
+	return out
+}
+
+func parseCIDRList(text string) []*net.IPNet {
+	var out []*net.IPNet
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		_, n, err := net.ParseCIDR(line)
+		if err != nil {
+			log.Printf("router: bad CIDR %q: %v", line, err)
+			continue
+		}
+		out = append(out, n)
 	}
 	return out
 }

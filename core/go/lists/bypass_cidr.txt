@@ -1,0 +1,52 @@
+# IP CIDR ranges of major Russian providers — direct dial bypass.
+# Covers cases where DNS hijack doesn't fire (Private DNS DoT / app-internal
+# DoH) and SOCKS5 sees only IP literals.
+# Maintained manually from RIPE AS data; subset of the hottest prefixes.
+
+# Yandex (AS13238)
+5.45.192.0/18
+5.255.192.0/18
+37.9.64.0/18
+37.140.128.0/17
+77.88.0.0/18
+84.201.128.0/18
+87.250.224.0/19
+93.158.128.0/18
+95.108.128.0/17
+100.43.64.0/19
+141.8.128.0/18
+178.154.128.0/17
+178.248.232.0/22
+199.21.96.0/22
+213.180.192.0/19
+
+# Yandex Cloud / Yandex Direct / sub-AS
+87.232.0.0/19
+87.232.32.0/19
+87.232.64.0/18
+
+# VK Group / Mail.ru (AS47764, AS21051)
+87.240.128.0/18
+95.213.0.0/17
+185.32.96.0/22
+178.176.96.0/19
+217.20.144.0/20
+217.69.128.0/20
+
+# Sberbank (AS35107, AS44724)
+194.54.32.0/19
+217.74.32.0/19
+
+# Tinkoff (AS200863)
+91.108.232.0/22
+
+# Avito (AS208877)
+193.108.124.0/22
+
+# OK.ru (Mail.ru subset, covered above)
+
+# Wildberries (AS204834)
+89.108.65.0/24
+
+# Ozon (AS56438)
+185.71.76.0/22
