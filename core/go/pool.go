@@ -245,18 +245,22 @@ func (p *Pool) pick() *MuxTunnel {
 }
 
 func (p *Pool) warmup() {
-	// Cold start: ONE dial at a time. Parallel dial bursts trigger DPI/ISP
-	// stateful filters that blackhole the destination IP for ~30s — net
-	// wall-clock ends up the same as single-dial. The short cold-path
-	// timeouts in createOne (3s × 3 attempts) handle flaky handshakes
-	// without flooding the network.
-	p.createOne()
+	// Cold start: under Megafon DPI shaping, single sequential dial can
+	// take 10-15s before getting first tunnel (every TLS handshake hits
+	// 3s timeout). User waits with empty pool, app says "connecting".
+	//
+	// Compromise: launch TWO parallel dials for the first tunnel only.
+	// Two is the limit per CLAUDE.md observation that 3+ parallel triggers
+	// DPI burst-detection. After one succeeds, the second's success (if
+	// any) just adds to the pool early — net positive.
+	go p.createOne()
+	go p.createOne()
 	// Slow-fill the rest at the original cadence
-	for i := 1; i < p.cfg.MaxTunnels; i++ {
+	for i := 2; i < p.cfg.MaxTunnels; i++ {
 		select {
 		case <-p.quit:
 			return
-		case <-time.After(time.Duration(i)*3*time.Second + jitter(2*time.Second)):
+		case <-time.After(time.Duration(i-1)*3*time.Second + jitter(2*time.Second)):
 			go p.createOne()
 		}
 	}
@@ -286,10 +290,11 @@ func (p *Pool) createOne() {
 		attempts = 2
 		backoff = 2 * time.Second
 	} else {
-		// Cold start: fail-fast on the first server attempt, retry rotates
-		// to the next server (Dialer counter increments). 3s × 3 = ~10s
-		// worst-case to touch all 3 servers, vs 15s with 5s timeout.
-		dialTO = 3 * time.Second
+		// Cold start under Megafon DPI shaping: TLS handshake reads can
+		// legitimately take 3-4s before middlebox lets bytes through.
+		// 3s timeout was killing valid handshakes; 5s gives DPI time to
+		// "decide". Retry rotates to next server (Dialer counter increments).
+		dialTO = 5 * time.Second
 		attempts = 3
 		backoff = 300 * time.Millisecond
 	}
