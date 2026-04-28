@@ -9,6 +9,9 @@ youtube.com
 googlevideo.com
 ytimg.com
 youtu.be
+youtubei.googleapis.com
+yt3.ggpht.com
+yt4.ggpht.com
 
 # Meta family
 instagram.com

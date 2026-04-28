@@ -28,6 +28,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 //go:embed lists/bypass.txt
@@ -181,14 +183,13 @@ func (r *Router) proberLoop() {
 	}
 }
 
-// probeOne attempts a direct TCP connect with short timeout. Outcomes:
-//   - probe SUCCESS only caches BYPASS if host is a hostname (not IP literal).
-//     IPs are unsafe to bypass-by-probe because Google/CF/Akamai shared CDN
-//     IPs serve both blocked and non-blocked services (TCP-OK ≠ "safe to use
-//     direct" — DPI shapes at TLS-SNI layer, not TCP). Phase 2 DNS hijack
-//     ensures we always see hostname here, so bypass-learning is safe.
-//   - probe FAILURE always caches TUNNEL (TCP-unreachable from RU = certainly
-//     not bypass-able; route via tunnel).
+// probeOne attempts a direct TCP+TLS connect with short timeout. Outcomes:
+//   - For HTTPS port (443) on hostname: do uTLS handshake with SNI=hostname.
+//     TLS-OK → BYPASS (DPI lets the actual SNI through, safe to direct-route).
+//     TLS RST/timeout → TUNNEL (DPI shapes at SNI layer — youtubei.googleapis.com
+//     etc that pass TCP probe but fail TLS were the original false-positive).
+//   - For non-HTTPS or IP literal: TCP-only check. IP-literal SUCCESS doesn't
+//     cache (shared CDN IPs unsafe). FAILURE always caches TUNNEL.
 func (r *Router) probeOne(req probeRequest) {
 	r.mu.RLock()
 	if e, ok := r.cache[req.host]; ok && time.Now().Before(e.Expires) {
@@ -201,26 +202,51 @@ func (r *Router) probeOne(req probeRequest) {
 	defer cancel()
 	addr := net.JoinHostPort(req.host, fmt.Sprintf("%d", req.port))
 	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		// TCP failed — definitely tunnel
+		r.mu.Lock()
+		r.cache[req.host] = cacheEntry{V: VerdictTunnel, Expires: time.Now().Add(tunnelCacheTTL)}
+		r.mu.Unlock()
+		log.Printf("router: probe %s:%d → tunnel (tcp err=%v)", req.host, req.port, err)
+		return
+	}
+	defer conn.Close()
 
 	isIPLiteral := net.ParseIP(req.host) != nil
-	var v Verdict
-	var ttl time.Duration
-	if err == nil {
-		conn.Close()
-		if isIPLiteral {
-			// TCP-OK to a raw IP doesn't prove the service behind it is safe
-			// to bypass — skip caching, route via tunnel.
-			log.Printf("router: probe %s:%d → tcp-ok but IP-literal (no bypass-learn) — tunnel default", req.host, req.port)
+
+	// HTTPS hostname → do TLS-level probe. This catches the case where TCP
+	// connects but DPI shapes at the TLS-SNI layer (youtubei.googleapis.com
+	// from RU: TCP-OK to Google CDN IP, then RST when ClientHello SNI is seen).
+	if req.port == 443 && !isIPLiteral {
+		cfg := &utls.Config{
+			ServerName:         req.host,
+			InsecureSkipVerify: true, // we only care if handshake completes
+		}
+		u := utls.UClient(conn, cfg, utls.HelloChrome_131)
+		_ = u.SetDeadline(time.Now().Add(probeTimeout))
+		if err := u.Handshake(); err != nil {
+			r.mu.Lock()
+			r.cache[req.host] = cacheEntry{V: VerdictTunnel, Expires: time.Now().Add(tunnelCacheTTL)}
+			r.mu.Unlock()
+			log.Printf("router: probe %s:443 → tunnel (tls err=%v)", req.host, err)
 			return
 		}
-		v, ttl = VerdictBypass, bypassCacheTTL
-	} else {
-		v, ttl = VerdictTunnel, tunnelCacheTTL
+		r.mu.Lock()
+		r.cache[req.host] = cacheEntry{V: VerdictBypass, Expires: time.Now().Add(bypassCacheTTL)}
+		r.mu.Unlock()
+		log.Printf("router: probe %s:443 → bypass (tls ok)", req.host)
+		return
+	}
+
+	// Non-HTTPS or IP literal — TCP-only signal.
+	if isIPLiteral {
+		log.Printf("router: probe %s:%d → tcp-ok but IP-literal (no bypass-learn) — tunnel default", req.host, req.port)
+		return
 	}
 	r.mu.Lock()
-	r.cache[req.host] = cacheEntry{V: v, Expires: time.Now().Add(ttl)}
+	r.cache[req.host] = cacheEntry{V: VerdictBypass, Expires: time.Now().Add(bypassCacheTTL)}
 	r.mu.Unlock()
-	log.Printf("router: probe %s:%d → %s (ttl=%v err=%v)", req.host, req.port, v, ttl, err)
+	log.Printf("router: probe %s:%d → bypass (tcp ok, non-https)", req.host, req.port)
 }
 
 func (r *Router) refreshLoop() {

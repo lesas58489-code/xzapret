@@ -135,9 +135,13 @@ func (c *Client) Start() error {
 	// Router decides per-connection: bypass tunnel (direct dial from our
 	// process, mimo VpnService) or route through mux. Cache file lives in
 	// app cache dir (passed by Kotlin via CacheDir).
+	// v2 — TLS-level probe replaces TCP-only. Old "v1" cache file is left
+	// behind (will be GC'd when user clears cache); we start fresh because
+	// v1 hostnames cached as bypass via TCP-only probe (e.g. youtubei.googleapis.com)
+	// are now known to fail at TLS layer.
 	cachePath := ""
 	if c.cfg.CacheDir != "" {
-		cachePath = filepath.Join(c.cfg.CacheDir, "router_cache.json")
+		cachePath = filepath.Join(c.cfg.CacheDir, "router_cache_v2.json")
 	}
 	c.router = NewRouter(cachePath)
 	c.socks = newSocksServer(ln, c.pool)
