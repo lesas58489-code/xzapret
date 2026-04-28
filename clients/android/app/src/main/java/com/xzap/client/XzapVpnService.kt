@@ -128,6 +128,15 @@ class XzapVpnService : VpnService() {
                 return@Thread
             }
 
+            // Read Android Private DNS state. If "opportunistic" (Automatic with
+            // fallback), Go core will block DoT to force fallback to plain DNS,
+            // which our DNS hijack catches. If "hostname" (user-pinned provider)
+            // — Go core leaves DoT alone, MainActivity will have shown a dialog.
+            val privateDnsMode = try {
+                android.provider.Settings.Global.getString(contentResolver, "private_dns_mode") ?: "off"
+            } catch (_: Throwable) { "off" }
+            Log.i(TAG, "Private DNS mode: $privateDnsMode")
+
             // Build JSON config for Go core
             val cfg = JSONObject().apply {
                 put("key_b64", keyB64.replace(Regex("\\s"), ""))
@@ -136,6 +145,7 @@ class XzapVpnService : VpnService() {
                 put("mtu", 1500)
                 put("log_level", "warn")
                 put("cache_dir", cacheDir.absolutePath)
+                put("private_dns_mode", privateDnsMode)
                 if (isWs) {
                     put("transport", "ws")
                     put("ws_url", normalised)

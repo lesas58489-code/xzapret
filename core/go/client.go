@@ -30,6 +30,11 @@ type ClientConfig struct {
 	TLSProfile string // "chrome131" (default), "chrome120", "firefox120", "safari16", "random"
 	LocalSocks string // "127.0.0.1:10808"
 	CacheDir   string // app private cache dir for router cache, RTT history, etc.
+	// PrivateDNSMode is read from Android Settings.Global.private_dns_mode by Kotlin
+	// and passed in here. Values: "off" | "opportunistic" | "hostname" | "" (unknown).
+	// When "opportunistic" we block DoT (TCP/853) so Android falls back to plain DNS
+	// over UDP/53, which our DNS hijack handles. Other modes: no blocking.
+	PrivateDNSMode string
 }
 
 // Client is the stateful XZAP client singleton.
@@ -140,6 +145,12 @@ func (c *Client) Start() error {
 	// DNS hijack: fake-IP responses → SOCKS5 CONNECT recovers hostname →
 	// router decides per-domain (Phase 2). All-domain routing safety.
 	c.socks.dns = NewDNSServer()
+	// If Android Private DNS = "opportunistic" (Automatic, with fallback),
+	// block DoT to force fallback to plain UDP/53 → our hijack catches it.
+	c.socks.blockDoT = c.cfg.PrivateDNSMode == "opportunistic"
+	if c.socks.blockDoT {
+		log.Print("socks5: DoT blocking enabled (Private DNS = opportunistic)")
+	}
 	go c.socks.Run()
 
 	// Start decoy traffic generator. Sites = whiteSNIs (bypass.txt).

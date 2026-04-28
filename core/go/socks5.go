@@ -23,6 +23,7 @@ type socksServer struct {
 	pool     *Pool
 	router   *Router    // domain/IP-aware split routing; nil → tunnel everything
 	dns      *DNSServer // DNS hijack — resolves fake IPs back to original hostnames
+	blockDoT bool       // reject CONNECT to :853 (DNS-over-TLS) so Android falls back to UDP/53
 	running  atomic.Bool
 	bypassIP func(net.IP) bool // optional: return true for IPs that should go direct (legacy hook)
 }
@@ -119,6 +120,15 @@ func (s *socksServer) handleClient(c net.Conn) {
 	// Remove deadline for the data phase
 	_ = c.SetDeadline(time.Time{})
 
+	// Block DoT: if Android Private DNS is "opportunistic", reject TCP/853 so
+	// the system falls back to plain DNS over UDP/53 — which our DNS hijack
+	// handles. With Private DNS off this is a no-op. With "hostname" mode the
+	// caller (Kotlin) must show a settings dialog instead.
+	if s.blockDoT && port == 853 {
+		log.Printf("socks5: blocking DoT %s:853 → forcing UDP/53 fallback", host)
+		_, _ = c.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
 	// DNS hijack: if host is a fake IP we allocated for an earlier DNS query,
 	// recover the original hostname so Router decisions are domain-based
 	// (not IP-based — Google CDN IPs serve both blocked and non-blocked).

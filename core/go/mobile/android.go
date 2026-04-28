@@ -47,8 +47,9 @@ type startConfig struct {
 	SocksPort  int    `json:"socks_port"`
 	TunFD      int    `json:"tun_fd"`
 	MTU        int    `json:"mtu"`
-	LogLevel   string `json:"log_level"`
-	CacheDir   string `json:"cache_dir"`
+	LogLevel       string `json:"log_level"`
+	CacheDir       string `json:"cache_dir"`
+	PrivateDNSMode string `json:"private_dns_mode"` // "off"|"opportunistic"|"hostname"|""
 }
 
 // Start launches the XZAP client and, if TunFD>0, hooks up tun2socks
@@ -86,8 +87,9 @@ func Start(configJSON string) string {
 		Transport:  cfg.Transport,
 		WSUrl:      cfg.WSUrl,
 		TLSProfile: cfg.TLSProfile,
-		LocalSocks: fmt.Sprintf("127.0.0.1:%d", cfg.SocksPort),
-		CacheDir:   cfg.CacheDir,
+		LocalSocks:     fmt.Sprintf("127.0.0.1:%d", cfg.SocksPort),
+		CacheDir:       cfg.CacheDir,
+		PrivateDNSMode: cfg.PrivateDNSMode,
 	})
 	if err != nil {
 		return fmt.Sprintf("client init: %v", err)

@@ -64,6 +64,45 @@ class MainActivity : AppCompatActivity() {
             if (connected) disconnect() else requestVpn()
         }
         btnShareLogs.setOnClickListener { shareLogs() }
+
+        maybeWarnPrivateDNS()
+    }
+
+    /**
+     * Phase 2 router (DNS hijack) only catches plain UDP/53 traffic. If Android
+     * Private DNS is set to "hostname" (user pinned a specific DoT provider),
+     * DNS goes via TCP/853 and bypasses our hijack — we can't auto-fix this
+     * because hostname-mode does NOT fall back when DoT is blocked. So warn
+     * the user once and offer a tap to system settings.
+     *
+     * Mode = "opportunistic" is fine: Go core blocks :853 and Android falls
+     * back to UDP/53 → hijack works. We don't bother the user about it.
+     */
+    private fun maybeWarnPrivateDNS() {
+        val mode = try {
+            android.provider.Settings.Global.getString(contentResolver, "private_dns_mode") ?: "off"
+        } catch (_: Throwable) { "off" }
+        if (mode != "hostname") return
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        if (prefs.getBoolean("dismissed_private_dns_warning", false)) return
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Private DNS detected")
+            .setMessage("В настройках Android выбран постоянный DNS-провайдер (Private DNS = hostname). " +
+                    "Это мешает XZAP интеллектуально маршрутизировать трафик: все домены идут через тоннель, " +
+                    "включая российские сайты (потеря оптимизации, повышенная задержка).\n\n" +
+                    "Рекомендуется: «Off» или «Автоматически».")
+            .setPositiveButton("Открыть настройки") { _, _ ->
+                try {
+                    startActivity(Intent("android.settings.WIRELESS_SETTINGS"))
+                } catch (_: Throwable) {
+                    startActivity(Intent(android.provider.Settings.ACTION_SETTINGS))
+                }
+            }
+            .setNegativeButton("Не показывать") { _, _ ->
+                prefs.edit().putBoolean("dismissed_private_dns_warning", true).apply()
+            }
+            .setNeutralButton("Позже", null)
+            .show()
     }
 
     /**
