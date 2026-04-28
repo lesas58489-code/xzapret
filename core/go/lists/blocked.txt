@@ -54,6 +54,8 @@ chatgpt.com
 chat.openai.com
 openai.com
 oaiusercontent.com
+claude.ai
+anthropic.com
 midjourney.com
 huggingface.co
 
