@@ -88,6 +88,7 @@ class MainActivity : ComponentActivity() {
             putExtra(XzapVpnService.EXTRA_PORT, BuildConfig.XZAP_PORT)
             putExtra(XzapVpnService.EXTRA_KEY, BuildConfig.XZAP_KEY)
             putExtra(XzapVpnService.EXTRA_TLS_PROFILE, "chrome131")
+            putExtra(XzapVpnService.EXTRA_WS_FALLBACK, BuildConfig.XZAP_WS_FALLBACK)
         }
         startService(intent)
         pendingStart?.invoke()

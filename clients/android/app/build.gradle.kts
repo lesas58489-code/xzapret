@@ -21,9 +21,10 @@ android {
         targetSdk = 34
         versionCode = 2
         versionName = "1.1"
-        buildConfigField("String", "XZAP_KEY",     "\"${localProps.getProperty("XZAP_KEY", "")}\"")
-        buildConfigField("String", "XZAP_SERVERS", "\"${localProps.getProperty("XZAP_SERVERS", "151.244.111.186,202.155.11.110,151.245.104.38")}\"")
-        buildConfigField("int",    "XZAP_PORT",    localProps.getProperty("XZAP_PORT", "443"))
+        buildConfigField("String", "XZAP_KEY",         "\"${localProps.getProperty("XZAP_KEY", "")}\"")
+        buildConfigField("String", "XZAP_SERVERS",     "\"${localProps.getProperty("XZAP_SERVERS", "151.244.111.186,202.155.11.110,151.245.104.38")}\"")
+        buildConfigField("int",    "XZAP_PORT",        localProps.getProperty("XZAP_PORT", "443"))
+        buildConfigField("String", "XZAP_WS_FALLBACK", "\"${localProps.getProperty("XZAP_WS_FALLBACK", "")}\"")
     }
 
     buildFeatures {

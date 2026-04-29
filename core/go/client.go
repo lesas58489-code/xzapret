@@ -30,6 +30,12 @@ type ClientConfig struct {
 	TLSProfile string // "chrome131" (default), "chrome120", "firefox120", "safari16", "random"
 	LocalSocks string // "127.0.0.1:10808"
 	CacheDir   string // app private cache dir for router cache, RTT history, etc.
+	// WSFallbackUrl is a Cloudflare-Worker-fronted WSS endpoint used when
+	// direct TCP to all servers fails with "connection refused" / "network
+	// is unreachable" — typical of RU regional whitelist mode (drone alert,
+	// regional emergency). The Worker exits via CF backbone, bypassing TSPU.
+	// Empty = fallback disabled.
+	WSFallbackUrl string
 	// PrivateDNSMode is read from Android Settings.Global.private_dns_mode by Kotlin
 	// and passed in here. Values: "off" | "opportunistic" | "hostname" | "" (unknown).
 	// When "opportunistic" we block DoT (TCP/853) so Android falls back to plain DNS
@@ -282,10 +288,44 @@ func (c *Client) makeDialer() TransportDialer {
 			warmupServers = servers
 			log.Printf("makeDialer: all servers marked deferred — fallback to full set for warmup too")
 		}
-		log.Printf("makeDialer: warmup-set=%v full-set=%v", warmupServers, servers)
+		log.Printf("makeDialer: warmup-set=%v full-set=%v fallback=%q", warmupServers, servers, c.cfg.WSFallbackUrl)
 		var counter atomic.Uint64
 		warmupDone := c.warmupDone
+		// Sliding window of last N dial outcomes for whitelist-mode detection.
+		// If most recent dials all failed with refused/unreachable → switch
+		// to WSS fallback URL (CF Worker fronting our backend over CF backbone).
+		var refusedMu sync.Mutex
+		var refusedRing []bool   // true = "refused/unreachable", false = "ok or other"
+		const refusedWindow = 8  // observe last 8 outcomes
+		const refusedThresh = 6  // 6+ refused → enter fallback mode
 		return func(ctx context.Context) (ReaderWriterCloser, error) {
+			// Decide if whitelist-mode is suspected.
+			refusedMu.Lock()
+			suspected := false
+			if c.cfg.WSFallbackUrl != "" && len(refusedRing) >= refusedWindow {
+				cnt := 0
+				for _, r := range refusedRing {
+					if r {
+						cnt++
+					}
+				}
+				if cnt >= refusedThresh {
+					suspected = true
+				}
+			}
+			refusedMu.Unlock()
+
+			if suspected {
+				log.Printf("makeDialer: whitelist-mode suspected (%d refused in last %d) → WSS fallback %s",
+					refusedThresh, refusedWindow, c.cfg.WSFallbackUrl)
+				conn, err := transport.DialWS(ctx, c.cfg.WSFallbackUrl)
+				if err == nil {
+					return conn, nil
+				}
+				log.Printf("makeDialer: WSS fallback also failed: %v — falling through to direct dial", err)
+				// drop through to normal direct dial
+			}
+
 			pool := warmupServers
 			if warmupDone.Load() {
 				pool = servers
@@ -301,6 +341,13 @@ func (c *Client) makeDialer() TransportDialer {
 			log.Printf("makeDialer: dial phase=%s server=%s sni=%s persona=%s", phase, s.host, sni, personaName)
 			start := time.Now()
 			conn, err := transport.DialTLSWithChaff(ctx, s.host, s.port, sni, profile, persona)
+			refused := err != nil && (strings.Contains(err.Error(), "connection refused") || strings.Contains(err.Error(), "network is unreachable"))
+			refusedMu.Lock()
+			refusedRing = append(refusedRing, refused)
+			if len(refusedRing) > refusedWindow {
+				refusedRing = refusedRing[len(refusedRing)-refusedWindow:]
+			}
+			refusedMu.Unlock()
 			if err != nil {
 				return nil, err
 			}

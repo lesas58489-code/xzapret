@@ -50,6 +50,7 @@ type startConfig struct {
 	LogLevel       string `json:"log_level"`
 	CacheDir       string `json:"cache_dir"`
 	PrivateDNSMode string `json:"private_dns_mode"` // "off"|"opportunistic"|"hostname"|""
+	WSFallbackUrl  string `json:"ws_fallback_url"`  // CF Worker URL for whitelist-mode fallback
 }
 
 // Start launches the XZAP client and, if TunFD>0, hooks up tun2socks
@@ -90,6 +91,7 @@ func Start(configJSON string) string {
 		LocalSocks:     fmt.Sprintf("127.0.0.1:%d", cfg.SocksPort),
 		CacheDir:       cfg.CacheDir,
 		PrivateDNSMode: cfg.PrivateDNSMode,
+		WSFallbackUrl:  cfg.WSFallbackUrl,
 	})
 	if err != nil {
 		return fmt.Sprintf("client init: %v", err)

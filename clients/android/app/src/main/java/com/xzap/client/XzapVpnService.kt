@@ -30,6 +30,7 @@ class XzapVpnService : VpnService() {
         const val EXTRA_PORT = "port"
         const val EXTRA_KEY = "key"
         const val EXTRA_TLS_PROFILE = "tls_profile"
+        const val EXTRA_WS_FALLBACK = "ws_fallback"
         const val SOCKS_PORT = 10808
 
         // Russian apps that detect VPN and refuse to work (banks, gov, marketplaces).
@@ -79,13 +80,14 @@ class XzapVpnService : VpnService() {
                 val port = intent.getIntExtra(EXTRA_PORT, 8443)
                 val keyB64 = intent.getStringExtra(EXTRA_KEY) ?: return START_NOT_STICKY
                 val profile = intent.getStringExtra(EXTRA_TLS_PROFILE) ?: "chrome131"
-                connect(server, port, keyB64, profile)
+                val wsFallback = intent.getStringExtra(EXTRA_WS_FALLBACK) ?: ""
+                connect(server, port, keyB64, profile, wsFallback)
             }
         }
         return START_STICKY
     }
 
-    private fun connect(server: String, port: Int, keyB64: String, tlsProfile: String) {
+    private fun connect(server: String, port: Int, keyB64: String, tlsProfile: String, wsFallback: String = "") {
         if (running.get()) {
             disconnect()
             Thread.sleep(500)
@@ -146,6 +148,9 @@ class XzapVpnService : VpnService() {
                 put("log_level", "warn")
                 put("cache_dir", cacheDir.absolutePath)
                 put("private_dns_mode", privateDnsMode)
+                if (wsFallback.isNotEmpty()) {
+                    put("ws_fallback_url", wsFallback)
+                }
                 if (isWs) {
                     put("transport", "ws")
                     put("ws_url", normalised)
