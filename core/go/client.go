@@ -50,9 +50,10 @@ type Client struct {
 	pool   *Pool
 	socks  *socksServer
 	decoy  *DecoyManager
-	router *Router
-	mu     sync.Mutex
-	up     bool
+	router    *Router
+	startedAt time.Time
+	mu        sync.Mutex
+	up        bool
 
 	// warmupDone flips to true once the pool's warmup goroutine has finished
 	// kicking off all initial tunnels. The dialer uses this to switch from
@@ -169,6 +170,7 @@ func (c *Client) Start() error {
 	c.decoy = NewDecoyManager(append([]string(nil), whiteSNIs...))
 	c.decoy.Start()
 
+	c.startedAt = time.Now()
 	c.up = true
 	log.Printf("xzap client started, SOCKS5 on %s, transport=%s", c.cfg.LocalSocks, c.cfg.Transport)
 	return nil
@@ -183,6 +185,38 @@ func (c *Client) WaitReady(timeoutSec int) bool {
 		return false
 	}
 	return pool.Ready(time.Duration(timeoutSec) * time.Second)
+}
+
+// Stats returns a JSON snapshot of pool state for the UI.
+//   active:      tunnels currently alive AND not retiring
+//   total:       all tunnel slots in pool (alive + retiring)
+//   avg_rtt_ms:  average of last-successful-dial RTT across known servers
+//   uptime_sec:  seconds since Client.Start succeeded
+func (c *Client) Stats() string {
+	c.mu.Lock()
+	pool := c.pool
+	startedAt := c.startedAt
+	c.mu.Unlock()
+	active, total := 0, 0
+	if pool != nil {
+		active, total = pool.Stats()
+	}
+	avgRtt := int64(0)
+	c.rttMu.Lock()
+	if n := len(c.rtts); n > 0 {
+		var sum time.Duration
+		for _, v := range c.rtts {
+			sum += v
+		}
+		avgRtt = (sum / time.Duration(n)).Milliseconds()
+	}
+	c.rttMu.Unlock()
+	uptime := int64(0)
+	if !startedAt.IsZero() {
+		uptime = int64(time.Since(startedAt).Seconds())
+	}
+	return fmt.Sprintf(`{"active":%d,"total":%d,"avg_rtt_ms":%d,"uptime_sec":%d}`,
+		active, total, avgRtt, uptime)
 }
 
 // OnNetworkChanged signals that the underlying network has switched

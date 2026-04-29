@@ -112,6 +112,19 @@ func (p *Pool) Stop() {
 	}
 }
 
+// Stats returns current pool counts. Used by Mobile.Stats() → UI.
+func (p *Pool) Stats() (active, total int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	total = len(p.items)
+	for _, it := range p.items {
+		if it.t.IsAlive() && !it.retiring {
+			active++
+		}
+	}
+	return
+}
+
 // KillAll closes every existing tunnel and clears the pool. Used when the
 // underlying network changes (cellular ↔ Wi-Fi switch) — the prior tunnels'
 // TCP sockets were bound to the old source IP and are now zombie connections

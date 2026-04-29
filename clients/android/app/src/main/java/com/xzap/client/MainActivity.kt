@@ -6,6 +6,7 @@ import android.net.VpnService
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -14,6 +15,8 @@ import com.xzap.client.ui.TunnelStats
 import com.xzap.client.ui.VpnState
 import com.xzap.client.ui.XzapApp
 import com.xzap.client.ui.XzapTheme
+import kotlinx.coroutines.delay
+import org.json.JSONObject
 
 /**
  * Compose-based main activity. Phase 1 of the redesign per
@@ -47,9 +50,28 @@ class MainActivity : ComponentActivity() {
                 var state by remember { mutableStateOf(VpnState.IDLE) }
                 var killOn by remember { mutableStateOf(true) }
                 var autoOn by remember { mutableStateOf(false) }
+                var stats by remember { mutableStateOf(TunnelStats()) }
+                // Poll Mobile.stats() once per second while CONNECTED.
+                // Pulls active tunnel count, average RTT, uptime, throughput.
+                LaunchedEffect(state) {
+                    if (state != VpnState.CONNECTED && state != VpnState.ERROR) return@LaunchedEffect
+                    while (true) {
+                        try {
+                            val js = mobile.Mobile.stats()
+                            val obj = JSONObject(js)
+                            stats = TunnelStats(
+                                activeTunnels = obj.optInt("active"),
+                                totalCap     = 9,
+                                avgRttMs     = obj.optInt("avg_rtt_ms"),
+                                uptimeSec    = obj.optInt("uptime_sec"),
+                            )
+                        } catch (_: Throwable) { /* swallow JSON / native errors */ }
+                        delay(1000)
+                    }
+                }
                 XzapApp(
                     state = state,
-                    stats = TunnelStats(),
+                    stats = stats,
                     killSwitchOn = killOn,
                     autoConnectOn = autoOn,
                     onTapButton = {

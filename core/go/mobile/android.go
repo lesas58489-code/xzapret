@@ -149,6 +149,18 @@ func Stop() {
 	log.Print("[xzapcore] stopped")
 }
 
+// Stats returns a JSON snapshot of current pool state for the UI to poll
+// (active tunnels, average RTT, uptime). Empty / zero values when stopped.
+func Stats() string {
+	mu.Lock()
+	c := client
+	mu.Unlock()
+	if c == nil {
+		return `{"active":0,"total":0,"avg_rtt_ms":0,"uptime_sec":0}`
+	}
+	return c.Stats()
+}
+
 // NetworkChanged is called by Kotlin's ConnectivityManager.NetworkCallback
 // when the device's underlying network switches (cellular ↔ Wi-Fi).
 // Triggers pool.KillAll so tunnels reconstruct on the new interface
