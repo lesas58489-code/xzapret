@@ -129,6 +129,17 @@ func (s *socksServer) handleClient(c net.Conn) {
 		_, _ = c.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
+	// Block DoH: well-known DNS-over-HTTPS endpoints (Cloudflare 1.1.1.1,
+	// Google 8.8.8.8/8.8.4.4, Quad9 9.9.9.9, plus dns.google etc by name) on
+	// TCP/443. Chrome/Firefox use these to bypass system DNS — therefore our
+	// DNS hijack — so hostname-based routing (e.g. claude.ai → tunnel) can't
+	// fire, SOCKS5 only sees a Cloudflare CDN IP literal.
+	// Reject → app falls back to system DNS → hijack works → router decides.
+	if isDoHEndpoint(host, port) {
+		log.Printf("socks5: blocking DoH %s:%d → forcing system DNS", host, port)
+		_, _ = c.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
 	// DNS hijack: if host is a fake IP we allocated for an earlier DNS query,
 	// recover the original hostname so Router decisions are domain-based
 	// (not IP-based — Google CDN IPs serve both blocked and non-blocked).
@@ -339,6 +350,30 @@ func (s *socksServer) relayDNS(udp *net.UDPConn, src *net.UDPAddr,
 	reply = append(reply, udpHdr...)
 	reply = append(reply, dns...)
 	_, _ = udp.WriteToUDP(reply, src)
+}
+
+// isDoHEndpoint returns true for well-known DNS-over-HTTPS / Trusted-Recursive
+// targets that browsers use to bypass system DNS. Used to selectively reject
+// these CONNECTs so apps fall back to UDP/53 → our hijack catches them.
+//
+// IPs cover Cloudflare (1.1.1.1/1.0.0.1), Google (8.8.8.8/8.8.4.4),
+// Quad9 (9.9.9.9, 149.112.112.112), AdGuard (94.140.14.14, 94.140.15.15).
+// Hostnames cover the same provider set when SOCKS5 receives a name (rare,
+// but happens with some apps).
+func isDoHEndpoint(host string, port int) bool {
+	if port != 443 {
+		return false
+	}
+	switch host {
+	case "1.1.1.1", "1.0.0.1", "1dot1dot1dot1.cloudflare-dns.com",
+		"cloudflare-dns.com", "chrome.cloudflare-dns.com", "mozilla.cloudflare-dns.com",
+		"8.8.8.8", "8.8.4.4", "dns.google", "dns.google.com",
+		"9.9.9.9", "149.112.112.112", "dns.quad9.net",
+		"94.140.14.14", "94.140.15.15", "dns.adguard-dns.com",
+		"doh.opendns.com", "208.67.222.222", "208.67.220.220":
+		return true
+	}
+	return false
 }
 
 // hijackDNS synthesizes a DNS reply locally (fake IPs from the DNSServer)
