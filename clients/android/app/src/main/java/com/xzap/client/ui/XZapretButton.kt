@@ -19,7 +19,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -40,6 +39,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.nativeCanvas
@@ -129,54 +129,46 @@ fun XZapretButton(
     // Reduced-motion accommodation: skip looping animations, keep transitional ones.
     val reduceMotion = LocalReduceMotion.current
 
-    // Halo "breathing" loop — only when CONNECTED, scale 0.92↔1.06, 2.4s, ease-in-out
+    // Halo "breathing" loop — CONNECTED, scale 0.92↔1.06, 2.4s, ease-in-out.
+    // When reduce-motion, both endpoints set to 1.0 → animation runs but no
+    // visual motion (cleaner than conditional animateFloat which breaks `by`).
     val infinite = rememberInfiniteTransition(label = "infinite")
-    val haloPulse by if (reduceMotion) {
-        androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(1.0f) }
-    } else {
-        infinite.animateFloat(
-            initialValue = 0.92f,
-            targetValue = 1.06f,
-            animationSpec = infiniteRepeatable(
-                animation = tween(durationMillis = 2400, easing = CubicBezierEasing(0.4f, 0f, 0.6f, 1f)),
-                repeatMode = RepeatMode.Reverse,
-            ),
-            label = "halo",
-        )
-    }
+    val haloPulse by infinite.animateFloat(
+        initialValue = if (reduceMotion) 1f else 0.92f,
+        targetValue  = if (reduceMotion) 1f else 1.06f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 2400, easing = CubicBezierEasing(0.4f, 0f, 0.6f, 1f)),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "halo",
+    )
 
-    // Idle dashed-ring rotation — slow continuous turn (24s/turn)
-    val idleRingAngle by if (reduceMotion) {
-        androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(0f) }
-    } else {
-        infinite.animateFloat(
-            initialValue = 0f,
-            targetValue = 360f,
-            animationSpec = infiniteRepeatable(
-                animation = tween(durationMillis = 24_000, easing = LinearEasing),
-                repeatMode = RepeatMode.Restart,
-            ),
-            label = "idleRing",
-        )
-    }
+    // Idle dashed-ring rotation — 24s/turn. reduce-motion → target equals
+    // initial so it stays static at 0°.
+    val idleRingAngle by infinite.animateFloat(
+        initialValue = 0f,
+        targetValue  = if (reduceMotion) 0f else 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 24_000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "idleRing",
+    )
 
-    // ERROR glitch — bottom-half jitter ±3px on 220ms square-wave loop.
-    // Disabled when reduceMotion is on.
-    val glitchPhase by if (state == VpnState.ERROR && !reduceMotion) {
-        infinite.animateFloat(
-            initialValue = 0f,
-            targetValue = 1f,
-            animationSpec = infiniteRepeatable(
-                animation = tween(durationMillis = 110, easing = LinearEasing),
-                repeatMode = RepeatMode.Reverse,
-            ),
-            label = "glitch",
-        )
-    } else {
-        androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(0f) }
-    }
-    val glitchDx = if (state == VpnState.ERROR && !reduceMotion) (if (glitchPhase < 0.5f) 3f else -3f) else 0f
-    val glitchDy = if (state == VpnState.ERROR && !reduceMotion) (if (glitchPhase < 0.5f) -1f else 1f) else 0f
+    // ERROR glitch — bottom-half jitter on 220ms square-wave loop. Same
+    // pattern: target=initial when not in ERROR or reduce-motion → no motion.
+    val glitchActive = state == VpnState.ERROR && !reduceMotion
+    val glitchPhase by infinite.animateFloat(
+        initialValue = 0f,
+        targetValue  = if (glitchActive) 1f else 0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 110, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "glitch",
+    )
+    val glitchDx = if (glitchActive) (if (glitchPhase < 0.5f) 3f else -3f) else 0f
+    val glitchDy = if (glitchActive) (if (glitchPhase < 0.5f) -1f else 1f) else 0f
 
     // Concentric ring pulse — one-shot wave on CONNECTING (scale 0.85→1.6, 900ms)
     val ringPulse = remember { Animatable(0f) }
