@@ -1,8 +1,13 @@
 package com.xzap.client.ui
 
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -14,6 +19,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -23,14 +29,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.PathMeasure
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
@@ -116,6 +124,43 @@ fun XZapretButton(
         label = "press",
     )
 
+    // Halo "breathing" loop — only when CONNECTED, scale 0.92↔1.06, 2.4s, ease-in-out
+    val infinite = rememberInfiniteTransition(label = "infinite")
+    val haloPulse by infinite.animateFloat(
+        initialValue = 0.92f,
+        targetValue = 1.06f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 2400, easing = CubicBezierEasing(0.4f, 0f, 0.6f, 1f)),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "halo",
+    )
+
+    // Idle dashed-ring rotation — slow continuous turn (24s/turn)
+    val idleRingAngle by infinite.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 24_000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "idleRing",
+    )
+
+    // Concentric ring pulse — one-shot wave on CONNECTING (scale 0.85→1.6, 900ms)
+    val ringPulse = remember { Animatable(0f) }
+    LaunchedEffect(state) {
+        if (state == VpnState.CONNECTING) {
+            ringPulse.snapTo(0f)
+            ringPulse.animateTo(
+                targetValue = 1f,
+                animationSpec = tween(durationMillis = 900, easing = CubicBezierEasing(0.16f, 1f, 0.3f, 1f)),
+            )
+        } else {
+            ringPulse.snapTo(0f)
+        }
+    }
+
     Column(
         modifier = modifier,
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -135,11 +180,12 @@ fun XZapretButton(
                 },
             contentAlignment = Alignment.Center,
         ) {
-            // Halo behind everything (CONNECTED only)
+            // Halo behind everything (CONNECTED only) — breathing scale
             if (haloAlpha > 0f) {
                 Box(
                     modifier = Modifier
                         .matchParentSize()
+                        .scale(haloPulse)
                         .alpha(haloAlpha * 0.55f)
                         .background(
                             Brush.radialGradient(
@@ -148,6 +194,47 @@ fun XZapretButton(
                             )
                         )
                 )
+            }
+
+            // Idle dashed ring (rotating, only when fully IDLE)
+            if (state == VpnState.IDLE) {
+                Canvas(modifier = Modifier.matchParentSize()) {
+                    val cx = size.width / 2f
+                    val cy = size.height / 2f
+                    val ringRadius = minOf(size.width, size.height) / 2f * 0.92f
+                    rotate(idleRingAngle, pivot = Offset(cx, cy)) {
+                        drawCircle(
+                            color = XzapColors.TextQuaternary,
+                            radius = ringRadius,
+                            center = Offset(cx, cy),
+                            style = Stroke(
+                                width = 1.5f,
+                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 14f)),
+                            ),
+                        )
+                    }
+                }
+            }
+
+            // Concentric ring pulse on CONNECTING (one-shot 900ms wave)
+            if (ringPulse.value > 0f && ringPulse.value < 1f) {
+                val p = ringPulse.value
+                val pulseScale = 0.85f + (1.6f - 0.85f) * p
+                val pulseAlpha = 1f - p // fades out as it expands
+                Canvas(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .scale(pulseScale)
+                        .alpha(pulseAlpha),
+                ) {
+                    val r = minOf(size.width, size.height) / 2f * 0.7f
+                    drawCircle(
+                        color = accent,
+                        radius = r,
+                        center = Offset(size.width / 2f, size.height / 2f),
+                        style = Stroke(width = 2f),
+                    )
+                }
             }
 
             // Wordmark + slash

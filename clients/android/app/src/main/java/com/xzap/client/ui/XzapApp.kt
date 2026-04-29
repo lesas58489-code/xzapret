@@ -194,7 +194,7 @@ private fun SwarmChip(state: VpnState, stats: TunnelStats) {
                     repeat(3) { col ->
                         val idx = row * 3 + col
                         val lit = state == VpnState.CONNECTED && idx < stats.activeTunnels
-                        DotIndicator(lit = lit)
+                        DotIndicator(lit = lit, idx = idx)
                     }
                 }
             }
@@ -234,17 +234,39 @@ private fun SwarmChip(state: VpnState, stats: TunnelStats) {
 }
 
 @Composable
-private fun DotIndicator(lit: Boolean) {
-    val color by animateFloatAsState(
+private fun DotIndicator(lit: Boolean, idx: Int) {
+    // Per-dot continuous pulse — staggered so the grid breathes out-of-phase.
+    // Each dot's loop has duration 1.4 + (idx % 5) * 0.18s, with phase delay
+    // (idx * 73) % 1300ms so they don't sync. Approximated via offset trick:
+    // wrap a stable infinite-transition with delayMillis on initialDelay.
+    val infinite = androidx.compose.animation.core.rememberInfiniteTransition(label = "dot$idx")
+    val durationMs = (1400 + (idx % 5) * 180)
+    val pulse by infinite.animateFloat(
+        initialValue = 0.5f,
+        targetValue = 1f,
+        animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+            animation = androidx.compose.animation.core.tween(
+                durationMillis = durationMs,
+                delayMillis = (idx * 73) % 1300,
+                easing = androidx.compose.animation.core.CubicBezierEasing(0.4f, 0f, 0.6f, 1f),
+            ),
+            repeatMode = androidx.compose.animation.core.RepeatMode.Reverse,
+        ),
+        label = "pulse$idx",
+    )
+    val baseAlpha by animateFloatAsState(
         targetValue = if (lit) 1f else 0.2f,
-        animationSpec = tween(durationMillis = 220),
-        label = "dot",
+        animationSpec = tween(durationMillis = 220, delayMillis = idx * 50),
+        label = "lit$idx",
     )
     Box(
         modifier = Modifier
             .size(6.dp)
             .clip(RoundedCornerShape(3.dp))
-            .background(if (lit) XzapColors.Accent.copy(alpha = color) else XzapColors.Border),
+            .background(
+                if (lit) XzapColors.Accent.copy(alpha = baseAlpha * pulse)
+                else XzapColors.Border
+            ),
     )
 }
 
