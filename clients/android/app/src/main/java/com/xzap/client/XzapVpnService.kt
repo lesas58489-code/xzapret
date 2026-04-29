@@ -211,16 +211,24 @@ class XzapVpnService : VpnService() {
             .build()
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                if (lastSeenNetwork != null && lastSeenNetwork != network) {
-                    Log.i(TAG, "underlying network switched ($lastSeenNetwork → $network) — kicking pool")
-                    runCatching { Mobile.networkChanged() }
-                        .onFailure { Log.w(TAG, "Mobile.networkChanged failed: ${it.message}") }
-                }
+                val prev = lastSeenNetwork
                 lastSeenNetwork = network
+                if (prev == null) {
+                    // First network seen since VPN started — initialize, no kick.
+                    return
+                }
+                if (prev != network) {
+                    Log.i(TAG, "network changed ($prev → $network) — kicking pool")
+                    kickPool()
+                }
             }
             override fun onLost(network: Network) {
-                Log.i(TAG, "network lost: $network")
+                Log.i(TAG, "network lost: $network — kicking pool (existing tunnels' source IP just died)")
                 if (network == lastSeenNetwork) lastSeenNetwork = null
+                // Even if onAvailable hasn't fired yet for the next network,
+                // the existing tunnels are dead — kill them now so pick()
+                // doesn't keep routing streams through zombie sockets.
+                kickPool()
             }
         }
         try {
@@ -230,6 +238,11 @@ class XzapVpnService : VpnService() {
         } catch (e: Throwable) {
             Log.w(TAG, "registerNetworkCallback failed: ${e.message}")
         }
+    }
+
+    private fun kickPool() {
+        runCatching { Mobile.networkChanged() }
+            .onFailure { Log.w(TAG, "Mobile.networkChanged failed: ${it.message}") }
     }
 
     private fun unregisterNetworkCallback() {
