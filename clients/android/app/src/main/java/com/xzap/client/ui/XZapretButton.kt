@@ -1,6 +1,5 @@
 package com.xzap.client.ui
 
-import android.graphics.Typeface
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.CubicBezierEasing
@@ -22,9 +21,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.ui.platform.LocalContext
-import androidx.core.content.res.ResourcesCompat
-import com.xzap.client.R
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -133,17 +129,6 @@ fun XZapretButton(
 
     // Reduced-motion accommodation: skip looping animations, keep transitional ones.
     val reduceMotion = LocalReduceMotion.current
-
-    // Bundled brand font — Space Grotesk Bold (variable .ttf, weight 700).
-    // ResourcesCompat returns a regular Typeface; we wrap with create(.., BOLD)
-    // to ensure full weight against any Android version that ignores variable
-    // axes for the default style.
-    val context = LocalContext.current
-    val brandTypeface = remember {
-        val base = ResourcesCompat.getFont(context, R.font.space_grotesk_bold)
-            ?: Typeface.SANS_SERIF
-        Typeface.create(base, Typeface.BOLD)
-    }
 
     // Halo "breathing" loop — CONNECTED, scale 0.92↔1.06, 2.4s, ease-in-out.
     // When reduce-motion, both endpoints set to 1.0 → animation runs but no
@@ -284,7 +269,6 @@ fun XZapretButton(
                     slashColor = slashColor,
                     glitchDx = glitchDx,
                     glitchDy = glitchDy,
-                    typeface = brandTypeface,
                 )
             }
         }
@@ -308,7 +292,6 @@ private fun DrawScope.drawWordmark(
     slashColor: Color,
     glitchDx: Float = 0f,
     glitchDy: Float = 0f,
-    typeface: Typeface? = null,
 ) {
     // Map design viewBox (1000×VB_H) onto the actual pixel canvas, fit-by-width
     val sx = size.width / VB_W
@@ -351,7 +334,7 @@ private fun DrawScope.drawWordmark(
         textSize = FONT_SIZE_VB * s
         isAntiAlias = true
         textAlign = android.graphics.Paint.Align.CENTER
-        this.typeface = typeface ?: android.graphics.Typeface.create(
+        typeface = android.graphics.Typeface.create(
             android.graphics.Typeface.SANS_SERIF, android.graphics.Typeface.BOLD
         )
         letterSpacing = -0.04f
