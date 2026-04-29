@@ -95,7 +95,7 @@ fun XzapApp(
                     .weight(1f),
                 contentAlignment = Alignment.Center,
             ) {
-                ButtonStub(state = state, onTap = onTapButton)
+                XZapretButton(state = state, onTap = onTapButton)
             }
 
             AnimatedVisibility(
