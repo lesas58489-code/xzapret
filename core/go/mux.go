@@ -91,7 +91,8 @@ type MuxTunnel struct {
 
 	// Lifetime traffic counters — rotator uses these to retire heavily-used
 	// tunnels earlier, mimicking browser conn lifecycle (heavy page view → close).
-	bytesOut       atomic.Int64
+	bytesOut       atomic.Int64 // payload bytes written by us through this tunnel
+	bytesIn        atomic.Int64 // payload bytes received via this tunnel
 	streamsCreated atomic.Uint32
 
 	// Recent stream outcomes (last 20) for health tracking. Used by Pool.pick()
@@ -141,6 +142,9 @@ func (t *MuxTunnel) IsAlive() bool { return atomic.LoadInt32(&t.alive) == 1 }
 
 // BytesOut returns total payload bytes written through this tunnel (lifetime).
 func (t *MuxTunnel) BytesOut() int64 { return t.bytesOut.Load() }
+
+// BytesIn returns total payload bytes received from peer (lifetime).
+func (t *MuxTunnel) BytesIn() int64 { return t.bytesIn.Load() }
 
 // StreamsCreated returns total number of streams opened on this tunnel (lifetime).
 func (t *MuxTunnel) StreamsCreated() uint32 { return t.streamsCreated.Load() }
@@ -295,6 +299,7 @@ func (t *MuxTunnel) readerLoop() {
 			return
 		}
 		t.lastFrameAt.Store(time.Now().UnixNano())
+		t.bytesIn.Add(int64(len(frame)))
 		if len(frame) < muxHdrSize {
 			log.Printf("mux: readerLoop got undersized frame %d bytes", len(frame))
 			continue

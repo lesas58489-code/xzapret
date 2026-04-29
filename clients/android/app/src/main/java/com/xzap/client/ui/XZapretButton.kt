@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -32,6 +33,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
@@ -124,28 +126,57 @@ fun XZapretButton(
         label = "press",
     )
 
+    // Reduced-motion accommodation: skip looping animations, keep transitional ones.
+    val reduceMotion = LocalReduceMotion.current
+
     // Halo "breathing" loop — only when CONNECTED, scale 0.92↔1.06, 2.4s, ease-in-out
     val infinite = rememberInfiniteTransition(label = "infinite")
-    val haloPulse by infinite.animateFloat(
-        initialValue = 0.92f,
-        targetValue = 1.06f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 2400, easing = CubicBezierEasing(0.4f, 0f, 0.6f, 1f)),
-            repeatMode = RepeatMode.Reverse,
-        ),
-        label = "halo",
-    )
+    val haloPulse by if (reduceMotion) {
+        androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(1.0f) }
+    } else {
+        infinite.animateFloat(
+            initialValue = 0.92f,
+            targetValue = 1.06f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 2400, easing = CubicBezierEasing(0.4f, 0f, 0.6f, 1f)),
+                repeatMode = RepeatMode.Reverse,
+            ),
+            label = "halo",
+        )
+    }
 
     // Idle dashed-ring rotation — slow continuous turn (24s/turn)
-    val idleRingAngle by infinite.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 24_000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart,
-        ),
-        label = "idleRing",
-    )
+    val idleRingAngle by if (reduceMotion) {
+        androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(0f) }
+    } else {
+        infinite.animateFloat(
+            initialValue = 0f,
+            targetValue = 360f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 24_000, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart,
+            ),
+            label = "idleRing",
+        )
+    }
+
+    // ERROR glitch — bottom-half jitter ±3px on 220ms square-wave loop.
+    // Disabled when reduceMotion is on.
+    val glitchPhase by if (state == VpnState.ERROR && !reduceMotion) {
+        infinite.animateFloat(
+            initialValue = 0f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 110, easing = LinearEasing),
+                repeatMode = RepeatMode.Reverse,
+            ),
+            label = "glitch",
+        )
+    } else {
+        androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(0f) }
+    }
+    val glitchDx = if (state == VpnState.ERROR && !reduceMotion) (if (glitchPhase < 0.5f) 3f else -3f) else 0f
+    val glitchDy = if (state == VpnState.ERROR && !reduceMotion) (if (glitchPhase < 0.5f) -1f else 1f) else 0f
 
     // Concentric ring pulse — one-shot wave on CONNECTING (scale 0.85→1.6, 900ms)
     val ringPulse = remember { Animatable(0f) }
@@ -243,6 +274,8 @@ fun XZapretButton(
                     cutFraction = cutAmount,
                     slashFraction = slashProgress,
                     slashColor = slashColor,
+                    glitchDx = glitchDx,
+                    glitchDy = glitchDy,
                 )
             }
         }
@@ -264,6 +297,8 @@ private fun DrawScope.drawWordmark(
     cutFraction: Float,
     slashFraction: Float,
     slashColor: Color,
+    glitchDx: Float = 0f,
+    glitchDy: Float = 0f,
 ) {
     // Map design viewBox (1000×VB_H) onto the actual pixel canvas, fit-by-width
     val sx = size.width / VB_W
@@ -320,28 +355,44 @@ private fun DrawScope.drawWordmark(
             canvas.nativeCanvas.drawText("Xzapret", textX, textY, paint)
         }
     }
-    // Bottom half — drawn in clipped region, translated by cutAmount * norm
+    // Bottom half — clipped + translated by cutAmount*norm + ERROR glitch jitter
     clipPath(bottomPath) {
-        translate(left = cutDx, top = cutDy) {
+        translate(left = cutDx + glitchDx, top = cutDy + glitchDy) {
             drawIntoCanvas { canvas ->
                 canvas.nativeCanvas.drawText("Xzapret", textX, textY, paint)
             }
         }
     }
 
-    // Slash itself — partial line based on slashFraction
+    // Slash itself — partial line based on slashFraction. Three layers:
+    //   1. Wide soft blur (BlurMaskFilter) for the drop-shadow glow
+    //   2. Mid semi-transparent stroke
+    //   3. Crisp top line
     if (slashFraction > 0f) {
         val drawX2 = sx1 + (sx2 - sx1) * slashFraction
         val drawY2 = sy1 + (sy2 - sy1) * slashFraction
-        // Glow layer (wider, semi-transparent)
+        val blurPaint = android.graphics.Paint().apply {
+            color = slashColor.toArgb()
+            style = android.graphics.Paint.Style.STROKE
+            strokeWidth = SLASH_STROKE_VB * s
+            strokeCap = android.graphics.Paint.Cap.ROUND
+            isAntiAlias = true
+            maskFilter = android.graphics.BlurMaskFilter(
+                12f * s, android.graphics.BlurMaskFilter.Blur.NORMAL
+            )
+        }
+        drawIntoCanvas { canvas ->
+            canvas.nativeCanvas.drawLine(sx1, sy1, drawX2, drawY2, blurPaint)
+        }
+        // Mid-glow (wider, semi-transparent)
         drawLine(
             color = slashColor.copy(alpha = 0.6f),
             start = Offset(sx1, sy1),
             end = Offset(drawX2, drawY2),
-            strokeWidth = SLASH_STROKE_VB * s * 1.8f,
+            strokeWidth = SLASH_STROKE_VB * s * 1.6f,
             cap = StrokeCap.Round,
         )
-        // Crisp line on top
+        // Crisp line
         drawLine(
             color = slashColor,
             start = Offset(sx1, sy1),

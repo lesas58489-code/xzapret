@@ -45,25 +45,46 @@ class MainActivity : ComponentActivity() {
         } catch (t: Throwable) {
             android.util.Log.e("XZAP-BOOT", "Mobile.touch failed", t)
         }
+        val reduceMotion = runCatching {
+            android.provider.Settings.Global.getFloat(
+                contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE
+            ) == 0f
+        }.getOrDefault(false)
         setContent {
             XzapTheme {
+                androidx.compose.runtime.CompositionLocalProvider(
+                    com.xzap.client.ui.LocalReduceMotion provides reduceMotion,
+                ) {
                 var state by remember { mutableStateOf(VpnState.IDLE) }
                 var killOn by remember { mutableStateOf(true) }
                 var autoOn by remember { mutableStateOf(false) }
                 var stats by remember { mutableStateOf(TunnelStats()) }
                 // Poll Mobile.stats() once per second while CONNECTED.
-                // Pulls active tunnel count, average RTT, uptime, throughput.
+                // Pulls active tunnel count, average RTT, uptime; computes
+                // DOWN/UP KB/s as delta of bytes_in/out between polls.
                 LaunchedEffect(state) {
                     if (state != VpnState.CONNECTED && state != VpnState.ERROR) return@LaunchedEffect
+                    var prevIn = 0L
+                    var prevOut = 0L
+                    var prevTimeMs = System.currentTimeMillis()
                     while (true) {
                         try {
                             val js = mobile.Mobile.stats()
                             val obj = JSONObject(js)
+                            val bIn = obj.optLong("bytes_in")
+                            val bOut = obj.optLong("bytes_out")
+                            val now = System.currentTimeMillis()
+                            val dt = (now - prevTimeMs).coerceAtLeast(1)
+                            val downKBps = if (prevIn > 0) ((bIn - prevIn) * 1000 / dt / 1024).toInt().coerceAtLeast(0) else 0
+                            val upKBps   = if (prevOut > 0) ((bOut - prevOut) * 1000 / dt / 1024).toInt().coerceAtLeast(0) else 0
+                            prevIn = bIn; prevOut = bOut; prevTimeMs = now
                             stats = TunnelStats(
                                 activeTunnels = obj.optInt("active"),
                                 totalCap     = 9,
                                 avgRttMs     = obj.optInt("avg_rtt_ms"),
                                 uptimeSec    = obj.optInt("uptime_sec"),
+                                downKBps     = downKBps,
+                                upKBps       = upKBps,
                             )
                         } catch (_: Throwable) { /* swallow JSON / native errors */ }
                         delay(1000)
@@ -99,6 +120,7 @@ class MainActivity : ComponentActivity() {
                         }
                     },
                 )
+                }
             }
         }
     }

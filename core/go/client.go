@@ -198,8 +198,9 @@ func (c *Client) Stats() string {
 	startedAt := c.startedAt
 	c.mu.Unlock()
 	active, total := 0, 0
+	var bytesIn, bytesOut int64
 	if pool != nil {
-		active, total = pool.Stats()
+		active, total, bytesIn, bytesOut = pool.Stats()
 	}
 	avgRtt := int64(0)
 	c.rttMu.Lock()
@@ -215,8 +216,8 @@ func (c *Client) Stats() string {
 	if !startedAt.IsZero() {
 		uptime = int64(time.Since(startedAt).Seconds())
 	}
-	return fmt.Sprintf(`{"active":%d,"total":%d,"avg_rtt_ms":%d,"uptime_sec":%d}`,
-		active, total, avgRtt, uptime)
+	return fmt.Sprintf(`{"active":%d,"total":%d,"avg_rtt_ms":%d,"uptime_sec":%d,"bytes_in":%d,"bytes_out":%d}`,
+		active, total, avgRtt, uptime, bytesIn, bytesOut)
 }
 
 // OnNetworkChanged signals that the underlying network has switched

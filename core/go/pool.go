@@ -112,8 +112,9 @@ func (p *Pool) Stop() {
 	}
 }
 
-// Stats returns current pool counts. Used by Mobile.Stats() → UI.
-func (p *Pool) Stats() (active, total int) {
+// Stats returns current pool counts and lifetime byte totals.
+// Used by Mobile.Stats() → UI for SwarmChip + throughput display.
+func (p *Pool) Stats() (active, total int, bytesIn, bytesOut int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	total = len(p.items)
@@ -121,6 +122,8 @@ func (p *Pool) Stats() (active, total int) {
 		if it.t.IsAlive() && !it.retiring {
 			active++
 		}
+		bytesIn += it.t.BytesIn()
+		bytesOut += it.t.BytesOut()
 	}
 	return
 }
