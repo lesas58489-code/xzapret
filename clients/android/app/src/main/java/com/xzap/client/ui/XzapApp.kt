@@ -74,18 +74,36 @@ fun XzapApp(
     stats: TunnelStats,
     killSwitchOn: Boolean,
     autoConnectOn: Boolean,
+    countdownSec: Int = 0,
     onTapButton: () -> Unit,
     onKillSwitchToggle: (Boolean) -> Unit,
     onAutoConnectToggle: (Boolean) -> Unit,
     onShareLogs: () -> Unit,
     onReconnect: () -> Unit = {},
+    onKillSwitchTap: () -> Unit = {},
+    onBypassApps: () -> Unit = {},
+    onSystemAlwaysOnVpn: () -> Unit = {},
 ) {
     Surface(
         modifier = Modifier.fillMaxSize(),
         color = XzapColors.Bg,
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
-            TopBar(onShareLogs = onShareLogs, onReconnect = onReconnect)
+            TopBar(
+                onShareLogs = onShareLogs,
+                onReconnect = onReconnect,
+                onKillSwitchTap = onKillSwitchTap,
+                onBypassApps = onBypassApps,
+                onSystemAlwaysOnVpn = onSystemAlwaysOnVpn,
+            )
+            // Banner: countdown to recovery action while DEGRADED.
+            AnimatedVisibility(
+                visible = countdownSec > 0,
+                enter = fadeIn(tween(150)),
+                exit = fadeOut(tween(150)),
+            ) {
+                CountdownBanner(secs = countdownSec)
+            }
             SwarmChip(state = state, stats = stats)
             Spacer(Modifier.height(8.dp))
 
@@ -128,7 +146,13 @@ fun XzapApp(
 }
 
 @Composable
-private fun TopBar(onShareLogs: () -> Unit, onReconnect: () -> Unit) {
+private fun TopBar(
+    onShareLogs: () -> Unit,
+    onReconnect: () -> Unit,
+    onKillSwitchTap: () -> Unit = {},
+    onBypassApps: () -> Unit = {},
+    onSystemAlwaysOnVpn: () -> Unit = {},
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -167,6 +191,18 @@ private fun TopBar(onShareLogs: () -> Unit, onReconnect: () -> Unit) {
                 DropdownMenuItem(
                     text = { Text("Reconnect") },
                     onClick = { menuOpen = false; onReconnect() },
+                )
+                DropdownMenuItem(
+                    text = { Text("Kill switch (network reset)") },
+                    onClick = { menuOpen = false; onKillSwitchTap() },
+                )
+                DropdownMenuItem(
+                    text = { Text("Bypass apps") },
+                    onClick = { menuOpen = false; onBypassApps() },
+                )
+                DropdownMenuItem(
+                    text = { Text("Системный kill-switch (always-on VPN)") },
+                    onClick = { menuOpen = false; onSystemAlwaysOnVpn() },
                 )
                 DropdownMenuItem(
                     text = { Text("Share logs") },
@@ -446,6 +482,23 @@ private fun ErrorBanner() {
         Text(
             text = "Connection dropped — reconnecting…",
             style = TextStyle(color = XzapColors.ErrorSoft, fontSize = 13.sp),
+        )
+    }
+}
+
+@Composable
+private fun CountdownBanner(secs: Int) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 18.dp, vertical = 6.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(XzapColors.Accent.copy(alpha = 0.10f))
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+    ) {
+        Text(
+            text = "Связь нестабильна — авто-восстановление через ${secs}с",
+            style = TextStyle(color = XzapColors.Accent, fontSize = 13.sp),
         )
     }
 }

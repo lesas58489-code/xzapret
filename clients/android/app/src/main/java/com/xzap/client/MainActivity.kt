@@ -7,6 +7,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -55,10 +56,16 @@ class MainActivity : ComponentActivity() {
                 androidx.compose.runtime.CompositionLocalProvider(
                     com.xzap.client.ui.LocalReduceMotion provides reduceMotion,
                 ) {
-                var state by remember { mutableStateOf(VpnState.IDLE) }
-                var killOn by remember { mutableStateOf(true) }
-                var autoOn by remember { mutableStateOf(false) }
+                // VPN state теперь приходит из сервиса через StateFlow.
+                // Если сервис ещё не запущен — observable начинается с IDLE.
+                val health by XzapVpnService.health.collectAsState()
+                val countdownSec by XzapVpnService.countdown.collectAsState()
+                val state = healthToUiState(health)
+                // Тумблеры — read-through из Prefs, write-through через onToggle.
+                var killOn by remember { mutableStateOf(Prefs.isKillSwitch(this@MainActivity)) }
+                var autoOn by remember { mutableStateOf(Prefs.isAutoConnect(this@MainActivity)) }
                 var stats by remember { mutableStateOf(TunnelStats()) }
+                var showBypassDialog by remember { mutableStateOf(false) }
                 // Poll Mobile.stats() once per second while CONNECTED.
                 // Pulls active tunnel count, average RTT, uptime; computes
                 // DOWN/UP KB/s as delta of bytes_in/out between polls.
@@ -95,31 +102,62 @@ class MainActivity : ComponentActivity() {
                     stats = stats,
                     killSwitchOn = killOn,
                     autoConnectOn = autoOn,
+                    countdownSec = countdownSec,
                     onTapButton = {
                         when (state) {
-                            VpnState.IDLE          -> { state = VpnState.CONNECTING; requestVpn { state = VpnState.CONNECTED } }
-                            VpnState.CONNECTED, VpnState.ERROR -> { state = VpnState.DISCONNECTING; disconnect(); state = VpnState.IDLE }
-                            else                   -> { /* ignore taps mid-transition */ }
+                            VpnState.IDLE -> requestVpn { /* state придёт из flow */ }
+                            VpnState.CONNECTED, VpnState.ERROR -> disconnect()
+                            else -> { /* ignore taps mid-transition */ }
                         }
                     },
-                    onKillSwitchToggle = { killOn = it },
-                    onAutoConnectToggle = { autoOn = it },
+                    onKillSwitchToggle = {
+                        killOn = it
+                        Prefs.setKillSwitch(this@MainActivity, it)
+                    },
+                    onAutoConnectToggle = {
+                        autoOn = it
+                        Prefs.setAutoConnect(this@MainActivity, it)
+                    },
                     onShareLogs = { shareLogs() },
                     onReconnect = {
-                        // Emulate "phone reboot for the VPN stack": Stop service
-                        // (Mobile.stop closes pool / tun2socks / TUN), wait briefly,
-                        // start fresh. Faster than airplane-mode toggle and
-                        // recovers from stuck states (TUN routes, ghost mux tunnels).
+                        // Существующий Reconnect — мягкий (disconnect + 800ms + connect).
+                        // Жёсткий вариант теперь живёт за onKillSwitchTap.
                         if (state == VpnState.CONNECTED || state == VpnState.ERROR) {
-                            state = VpnState.DISCONNECTING
                             disconnect()
                             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                                state = VpnState.CONNECTING
-                                requestVpn { state = VpnState.CONNECTED }
+                                requestVpn { /* state из flow */ }
                             }, 800)
                         }
                     },
+                    onKillSwitchTap = { killSwitch() },
+                    onBypassApps = { showBypassDialog = true },
+                    onSystemAlwaysOnVpn = {
+                        // Открывает экран Настройки → VPN, где есть тумблеры
+                        // «Постоянная VPN» и «Блокировать соединения без VPN» —
+                        // это встроенный системный kill-switch. Получить эти
+                        // привилегии программно (WRITE_SECURE_SETTINGS) нельзя
+                        // без adb pm grant.
+                        try {
+                            startActivity(Intent("android.net.vpn.SETTINGS").apply {
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            })
+                        } catch (_: Throwable) {
+                            // Fallback: общие настройки сети
+                            startActivity(Intent(android.provider.Settings.ACTION_WIRELESS_SETTINGS).apply {
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            })
+                        }
+                    },
                 )
+                if (showBypassDialog) {
+                    com.xzap.client.ui.BypassAppsDialog(
+                        initial = Prefs.getBypassPackages(this@MainActivity),
+                        onApply = { newSet ->
+                            Prefs.setBypassPackages(this@MainActivity, newSet)
+                        },
+                        onDismiss = { showBypassDialog = false },
+                    )
+                }
                 }
             }
         }
@@ -156,6 +194,12 @@ class MainActivity : ComponentActivity() {
     private fun disconnect() {
         startService(Intent(this, XzapVpnService::class.java).apply {
             action = XzapVpnService.ACTION_DISCONNECT
+        })
+    }
+
+    private fun killSwitch() {
+        startService(Intent(this, XzapVpnService::class.java).apply {
+            action = XzapVpnService.ACTION_KILLSWITCH
         })
     }
 
@@ -217,4 +261,13 @@ class MainActivity : ComponentActivity() {
             }
         }.start()
     }
+}
+
+private fun healthToUiState(h: XzapVpnService.VpnHealth): VpnState = when (h) {
+    XzapVpnService.VpnHealth.IDLE         -> VpnState.IDLE
+    XzapVpnService.VpnHealth.CONNECTING   -> VpnState.CONNECTING
+    XzapVpnService.VpnHealth.HEALTHY      -> VpnState.CONNECTED
+    XzapVpnService.VpnHealth.DEGRADED     -> VpnState.CONNECTED  // UI продолжает «зелёный», нотификация говорит правду
+    XzapVpnService.VpnHealth.RECONNECTING -> VpnState.CONNECTING
+    XzapVpnService.VpnHealth.DEAD         -> VpnState.ERROR
 }
