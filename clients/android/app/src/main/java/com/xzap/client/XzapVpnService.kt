@@ -4,7 +4,12 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -71,6 +76,8 @@ class XzapVpnService : VpnService() {
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private val running = AtomicBoolean(false)
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var lastSeenNetwork: Network? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -181,7 +188,55 @@ class XzapVpnService : VpnService() {
             val label = if (isWs) normalised else "$normalised:$port"
             updateNotification("Connected to $label")
             Log.i(TAG, "VPN ready (xzapcore + uTLS + tun2socks)")
+            registerNetworkCallback()
         }.start()
+    }
+
+    /**
+     * Register a NetworkCallback that watches for the underlying real network
+     * to switch (cellular → Wi-Fi or back). On change we tell Go core to
+     * KillAll tunnels — the existing TCP sockets are bound to the old source
+     * IP and become zombies after the switch (still "alive" until PING/PONG
+     * times out, ~30s, during which the user sees throughput collapse).
+     *
+     * NET_CAPABILITY_NOT_VPN filters out our own VPN interface so we only
+     * track the underlying network.
+     */
+    private fun registerNetworkCallback() {
+        if (networkCallback != null) return
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val req = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .build()
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                if (lastSeenNetwork != null && lastSeenNetwork != network) {
+                    Log.i(TAG, "underlying network switched ($lastSeenNetwork → $network) — kicking pool")
+                    runCatching { Mobile.networkChanged() }
+                        .onFailure { Log.w(TAG, "Mobile.networkChanged failed: ${it.message}") }
+                }
+                lastSeenNetwork = network
+            }
+            override fun onLost(network: Network) {
+                Log.i(TAG, "network lost: $network")
+                if (network == lastSeenNetwork) lastSeenNetwork = null
+            }
+        }
+        try {
+            cm.registerNetworkCallback(req, cb)
+            networkCallback = cb
+            Log.i(TAG, "NetworkCallback registered (underlying-network switch detection)")
+        } catch (e: Throwable) {
+            Log.w(TAG, "registerNetworkCallback failed: ${e.message}")
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val cb = networkCallback ?: return
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        runCatching { cm.unregisterNetworkCallback(cb) }
+        networkCallback = null
     }
 
     /** Create the TUN interface and return the FD; null on failure. */
@@ -267,6 +322,7 @@ class XzapVpnService : VpnService() {
 
     private fun disconnect() {
         running.set(false)
+        unregisterNetworkCallback()
         try { Mobile.stop() } catch (_: Exception) {}
         closeVpn()
         stopForeground(STOP_FOREGROUND_REMOVE)

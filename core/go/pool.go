@@ -112,6 +112,23 @@ func (p *Pool) Stop() {
 	}
 }
 
+// KillAll closes every existing tunnel and clears the pool. Used when the
+// underlying network changes (cellular ↔ Wi-Fi switch) — the prior tunnels'
+// TCP sockets were bound to the old source IP and are now zombie connections
+// that pick() would still treat as alive until PING/PONG eventually fails
+// (~30s). KillAll forces immediate reconstruction on the new network.
+// Pool keeps running; pick() will trigger createOne for replacements.
+func (p *Pool) KillAll() {
+	p.mu.Lock()
+	items := p.items
+	p.items = nil
+	p.mu.Unlock()
+	for _, it := range items {
+		it.t.Close()
+	}
+	log.Printf("pool: KillAll — closed %d tunnels (network change)", len(items))
+}
+
 // Ready blocks until at least one tunnel is ready, or timeout elapses.
 func (p *Pool) Ready(timeout time.Duration) bool {
 	select {

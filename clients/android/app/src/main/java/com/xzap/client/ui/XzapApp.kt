@@ -19,10 +19,15 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -72,13 +77,14 @@ fun XzapApp(
     onKillSwitchToggle: (Boolean) -> Unit,
     onAutoConnectToggle: (Boolean) -> Unit,
     onShareLogs: () -> Unit,
+    onReconnect: () -> Unit = {},
 ) {
     Surface(
         modifier = Modifier.fillMaxSize(),
         color = XzapColors.Bg,
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
-            TopBar(onShareLogs = onShareLogs)
+            TopBar(onShareLogs = onShareLogs, onReconnect = onReconnect)
             SwarmChip(state = state, stats = stats)
             Spacer(Modifier.height(8.dp))
 
@@ -121,7 +127,7 @@ fun XzapApp(
 }
 
 @Composable
-private fun TopBar(onShareLogs: () -> Unit) {
+private fun TopBar(onShareLogs: () -> Unit, onReconnect: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -138,20 +144,34 @@ private fun TopBar(onShareLogs: () -> Unit) {
             ),
         )
         Spacer(Modifier.weight(1f))
-        // Overflow menu placeholder — tap → share logs for now.
-        // Phase 5 will turn this into a proper bottomsheet menu.
-        Box(
-            modifier = Modifier
-                .size(34.dp)
-                .clip(RoundedCornerShape(10.dp))
-                .background(XzapColors.Surface3)
-                .clickable { onShareLogs() },
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(
-                text = "⋮",
-                style = TextStyle(color = XzapColors.Fg, fontSize = 18.sp),
-            )
+        var menuOpen by remember { mutableStateOf(false) }
+        Box {
+            Box(
+                modifier = Modifier
+                    .size(34.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(XzapColors.Surface3)
+                    .clickable { menuOpen = true },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "⋮",
+                    style = TextStyle(color = XzapColors.Fg, fontSize = 18.sp),
+                )
+            }
+            DropdownMenu(
+                expanded = menuOpen,
+                onDismissRequest = { menuOpen = false },
+            ) {
+                DropdownMenuItem(
+                    text = { Text("Reconnect") },
+                    onClick = { menuOpen = false; onReconnect() },
+                )
+                DropdownMenuItem(
+                    text = { Text("Share logs") },
+                    onClick = { menuOpen = false; onShareLogs() },
+                )
+            }
         }
     }
 }

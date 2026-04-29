@@ -185,6 +185,19 @@ func (c *Client) WaitReady(timeoutSec int) bool {
 	return pool.Ready(time.Duration(timeoutSec) * time.Second)
 }
 
+// OnNetworkChanged signals that the underlying network has switched
+// (cellular ↔ Wi-Fi, etc). Forces all current tunnels to close so pool
+// rebuilds on the new interface — without waiting for PING timeouts.
+func (c *Client) OnNetworkChanged() {
+	c.mu.Lock()
+	pool := c.pool
+	c.mu.Unlock()
+	if pool == nil {
+		return
+	}
+	pool.KillAll()
+}
+
 // Stop tears everything down.
 func (c *Client) Stop() {
 	c.mu.Lock()

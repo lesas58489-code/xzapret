@@ -62,6 +62,20 @@ class MainActivity : ComponentActivity() {
                     onKillSwitchToggle = { killOn = it },
                     onAutoConnectToggle = { autoOn = it },
                     onShareLogs = { shareLogs() },
+                    onReconnect = {
+                        // Emulate "phone reboot for the VPN stack": Stop service
+                        // (Mobile.stop closes pool / tun2socks / TUN), wait briefly,
+                        // start fresh. Faster than airplane-mode toggle and
+                        // recovers from stuck states (TUN routes, ghost mux tunnels).
+                        if (state == VpnState.CONNECTED || state == VpnState.ERROR) {
+                            state = VpnState.DISCONNECTING
+                            disconnect()
+                            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                state = VpnState.CONNECTING
+                                requestVpn { state = VpnState.CONNECTED }
+                            }, 800)
+                        }
+                    },
                 )
             }
         }

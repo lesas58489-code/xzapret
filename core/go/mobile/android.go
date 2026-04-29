@@ -149,6 +149,20 @@ func Stop() {
 	log.Print("[xzapcore] stopped")
 }
 
+// NetworkChanged is called by Kotlin's ConnectivityManager.NetworkCallback
+// when the device's underlying network switches (cellular ↔ Wi-Fi).
+// Triggers pool.KillAll so tunnels reconstruct on the new interface
+// instead of waiting for PING timeouts (~30s) on now-zombie sockets.
+func NetworkChanged() {
+	mu.Lock()
+	c := client
+	mu.Unlock()
+	if c == nil {
+		return
+	}
+	c.OnNetworkChanged()
+}
+
 // IsRunning reports current state.
 func IsRunning() bool {
 	mu.Lock()
